@@ -303,7 +303,9 @@ mod tests {
         // A null buffer cannot be written to.
         let mut used = usize::MAX;
         assert!(path(this, size, std::ptr::null_mut(), &mut used) < 0);
-        assert_eq!(used, usize::MAX, "nothing written");
+        // The string getters report the required size, NUL included, even
+        // when the buffer is missing (#446).
+        assert_eq!(used, size, "the required size is reported");
     }
 
     #[test]
