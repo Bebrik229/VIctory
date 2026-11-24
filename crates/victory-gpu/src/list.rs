@@ -361,6 +361,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .iter()
             .filter_map(|b| host_barrier(list, b))
             .collect();
+        // One transition per resource: a repeated resource in one
+        // ResourceBarrier call is an invalid call on some drivers.
+        {
+            let mut seen = std::collections::HashSet::new();
+            host.retain(|b| b.kind != 0 || seen.insert(b.first as usize));
+        }
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
@@ -373,14 +379,27 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
             // SAFETY: the same layout; borrowed resource pointers, never
             // released through this slice.
-            let host = unsafe {
+            let host_slice = unsafe {
                 std::slice::from_raw_parts(
                     host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
                     host.len(),
                 )
             };
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                let parts: Vec<String> = host
+                    .iter()
+                    .map(|b| {
+                        format!(
+                            "k{} res {:p} {:x}->{:x}",
+                            b.kind, b.first, b.second, b.last
+                        )
+                    })
+                    .collect();
+                format!("title barrier [{}]", parts.join(", "))
+            });
             // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            unsafe { list.list.ResourceBarrier(host_slice) };
         }
     }
     0
@@ -393,6 +412,8 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("state barrier res {texture:?} {before:#x}->{state:#x}"));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1649,7 +1670,8 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const Barrier
     if let Some(list) = host_list(this) {
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATES as State,
+            D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            D3D12_RESOURCE_STATES as State,
             D3D12_RESOURCE_UAV_BARRIER,
         };
         use windows::core::Interface;
@@ -1726,6 +1748,27 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const Barrier
             });
         }
         if !out.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            {
+                let parts: Vec<String> = out
+                    .iter()
+                    .map(|b| {
+                        if b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
+                            // SAFETY: checked the union member.
+                            let t = unsafe { &b.Anonymous.Transition };
+                            format!(
+                                "tr res {:p} {:x}->{:x}",
+                                t.pResource.as_ref().map(|r| r.as_raw()).unwrap_or_default(),
+                                t.StateBefore.0,
+                                t.StateAfter.0
+                            )
+                        } else {
+                            format!("type{}", b.Type.0)
+                        }
+                    })
+                    .collect();
+                list.note_op(|| format!("layout barrier [{}]", parts.join(", ")));
+            }
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(&out) };
         }

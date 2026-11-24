@@ -1362,6 +1362,10 @@ impl Host {
             bounds.iter().map(|&(a, b)| &lists[a..b]).collect()
         } else if bounds.is_empty() {
             vec![&lists[..]]
+        } else if max_runs == 1 {
+            // Bisection: every list on its own so the removal report names
+            // the exact list — prelude or run — that removed the device.
+            (0..lists.len()).map(|i| &lists[i..i + 1]).collect()
         } else {
             bounds
                 .chunks(max_runs)
@@ -1392,6 +1396,44 @@ impl Host {
                         WaitForSingleObject(self.event, INFINITE);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            if groups.len() > 1 {
+                // SAFETY: a plain query; checked per group so the failing
+                // group's index names its run, not just the whole batch.
+                if let Err(e) = unsafe { self.device.GetDeviceRemovedReason() } {
+                    // Which run and which of its lists (prelude or run
+                    // list) the group held; with one-list groups the index
+                    // lands inside that run's range.
+                    let run = bounds
+                        .iter()
+                        .position(|&(a, b)| a <= i && i < b)
+                        .or_else(|| bounds.iter().position(|&(a, _)| a > i).map(|p| p - 1));
+                    let kind = match run {
+                        Some(r) if i == bounds[r].0 && bounds[r].1 - bounds[r].0 > 1 => {
+                            format!("prelude of run {r}")
+                        }
+                        Some(r) => format!("list of run {r}"),
+                        None => format!("run {i}"),
+                    };
+                    let lo = run.unwrap_or(0);
+                    let hi = (lo + 1).min(runs.len());
+                    let pipes: Vec<String> = runs[lo..hi]
+                        .iter()
+                        .flat_map(|r| {
+                            r.pipelines
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                        })
+                        .collect();
+                    fail(format_args!(
+                        "host GPU device removed in submission group {i} of {} ({kind}): {e} pipelines {pipes:?}{}{}",
+                        groups.len(),
+                        self.removal_data(&runs[lo..hi]),
+                        last_notes(&runs[lo..hi]),
+                    ));
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1800,23 +1842,39 @@ impl HostList {
     /// states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        // One barrier per resource: two title textures can share a host
+        // texture, and a repeated resource in one ResourceBarrier call
+        // removes the device with an invalid call on some drivers.
+        let mut seen = std::collections::HashSet::new();
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
+                if real == *first || !seen.insert(copy.texture.as_raw()) {
+                    return None;
+                }
+                Some(transition(
+                    &copy.texture,
+                    D3D12_RESOURCE_STATES(real as i32),
+                    D3D12_RESOURCE_STATES(*first as i32),
+                ))
             })
             .collect();
         if barriers.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
+        #[cfg(feature = "diagnostics")]
+        for b in &barriers {
+            // SAFETY: the barriers above are all transitions.
+            let t = unsafe { &b.Anonymous.Transition };
+            tracing::warn!(
+                res = ?t.pResource.as_ref().map(|r| r.as_raw()),
+                before = t.StateBefore.0,
+                after = t.StateAfter.0,
+                "prelude transition"
+            );
+        }
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
