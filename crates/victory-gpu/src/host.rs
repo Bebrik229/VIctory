@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -250,6 +250,9 @@ fn create() -> anyhow::Result<Host> {
             D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mem = adapter_memory(&device).unwrap_or(0);
+        DEVICE_MEMORY.store(mem, Ordering::Relaxed);
+        tracing::info!(bytes = mem, "host device memory");
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -740,6 +743,31 @@ fn recommended_wave64_mode(device: &ID3D12Device) -> victory_shader::emit::Wave6
         Wave64Mode::Native
     } else {
         Wave64Mode::Emulate
+    }
+}
+
+static DEVICE_MEMORY: AtomicU64 = AtomicU64::new(0);
+
+/// The memory of the adapter `device` runs on (`0` when DXGI does not name it).
+pub(crate) fn device_memory() -> u64 {
+    DEVICE_MEMORY.load(Ordering::Relaxed)
+}
+
+fn adapter_memory(device: &ID3D12Device) -> Option<u64> {
+    // SAFETY: plain DXGI adapter queries matching the device's adapter LUID.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let luid = device.GetAdapterLuid();
+        let mut i = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            if let Ok(desc) = adapter.GetDesc1()
+                && desc.AdapterLuid == luid
+            {
+                return Some(desc.DedicatedVideoMemory as u64);
+            }
+        }
+        None
     }
 }
 
