@@ -1728,6 +1728,7 @@ mod barycentric_tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            options: super::TranslateOptions::default(),
         })
         .unwrap();
         assert!(l.stride_table);
