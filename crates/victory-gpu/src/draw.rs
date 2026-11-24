@@ -24,6 +24,7 @@ use windows::core::Interface;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+use crate::scissor;
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -40,9 +41,9 @@ enum Root {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
-    address: u64,
-    size: u32,
-    stride: u32,
+    pub(crate) address: u64,
+    pub(crate) size: u32,
+    pub(crate) stride: u32,
 }
 
 #[repr(C)]
@@ -91,8 +92,14 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// The title's last viewports, for `VICTORY_WIDE_SCISSOR` (a scissor
+    /// widened to them) and the scissor log lines.
+    viewports: Vec<[f32; 4]>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// Root SRVs bound as one-view tables in this list: (host heap, title
+    /// address) → dynamic slot.
+    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
 }
 
 impl Drop for State {
@@ -119,8 +126,14 @@ static FRAME: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// The draws traced since the last call.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn take_frame() -> Vec<String> {
+    SCISSORS.store(0, Ordering::Relaxed);
     std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
 }
+
+/// The scissor sets traced this frame (diagnostics builds, see
+/// [`note_scissors`]).
+#[cfg(feature = "diagnostics")]
+static SCISSORS: AtomicU64 = AtomicU64::new(0);
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
 /// (no host pipeline) since the last call.
@@ -546,12 +559,23 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
+                        // An unset table is undefined: a null view instead.
+                        if tabled && !self.root_srv_table(list, None, param, compute) {
+                            return false;
+                        }
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    if tabled {
+                        if !self.root_srv_table(list, Some(address), param, compute) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    let Some(gpu) = root_view(list, address, srv) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -564,6 +588,75 @@ impl State {
                         }
                     }
                 }
+            }
+        }
+        true
+    }
+
+    /// Binds a root SRV as a one-view table (see
+    /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
+    /// title buffer's host copy from `address` to the copy's end, or a null
+    /// view (no address, or no host copy). One slot per address per list.
+    /// False if no dynamic slot could be had (the draw is dropped).
+    fn root_srv_table(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+        param: u32,
+        compute: bool,
+    ) -> bool {
+        let Some((heap, host)) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
+        else {
+            once!("a root SRV without a bound view heap: the draw is dropped");
+            return false;
+        };
+        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        let index = match self.root_srv_slots.get(&key) {
+            Some(&index) => index,
+            None => {
+                let Some(index) = host.dynamic(1) else {
+                    return false;
+                };
+                self.dynamic.push((key.0, index, 1));
+                self.root_srv_slots.insert(key, index);
+                match &shadow {
+                    Some((a, s)) => {
+                        // SAFETY: a live buffer.
+                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+                        let offset = s.gpu(*a) - base;
+                        if offset.is_multiple_of(16) {
+                            host.raw_at(index, &s.buffer, offset, s.left(*a));
+                        } else {
+                            // Raw views start on 16 bytes; one from the
+                            // aligned start would shift every read.
+                            once!(
+                                address = format_args!("{a:#x}"),
+                                "a root SRV not on 16 bytes reads zeros"
+                            );
+                            host.null_raw_at(index);
+                        }
+                    }
+                    None => host.null_raw_at(index),
+                }
+                index
+            }
+        };
+        if let Some((a, s)) = &shadow {
+            s.refresh(list, *a, s.left(*a).min(1 << 20));
+        }
+        let handle = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound view heap.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
         true
@@ -803,7 +896,7 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
+                    Some(View::Constant(address, size)) if address != 0 => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -1062,6 +1155,76 @@ impl State {
             },
             None => None,
         };
+        if kind == INDEXED && self.topology == RECTANGLES {
+            once!("indirect indexed rectangles not drawn");
+            why("indexed rectangles not supported");
+            return false;
+        }
+        if kind == DRAW && self.topology == RECTANGLES {
+            let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_drop(self.pipeline as This);
+                return false;
+            };
+            if p.compute || p.mesh {
+                why(&format!(
+                    "pipeline mismatch (compute {}, mesh {}, topology {})",
+                    p.compute, p.mesh, self.topology
+                ));
+                return false;
+            }
+            let Some(signature) = host_signature(DRAW, 16) else {
+                why("no host signature");
+                return false;
+            };
+            if max == 0 {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            let prepared = match crate::rectangles::expand(
+                list,
+                p,
+                &self.vertex,
+                (&args, arguments, stride, max),
+                counter.as_ref().map(|(s, at)| (s, *at)),
+            ) {
+                Ok(p) => p,
+                Err(reason) => {
+                    why(reason);
+                    return false;
+                }
+            };
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            if !self.prepare(list, false) {
+                why("prepare failed for indirect rectangles");
+                return false;
+            }
+            prepared.before_draw(list);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                self.op_text(
+                    format!("indirect rect draw max {max} at {arguments:#x}"),
+                    false,
+                )
+            });
+            // SAFETY: an open list with everything set; `prepared.args_buf` is
+            // list-owned (records past the title's count are empty draws, so
+            // no count buffer), the signature cached.
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &prepared.args_buf,
+                    0,
+                    None::<&ID3D12Resource>,
+                    0,
+                )
+            };
+            prepared.after_draw(list);
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -1081,7 +1244,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
@@ -1289,16 +1452,109 @@ const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
-/// Fixed-function state, straight onto the host list.
-pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+/// Fixed-function state, straight onto the host list. The viewports are
+/// kept for `VICTORY_WIDE_SCISSOR`, which widens scissors to them.
+pub(crate) fn viewports(list: &HostList, state: &mut State, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
     unsafe { list.list.RSSetViewports(viewports) };
+    state.viewports.clear();
+    state.viewports.extend(
+        viewports
+            .iter()
+            .map(|v| [v.TopLeftX, v.TopLeftY, v.Width, v.Height]),
+    );
 }
 
-pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+/// The title's scissor rects, onto the host list as it gave them (with
+/// `VICTORY_WIDE_SCISSOR`: widened to their viewport, see
+/// [`crate::scissor`]).
+pub(crate) fn scissors(list: &HostList, state: &mut State, rects: &[RECT]) {
+    let title: Vec<scissor::Rect> = rects
+        .iter()
+        .map(|r| [r.left, r.top, r.right, r.bottom])
+        .collect();
+    let wide = scissor::wide()
+        .then(|| scissor::widened(&title, &state.viewports))
+        .flatten();
+    note_scissors(&title, &state.viewports, wide.is_some());
+    let host: Vec<RECT> = match &wide {
+        Some(wide) => wide
+            .iter()
+            .map(|r| RECT {
+                left: r[0],
+                top: r[1],
+                right: r[2],
+                bottom: r[3],
+            })
+            .collect(),
+        None => rects.to_vec(),
+    };
     // SAFETY: an open list.
-    unsafe { list.list.RSSetScissorRects(rects) };
+    unsafe { list.list.RSSetScissorRects(&host) };
 }
+
+/// What a scissor set is worth saying: with `VICTORY_WIDE_SCISSOR`, each
+/// change it makes (rate-limited); in diagnostics builds, the first pairs
+/// of every frame.
+fn note_scissors(title: &[scissor::Rect], viewports: &[scissor::Viewport], widened: bool) {
+    // The rects of this set that span less than their viewport, as text.
+    let narrow = || -> Vec<String> {
+        title
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let v = scissor::pair(viewports, i)?;
+                scissor::narrower(r, v).then(|| {
+                    format!(
+                        "scissor {} under viewport {}",
+                        scissor::rect_text(r),
+                        scissor::viewport_text(v)
+                    )
+                })
+            })
+            .collect()
+    };
+    if widened {
+        static WIDENED: AtomicU64 = AtomicU64::new(0);
+        let n = WIDENED.fetch_add(1, Ordering::Relaxed);
+        let narrow = narrow();
+        if !narrow.is_empty() && (n < 8 || n.is_multiple_of(512)) {
+            tracing::warn!(
+                n,
+                "{}: widened to the viewport (VICTORY_WIDE_SCISSOR)",
+                narrow.join("; ")
+            );
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let n = SCISSORS.fetch_add(1, Ordering::Relaxed);
+            if n < SCISSORS_PER_FRAME {
+                let pairs: Vec<String> = title
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let v = scissor::pair(viewports, i);
+                        format!(
+                            "{} viewport {}",
+                            scissor::rect_text(r),
+                            v.map_or("none".into(), scissor::viewport_text)
+                        )
+                    })
+                    .collect();
+                tracing::debug!(
+                    "scissors {pairs:?}{}",
+                    if widened { " (widened)" } else { "" }
+                );
+            }
+        }
+    }
+}
+
+/// The scissor/viewport pairs a diagnostics frame logs.
+#[cfg(feature = "diagnostics")]
+const SCISSORS_PER_FRAME: u64 = 8;
 
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     // SAFETY: an open list.

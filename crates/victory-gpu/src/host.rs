@@ -67,6 +67,52 @@ unsafe impl Sync for Host {}
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
+/// Host objects the title let go of while a submission may still use them
+/// (a texture its descriptors name, a descriptor slot's old resource), by
+/// the submission count they wait for. The title's descriptor writes and
+/// releases reach the host at once, from its own threads, while the host
+/// runs a submission for most of a second in the world: freeing there was
+/// a GPU page fault on the freed texture (DXGI_ERROR_DEVICE_HUNG,
+/// 2026-11-24, RX 7600).
+static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+/// Submissions started and finished (waited for).
+static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A retired object, dropped on whatever thread finishes the submission.
+struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
+// SAFETY: what is retired is D3D12 objects (free-threaded) and the
+// reference-counted wrappers holding them, dropped once.
+unsafe impl Send for Retired {}
+
+/// Drops `object` once every submission running now has finished: at once
+/// if none is.
+pub(crate) fn retire<T: 'static>(object: T) {
+    let started = STARTED.load(Ordering::Acquire);
+    if started <= FINISHED.load(Ordering::Acquire) {
+        drop(object);
+        return;
+    }
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((started, Retired(Box::new(object))));
+}
+
+/// Drops what waited for submissions up to `finished`.
+fn bury(finished: u64) {
+    let done: Vec<(u64, Retired)> = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        if retired.is_empty() {
+            return;
+        }
+        let (done, keep) = std::mem::take(&mut *retired).into_iter().partition(|(at, _)| *at <= finished);
+        *retired = keep;
+        done
+    };
+    drop(done);
+}
+
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -134,7 +180,7 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
-fn create() -> windows::core::Result<Host> {
+fn create() -> anyhow::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -177,6 +223,33 @@ fn create() -> windows::core::Result<Host> {
         }
         let (device, adapter_desc) = create_device()?;
         let caps = probe_caps(&device, &adapter_desc);
+        let mut device: Option<ID3D12Device> = None;
+        // Diagnostics: the software adapter, on which a shader's wild access
+        // is an access violation in this process (a crash report with the
+        // address and instruction) instead of a GPU fault and driver reset.
+        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+            let adapter = warp_adapter()?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!("host device on the software adapter (WARP)");
+        } else {
+            // Not `D3D12CreateDevice(None, …)`: the adapter DXGI calls the
+            // default is the one driving the primary output, which on a
+            // hybrid laptop is the integrated GPU and can be a display-only
+            // adapter on a machine with a remote-desktop or emulator driver.
+            // `adapter` picks one that can run the title and says what every
+            // adapter offers when none can.
+            let (chosen, _) = crate::adapter::open()?;
+            device = Some(chosen);
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Whether a GPU hang ends the run or freezes the PC (#1054).
+            crate::tdr::log();
+            #[cfg(all(test, feature = "diagnostics"))]
+            let adapter = present_tests::adapter()?;
+            #[cfg(not(all(test, feature = "diagnostics")))]
+            let adapter: Option<windows::core::IUnknown> = None;
+            D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        }
+        let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -935,6 +1008,10 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// GPU-writable scratch for indirect rectangle expansion (`rectangles`):
+    /// expanded vertices, rewritten draw arguments and per-draw atomic
+    /// counters, reused across draws and across resets.
+    rect_scratch: Mutex<RectScratch>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1015,6 +1092,28 @@ pub(crate) struct PooledUpload {
 unsafe impl Send for PooledUpload {}
 // SAFETY: as above.
 unsafe impl Sync for PooledUpload {}
+/// Per-list GPU-writable buffers for indirect rectangle expansion
+/// (`crate::rectangles`): one vertex scratch buffer (reused per draw after
+/// its VB -> UAV barrier), one rewritten-arguments buffer (grown if a draw
+/// has more records), and chunks of 4-byte atomic counters zeroed before
+/// submission.
+#[derive(Default)]
+struct RectScratch {
+    vertices: Option<ID3D12Resource>,
+    args: Option<(ID3D12Resource, u64)>,
+    counters: Vec<(ID3D12Resource, usize, u64)>,
+    counter_chunk: usize,
+    counter_used: u32,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the counter pointers are
+// persistent mappings written only before submission.
+unsafe impl Send for RectScratch {}
+
+/// Counters per chunk (4 KiB = 1024 words).
+const RECT_COUNTER_CHUNK: u32 = 1024;
+/// Initial rewritten-arguments buffer size (64 KiB = 4096 draw records).
+const RECT_ARGS_MIN: u64 = 64 << 10;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -1131,6 +1230,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                rect_scratch: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1144,6 +1244,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -1204,6 +1305,8 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        FINISHED.store(this_submission, Ordering::Release);
+        bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1537,6 +1640,10 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        {
+            let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            (rect.counter_chunk, rect.counter_used) = (0, 0);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1571,6 +1678,19 @@ impl HostList {
                 (before != wanted).then_some((texture, before))
             }
         }
+    }
+
+    /// The current state established by this list. A texture the list has
+    /// never used can arrive in a different state at submission.
+    pub(crate) fn tracked_texture_state(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) -> Option<u32> {
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(std::sync::Arc::as_ptr(copy) as usize))
+            .map(|&(_, last, _)| last)
     }
 
     /// At submission: the list that moves each texture this list uses from
@@ -1777,6 +1897,69 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The list's GPU-writable scratch buffer for expanded indirect
+    /// rectangle vertices (`capacity` bytes), created on first use.
+    pub(crate) fn rect_vertices(&self, capacity: u64) -> Option<ID3D12Resource> {
+        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if rect.vertices.is_none() {
+            let buffer = host()?.default_buffer(capacity)?;
+            name(&buffer, || format!("rect scratch {capacity:#x}"));
+            rect.vertices = Some(buffer);
+        }
+        rect.vertices.clone()
+    }
+
+    /// A GPU-writable buffer of at least `bytes` for rewritten indirect
+    /// draw arguments, kept alive until the list is reset.
+    pub(crate) fn rect_args(&self, bytes: u64) -> Option<ID3D12Resource> {
+        let want = bytes.max(RECT_ARGS_MIN).next_multiple_of(256);
+        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buf, len)) = &rect.args
+            && *len >= want
+        {
+            return Some(buf.clone());
+        }
+        let buffer = host()?.default_buffer(want)?;
+        name(&buffer, || format!("rect args {want:#x}"));
+        let old = rect.args.replace((buffer.clone(), want));
+        drop(rect);
+        if let Some((old, _)) = old {
+            self.keep(&old);
+        }
+        Some(buffer)
+    }
+
+    /// The host GPU address of a 4-byte atomic counter for one indirect
+    /// rectangle draw, zeroed at each submission before the list runs.
+    pub(crate) fn rect_counter(&self) -> Option<u64> {
+        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if rect.counter_used == RECT_COUNTER_CHUNK {
+            rect.counter_chunk += 1;
+            rect.counter_used = 0;
+        }
+        if rect.counter_chunk == rect.counters.len() {
+            let bytes = u64::from(RECT_COUNTER_CHUNK) * 4;
+            let (buffer, data) = host()?.shared_buffer(bytes)?;
+            name(&buffer, || "rect counters".into());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            rect.counters.push((buffer, data as usize, gpu));
+            rect.counter_used = 0;
+        }
+        let (_, data, gpu) = rect.counters[rect.counter_chunk];
+        let slot = rect.counter_used;
+        rect.counter_used += 1;
+        drop(rect);
+        if slot == 0 {
+            let bytes = RECT_COUNTER_CHUNK as usize * 4;
+            // SAFETY: the list's own mapped chunk, zeroed before it runs.
+            self.defer_host(move || unsafe {
+                std::ptr::write_bytes(data as *mut u8, 0, bytes);
+            });
+        }
+        Some(gpu + u64::from(slot) * 4)
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -2509,6 +2692,18 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            #[cfg(all(test, feature = "diagnostics"))]
+            let back_readback = present_tests::ACTIVE.get().then(|| {
+                list.ResourceBarrier(&[transition(
+                    &back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let copy = crate::capture::read_back(&self.device, list, &back)
+                    .expect("back-buffer readback");
+                list.ResourceBarrier(&[transition(
+                    &back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                copy
+            });
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -2531,7 +2726,14 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(all(test, feature = "diagnostics"))]
+            if let Some((buffer, footprint)) = back_readback {
+                assert_eq!(status.0, 0, "DXGI Present");
+                present_tests::check_pixels(frame, &buffer, &footprint);
+                eprintln!("PresentX frame {frame}, back buffer {index}: all pixels matched");
+            }
+            let _ = status;
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -2680,6 +2882,48 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    /// A GPU-only default-heap buffer that shaders can write (unordered
+    /// access). Starts in the common state.
+    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a default-heap buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no default buffer");
                 None
             }
         }
@@ -2990,3 +3234,6 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         list.reset();
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod present_tests;
