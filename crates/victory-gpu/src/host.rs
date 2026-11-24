@@ -196,7 +196,7 @@ fn create() -> anyhow::Result<Host> {
                     if let (Some(sdk), Ok(exe)) = (&sdkcfg, std::env::current_exe()) {
                         let dir = exe.parent().unwrap().join("d3d12sdk");
                         let narrow = dir.to_string_lossy().into_owned() + "\\\0";
-                        match sdk.SetSDKVersion(615, windows::core::PCSTR(narrow.as_ptr())) {
+                        match sdk.SetSDKVersion(613, windows::core::PCSTR(narrow.as_ptr())) {
                             Ok(()) => tracing::info!(dir = %dir.display(), "Agility SDK path set"),
                             Err(e) => tracing::warn!(error = %e, "SetSDKVersion failed"),
                         }

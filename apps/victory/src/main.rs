@@ -22,7 +22,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 mod agility {
     #[unsafe(no_mangle)]
     #[used]
-    pub static D3D12SDKVersion: u32 = 615;
+    pub static D3D12SDKVersion: u32 = 613;
     #[repr(transparent)]
     pub struct SyncPtr(pub *const u8);
     unsafe impl Sync for SyncPtr {}
