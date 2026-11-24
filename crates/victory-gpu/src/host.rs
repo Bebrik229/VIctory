@@ -187,6 +187,18 @@ fn create() -> anyhow::Result<Host> {
         let debug =
             cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
         if debug {
+            // No Graphics Tools optional feature on this host: the Agility
+            // SDK redist carries d3d12SDKLayers.dll. SetSDKPath makes
+            // D3D12GetDebugInterface find it next to the exe.
+            let mut sdkcfg: Option<ID3D12SDKConfiguration> = None;
+            if D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut sdkcfg).is_ok()
+                && let Some(sdk) = &sdkcfg
+                && let Ok(exe) = std::env::current_exe()
+            {
+                let dir = exe.parent().unwrap().join("d3d12sdk");
+                let narrow = dir.to_string_lossy().replace('\\', "\\\\") + "\\\0";
+                let _ = sdk.SetSDKVersion(615, windows::core::PCSTR(narrow.as_ptr()));
+            }
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
                 Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
