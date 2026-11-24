@@ -14,6 +14,23 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// Agility SDK redist exports, read by d3d12.dll at device and debug-layer
+/// creation: `d3d12sdk\` next to the exe carries D3D12Core.dll and
+/// d3d12SDKLayers.dll, so the debug layer runs without the Graphics Tools
+/// optional feature.
+#[cfg(target_os = "windows")]
+mod agility {
+    #[unsafe(no_mangle)]
+    #[used]
+    pub static D3D12SDKVersion: u32 = 615;
+    #[repr(transparent)]
+    pub struct SyncPtr(pub *const u8);
+    unsafe impl Sync for SyncPtr {}
+    #[unsafe(no_mangle)]
+    #[used]
+    pub static D3D12SDKPath: SyncPtr = SyncPtr(b".\\d3d12sdk\\\0".as_ptr());
+}
+
 #[derive(Parser)]
 #[command(
     name = "victory",
