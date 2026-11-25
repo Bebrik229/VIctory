@@ -25,6 +25,10 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[path = "group_uniform.rs"]
+mod group_uniform;
+use group_uniform::{all_group_blocks, all_lane_blocks, lane_regions, lds_meetings};
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -65,6 +69,12 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Multi-wave pure scalar skips flattened into unconditional fallthrough + `select`.
+    #[cfg(test)]
+    pub flat_skips: usize,
+    /// Group-sync TGSM meetings inserted via `lds_meeting`.
+    #[cfg(test)]
+    pub lds_meetings: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -239,6 +249,22 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// Single-wave Wave32 compute shader sharing LDS without `s_barrier`: all-lane blocks
+    /// where write/read transitions insert a TGSM sync, plus whether LDS is accessed across
+    /// multiple blocks or a loop (sync before leaving an all-lane block).
+    one_wave_lds: Option<(Vec<bool>, bool)>,
+    /// Last LDS access kind in the current block for `one_wave_lds`
+    /// (`0`: clean, `1`: read, `2`: write, `3`: atomic).
+    lds_state: u8,
+    #[cfg(test)]
+    lds_meetings: u32,
+    /// Multi-wave (`group > 64`) wave-varying scalar forward-skips flattened into
+    /// unconditional fallthrough + `select` at the join so `exchange_halves` barriers
+    /// execute in workgroup-uniform control flow: `branch_block -> (body, join)`.
+    flat_skips: HashMap<usize, (usize, usize)>,
+    /// Condition evaluated at each flattened skip, keyed by its `join` block:
+    /// `(branch_block, body_block, cond, skip_on_true)`.
+    flat_conds: HashMap<usize, (usize, usize, V, bool)>,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
@@ -335,84 +361,6 @@ pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
-
-/// Instructions that read a lane mask (not EXEC implicitly, not a lane's
-/// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
-/// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
-/// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
-    let n = st.exits.len();
-    let mut all = vec![true; n];
-    for (_, region) in lane_regions(st)? {
-        for b in (0..n).filter(|&b| region[b]) {
-            all[b] = false;
-        }
-    }
-    Some(all)
-}
-
-/// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
-/// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
-    let n = st.exits.len();
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, e) in st.exits.iter().enumerate() {
-        match *e {
-            LaneExit::Jump(t) => succ[b].push(t),
-            LaneExit::Branch { taken, not_taken, .. } => {
-                succ[b].push(taken);
-                succ[b].push(not_taken);
-            }
-            LaneExit::End => {}
-            LaneExit::Indirect => return None,
-        }
-    }
-    // post-dominators (bitsets; a virtual exit after every End)
-    let words = n.div_ceil(64);
-    let full = vec![u64::MAX; words];
-    let mut pdom: Vec<Vec<u64>> = (0..n).map(|b| if succ[b].is_empty() { let mut v = vec![0; words]; v[b / 64] |= 1 << (b % 64); v } else { full.clone() }).collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in (0..n).rev() {
-            if succ[b].is_empty() {
-                continue;
-            }
-            let mut v = full.clone();
-            for &t in &succ[b] {
-                for w in 0..words {
-                    v[w] &= pdom[t][w];
-                }
-            }
-            v[b / 64] |= 1 << (b % 64);
-            if v != pdom[b] {
-                pdom[b] = v;
-                changed = true;
-            }
-        }
-    }
-    let mut regions = Vec::new();
-    for (d, e) in st.exits.iter().enumerate() {
-        let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
-            continue; // a wave-wide or uniform branch: all lanes go the same way
-        }
-        // blocks reachable from the lane branch that do not post-dominate it
-        let mut seen = vec![false; n];
-        let mut stack: Vec<usize> = succ[d].clone();
-        while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
-                continue;
-            }
-            seen[b] = true;
-            stack.extend(succ[b].iter().copied());
-        }
-        regions.push((d, seen));
-    }
-    Some(regions)
-}
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
@@ -825,84 +773,6 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
-/// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
-/// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
-/// group barrier) at its start and before its exit. `None` if barriers cannot keep the
-/// console's order.
-///
-/// The console runs the wave's lanes in step, so an LDS write is seen by every later read. Two
-/// host waves keep that order if they meet between any two accesses of which one writes. A
-/// barrier must be run by every thread, so it cannot stand in a lane branch's region; but
-/// every way into and out of such a region passes a block all lanes run, and the waves meet
-/// there: before the exit of an all-lane block into a region with LDS accesses, and at the
-/// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
-/// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
-/// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
-    let n = st.exits.len();
-    let succ = |b: usize| -> Vec<usize> {
-        match st.exits[b] {
-            LaneExit::Jump(t) => vec![t],
-            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
-            LaneExit::End | LaneExit::Indirect => Vec::new(),
-        }
-    };
-    // regions: blocks not every lane runs, joined by the edges between them
-    let mut region: Vec<usize> = (0..n).collect();
-    fn find(region: &mut [usize], mut b: usize) -> usize {
-        while region[b] != b {
-            region[b] = region[region[b]];
-            b = region[b];
-        }
-        b
-    }
-    for b in 0..n {
-        for t in succ(b) {
-            if !all[b] && !all[t] {
-                let (x, y) = (find(&mut region, b), find(&mut region, t));
-                region[x] = y;
-            }
-        }
-    }
-    // per region: LDS reads, LDS writes
-    let mut reads = vec![false; n];
-    let mut writes = vec![false; n];
-    for (b, block) in p.blocks.iter().enumerate().take(n) {
-        if all[b] {
-            continue;
-        }
-        let r = find(&mut region, b);
-        for i in &block.insts {
-            let name = i.name();
-            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
-                continue;
-            }
-            if name.starts_with("ds_read") {
-                reads[r] = true;
-            } else {
-                writes[r] = true;
-            }
-        }
-    }
-    if (0..n).any(|r| reads[r] && writes[r]) {
-        return None;
-    }
-    let mut meet = vec![(false, false); n];
-    for b in 0..n {
-        for t in succ(b) {
-            if all[b] && !all[t] {
-                let r = find(&mut region, t);
-                meet[b].1 |= reads[r] || writes[r];
-            } else if !all[b] && all[t] {
-                let r = find(&mut region, b);
-                meet[t].0 |= reads[r] || writes[r];
-            }
-        }
-    }
-    Some(meet)
-}
-
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
 /// own bit by its console lane.
 fn lane_constant_masks(st: &Structured) -> bool {
@@ -1271,6 +1141,8 @@ impl<'a> Lower<'a> {
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
+        let mut one_wave_lds: Option<(Vec<bool>, bool)> = None;
+        let mut flat_skips: HashMap<usize, (usize, usize)> = HashMap::new();
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
@@ -1323,12 +1195,21 @@ impl<'a> Lower<'a> {
                     // LDS the console shares within its one wave without barriers: split into
                     // two waves of 32, a group barrier before every LDS access keeps their order
                     // – where every thread of the group gets there (no lane branch around it,
-                    // no guard), else a barrier would hang the group
+                    // no guard), else a barrier would hang the group.
+                    // For multi-wave groups (`group > 64`), workgroup-wide barriers in
+                    // `exchange_halves` / `split_lds` also require every console wave in the
+                    // group to reach the block (`all_group_blocks`), not just every lane of one
+                    // console wave.
                     let lds = |i: &Inst| {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
-                    if let Some(all) = all_lane_blocks(x.st) {
+                    let group_blocks = if group > 64 {
+                        all_group_blocks(p, x.st, crosses && !LOCAL_WAVES.get())
+                    } else {
+                        all_lane_blocks(x.st).map(|all| (all, HashMap::new()))
+                    };
+                    if let Some((all, skips)) = group_blocks {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
@@ -1354,6 +1235,7 @@ impl<'a> Lower<'a> {
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
+                                flat_skips = skips;
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
                             }
@@ -1397,6 +1279,37 @@ impl<'a> Lower<'a> {
                     }
                     why.sort_unstable();
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
+                }
+            }
+            // Single-wave Wave32 compute groups sharing LDS rely on AMD SIMD lockstep +
+            // `s_waitcnt lgkmcnt(0)` without `s_barrier`. DXIL and NVIDIA ITS require an
+            // explicit TGSM barrier across cross-lane write/read transitions.
+            if wave == 32 && wave_shared_lds && !split_lds {
+                let lds = |i: &Inst| {
+                    matches!(i.fields, Fields::Ds { .. })
+                        && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+                };
+                if let Some(all) = all_lane_blocks(x.st) {
+                    let mut lds_blocks = 0usize;
+                    let mut has_preds_on_lds = false;
+                    let mut all_ok = true;
+                    for (b, blk) in p.blocks.iter().enumerate() {
+                        if blk.insts.iter().any(lds) {
+                            lds_blocks += 1;
+                            if !blk.preds.is_empty() {
+                                has_preds_on_lds = true;
+                            }
+                            if !all.get(b).copied().unwrap_or(false) {
+                                all_ok = false;
+                            }
+                        }
+                    }
+                    if lds_blocks > 0 {
+                        if !all_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                            lds_meet = Some((all.clone(), meet));
+                        }
+                        one_wave_lds = Some((all, lds_blocks > 1 || has_preds_on_lds));
+                    }
                 }
             }
             if wave == 32 && x.native.wave64 {
@@ -1546,6 +1459,12 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            one_wave_lds,
+            lds_state: 0,
+            #[cfg(test)]
+            lds_meetings: 0,
+            flat_skips,
+            flat_conds: HashMap::new(),
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
@@ -2255,6 +2174,7 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            self.lds_state = 0;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
@@ -2272,6 +2192,14 @@ impl<'a> Lower<'a> {
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
+                self.lds_meeting();
+            }
+            if self.lds_state != 0
+                && self
+                    .one_wave_lds
+                    .as_ref()
+                    .is_some_and(|(all, sync_exit)| *sync_exit && all.get(b).copied().unwrap_or(false))
+            {
                 self.lds_meeting();
             }
             self.tail[b] = Some(self.cur);
@@ -2295,6 +2223,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            flat_skips: self.flat_skips.len(),
+            #[cfg(test)]
+            lds_meetings: self.lds_meetings,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4799,6 +4731,26 @@ impl<'a> Lower<'a> {
             let mode = self.s.m.i32(meeting_mode());
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        } else if let Some((all, _)) = &self.one_wave_lds
+            && all.get(b).copied().unwrap_or(false)
+        {
+            if name == "s_barrier" {
+                self.lds_state = 0;
+            } else if matches!(inst.fields, Fields::Ds { .. })
+                && !(name.starts_with("ds_swizzle") || name.contains("permute"))
+            {
+                let kind: u8 = if name.starts_with("ds_read") {
+                    1
+                } else if name.starts_with("ds_write") {
+                    2
+                } else {
+                    3
+                };
+                if self.lds_state != 0 && self.lds_state != kind {
+                    self.lds_meeting();
+                }
+                self.lds_state = kind;
+            }
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
@@ -4863,6 +4815,11 @@ impl<'a> Lower<'a> {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.lds_state = 0;
+        #[cfg(test)]
+        {
+            self.lds_meetings += 1;
+        }
     }
 
     /// Whether `v` is a register no program reads as a number: a descriptor dword without
@@ -11099,35 +11056,48 @@ impl<'a> Lower<'a> {
                         (c, taken, not_taken)
                     }
                 };
-                // A back edge is taken only below the iteration limit.
-                let back =
-                    |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
-                // (No `xor` of a compare: a loop exit testing one hung the
-                // AMD driver.)
-                let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
-                    self.s.m.bin(self.cur, Bin::And, cond, ok)
-                } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
-                    self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                // Flattened wave-varying scalar forward-skip: run `body` unconditionally
+                // so every wave hits `exchange_halves` barriers in lockstep, then pick
+                // between `d` and `body` values at `join` via `select` in `fill_phis`.
+                if let Some(&(body, join)) = self.flat_skips.get(&b) {
+                    let skip_on_true = taken == join;
+                    debug_assert!(
+                        (taken == join && not_taken == body)
+                            || (taken == body && not_taken == join)
+                    );
+                    self.flat_conds.insert(join, (b, body, cond, skip_on_true));
+                    Term::Br(self.block[body].expect("reachable"))
                 } else {
-                    cond
-                };
-                // Critical edges get a block of their own, so loops have
-                // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                for (to, via) in [(taken, t), (not_taken, f)] {
-                    if !back(self, to) {
-                        // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
-                            self.cur
-                        } else {
-                            via
-                        };
-                        self.enter_loop(b, to, from);
+                    // A back edge is taken only below the iteration limit.
+                    let back =
+                        |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
+                    // (No `xor` of a compare: a loop exit testing one hung the
+                    // AMD driver.)
+                    let cond = if back(self, taken) {
+                        let ok = self.count_iteration(taken, pred::IULT);
+                        self.s.m.bin(self.cur, Bin::And, cond, ok)
+                    } else if back(self, not_taken) {
+                        let stop = self.count_iteration(not_taken, pred::IUGE);
+                        self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    } else {
+                        cond
+                    };
+                    // Critical edges get a block of their own, so loops have
+                    // dedicated exits and preheaders as DXC emits them.
+                    let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                    for (to, via) in [(taken, t), (not_taken, f)] {
+                        if !back(self, to) {
+                            // From an edge block, or from here.
+                            let from = if Some(via) == self.block[to] {
+                                self.cur
+                            } else {
+                                via
+                            };
+                            self.enter_loop(b, to, from);
+                        }
                     }
+                    Term::CondBr(cond, t, f)
                 }
-                Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
                 if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
@@ -11240,13 +11210,24 @@ impl<'a> Lower<'a> {
                 .get(&phi.value)
                 .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
             let mut incoming = Vec::new();
+            let mut by_pred: Vec<(usize, V, usize)> = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
+                by_pred.push((q, x, qb));
                 incoming.push((x, qb));
             }
-            self.s.m.set_phi(v, incoming);
+            if let Some(&(d, body, cond, skip_on_true)) = self.flat_conds.get(&b) {
+                let val_d = by_pred.iter().find(|&&(q, _, _)| q == d).expect("flat skip pred").1;
+                let &(_, val_body, body_tail) =
+                    by_pred.iter().find(|&&(q, _, _)| q == body).expect("flat skip body");
+                let (t_val, f_val) = if skip_on_true { (val_d, val_body) } else { (val_body, val_d) };
+                let sel = self.s.m.select(body_tail, cond, t_val, f_val);
+                self.s.m.set_phi(v, vec![(sel, body_tail)]);
+            } else {
+                self.s.m.set_phi(v, incoming);
+            }
         }
         // A join that only another join reads is read wherever that one is. Left
         // unmarked, a value without a DXIL form coming into it became zero without a
@@ -11289,6 +11270,7 @@ impl<'a> Lower<'a> {
                     .iter()
                     .any(|a| matches!(self.vals.get(a), Some(Val::I32(_))));
             let mut incoming = Vec::new();
+            let mut by_pred: Vec<(usize, V, usize)> = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
@@ -11362,9 +11344,19 @@ impl<'a> Lower<'a> {
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
                 };
+                by_pred.push((q, x, qb));
                 incoming.push((x, qb));
             }
-            self.s.m.set_phi(v, incoming);
+            if let Some(&(d, body, cond, skip_on_true)) = self.flat_conds.get(&b) {
+                let val_d = by_pred.iter().find(|&&(q, _, _)| q == d).expect("flat skip pred").1;
+                let &(_, val_body, body_tail) =
+                    by_pred.iter().find(|&&(q, _, _)| q == body).expect("flat skip body");
+                let (t_val, f_val) = if skip_on_true { (val_d, val_body) } else { (val_body, val_d) };
+                let sel = self.s.m.select(body_tail, cond, t_val, f_val);
+                self.s.m.set_phi(v, vec![(sel, body_tail)]);
+            } else {
+                self.s.m.set_phi(v, incoming);
+            }
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);

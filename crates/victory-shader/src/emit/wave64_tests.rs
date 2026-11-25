@@ -530,3 +530,212 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// Lowers `native` for a host of 32-lane waves and returns both the [`HostShader`] and
+/// the lowering diagnostics (`flat_skips`, `lds_meetings`).
+fn lowered_with_stats(
+    native: &NativeProgram,
+    p: &ir::Program,
+    wide: &HashSet<usize>,
+) -> Result<(HostShader, usize, u32), ShaderError> {
+    let st = structure::structure_wide(p, wide).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let l = lower::lower(&lower::Parts {
+        native,
+        p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let l = l?;
+    let flat_skips = l.flat_skips;
+    let lds_meetings = l.lds_meetings;
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    Ok((shader, flat_skips, lds_meetings))
+}
+
+/// Multi-wave (`group = 128 > 64`) console wave64 shader with a wave-varying scalar skip
+/// (`s_bcnt1_i32_b64 -> s_cbranch_scc1`) around a pure single-block body that itself uses
+/// wave exchange (`ShallowWaterSim:CS_AssembleComputeList` pattern). Flattening the skip
+/// keeps the workgroup-wide exchange barriers uniform across both console waves while
+/// preserving per-wave results via `select` at the join.
+#[test]
+fn multi_wave_pure_scalar_skip_around_exchange_is_flattened() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE82_106A, // s_bcnt1_i32_b64 s2, vcc
+        0x7E08_0281, // v_mov_b32 v4, 1
+        0xBF85_0004, // s_cbranch_scc1 +4 (skip pure body when any lane in this wave has v0 < s0)
+        // Pure single-block body with wave exchange:
+        0x7D84_0001, // v_cmp_eq_u32 vcc, s1, v0
+        0xBE82_106A, // s_bcnt1_i32_b64 s2, vcc
+        0x8502_8082, // s_cselect_b32 s2, 2, 0
+        0x7E08_0202, // v_mov_b32 v4, s2
+        // Join: each console wave writes its v4 to UAV[wave_id]
+        0x2C0A_0086, // v_lshrrev_b32 v5, 6, v0
+        0x340A_0A82, // v_lshlrev_b32 v5, 2, v5
+        0xE070_1000,
+        0x8002_0405, // buffer_store_dword v4, v5, s[8:11], 0 offen
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let (shader, flat_skips, _) =
+        lowered_with_stats(&native, &p, &HashSet::new()).expect("lower");
+    assert_eq!(flat_skips, 1, "wave-varying pure scalar skip must be flattened");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    // Wave 0 = lanes 0..63, Wave 1 = lanes 64..127.
+    // Divergent case (s0=1, s1=100): Wave 0 skips body -> 1; Wave 1 enters body -> 2.
+    for (s0, s1, expected) in [
+        (1u32, 100u32, [1u32, 2u32]),
+        (1, 999, [1, 0]),
+        (0, 100, [0, 2]),
+        (65, 100, [1, 1]),
+    ] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = [s0, s1][d as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!([out[0][0], out[0][1]], expected, "s0={s0}, s1={s1}");
+    }
+    eprintln!("ran on the hardware device: flattened multi-wave scalar skip around exchange");
+}
+
+/// A multi-wave (`group = 128 > 64`) wave-varying scalar skip whose body has a side effect
+/// (`buffer_store_dword`) cannot be flattened, so lowering must refuse placing a workgroup-wide
+/// exchange barrier inside it rather than emitting a divergent barrier.
+#[test]
+fn multi_wave_side_effect_scalar_skip_around_exchange_refuses_divergent_barrier() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE82_106A, // s_bcnt1_i32_b64 s2, vcc
+        0xBF85_0006, // s_cbranch_scc1 +6
+        // Side-effectful body with wave exchange:
+        0x7D84_0001, // v_cmp_eq_u32 vcc, s1, v0
+        0xBE82_106A, // s_bcnt1_i32_b64 s2, vcc
+        0x8502_8082, // s_cselect_b32 s2, 2, 0
+        0x7E08_0202, // v_mov_b32 v4, s2
+        0xE070_0000,
+        0x8002_0400, // buffer_store_dword v4, off, s[8:11], 0
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let res = lowered(&native, &p, &HashSet::new());
+    assert!(
+        matches!(
+            &res,
+            Err(ShaderError::Unsupported { what, .. })
+                if *what == "a lane mask exchanged where not every lane runs"
+        ),
+        "expected divergent multi-wave exchange refusal, got {:?}",
+        res.err()
+    );
+}
+
+/// Native single-wave Wave32 compute group (`threads = [32, 1, 1]`) sharing LDS across lanes
+/// with no `s_barrier` (`ShallowWaterSim:CS_ApplyDisturb` pattern). Lowering must insert a
+/// TGSM barrier on the write-to-read transition so cross-lane reads see sibling writes under
+/// DXIL and independent thread scheduling.
+#[test]
+fn single_wave32_shared_lds_syncs_write_to_read() {
+    let words = [
+        0x4A02_0000, // v_add_nc_u32 v1, s0, v0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x36 << 26 | 0x0D << 18,
+        1 << 8 | 2, // ds_write_b32 v2, v1 (no s_barrier after)
+        0x4A06_0091, // v_add_nc_u32 v3, 17, v0
+        0x3606_069F, // v_and_b32 v3, 31, v3
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3
+        0x36 << 26 | 0x36 << 18,
+        4 << 24 | 3, // ds_read_b32 v4, v3
+        0xE070_1000,
+        0x8002_0402, // buffer_store_dword v4, v2, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, false, 32);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 B LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let (shader, _, lds_meetings) =
+        lowered_with_stats(&native, &p, &HashSet::new()).expect("lower");
+    assert_eq!(lds_meetings, 1, "write->read transition in single-wave Wave32 LDS must emit 1 TGSM barrier");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    let base = 0x1234_0000u32;
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = base;
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(32)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    for t in 0..32u32 {
+        let expected = base + ((t + 17) & 31);
+        assert_eq!(out[0][t as usize], expected, "lane {t}");
+    }
+    eprintln!("ran on the hardware device: single-wave Wave32 LDS cross-lane sync across all 32 lanes");
+}
