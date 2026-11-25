@@ -18,6 +18,11 @@ use super::slot_map::SlotMap;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Number of buckets partitioning [`HostHeap::buffers`] by `index % BUFFER_BUCKETS`,
+/// matching `draw.rs`'s 16-pass amortized buffer sweep so each pass clones only its
+/// `1 / 16` slice without scanning the whole set.
+pub(crate) const BUFFER_BUCKETS: usize = 16;
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -79,11 +84,12 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
-    /// Title slots holding buffer views. Such a view gets its host slot
+    /// Title slots holding buffer views, partitioned into [`BUFFER_BUCKETS`]
+    /// buckets by `index % BUFFER_BUCKETS`. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
-    /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
-    /// buffers from the whole heap.
-    buffers: Mutex<std::collections::BTreeSet<u32>>,
+    /// through a table, or [`HostHeap::buffer_slots_bucket`] for shaders that
+    /// pick buffers from the whole heap.
+    buffers: [Mutex<std::collections::BTreeSet<u32>>; BUFFER_BUCKETS],
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
@@ -1234,7 +1240,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
-            buffers: Mutex::default(),
+            buffers: std::array::from_fn(|_| Mutex::default()),
             changed: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { titled })
@@ -1480,16 +1486,16 @@ impl HostHeap {
     /// nothing and leaves the sets of the slots shaders pick by index (as
     /// the fork did), and a pool slot is given back. `for_draw`: the slot
     /// leaves the sets even if its host slot was never made.
-    fn empty_slot(&self, made: &mut Made, title: u32, for_draw: bool) {
+    fn empty_slot(&self, made: &mut Made, title: u32, for_draw: bool, mark_changed: bool) {
         match made.host(title) {
             Some(host) if made.keys[host as usize] != 0 => {
                 made.keys[host as usize] = 0;
                 self.make_null(host);
-                let _ = self.note_buffer(title, None, false);
+                let _ = self.note_buffer_in(title, None, false, mark_changed);
             }
             // Left for later and stale since: out of the sets and the stride table.
             _ if for_draw => {
-                let _ = self.note_buffer(title, None, false);
+                let _ = self.note_buffer_in(title, None, false, mark_changed);
             }
             _ => {}
         }
@@ -1529,7 +1535,7 @@ impl HostHeap {
             })
             .collect();
         for &title in &dead {
-            self.empty_slot(made, title, true);
+            self.empty_slot(made, title, true, true);
         }
         // The first passes at warn level, the rest at debug.
         static PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1961,10 +1967,26 @@ impl HostHeap {
         }
     }
 
-    /// The title slots that hold buffer views.
+    /// The title slots holding buffer views in bucket `bucket % BUFFER_BUCKETS`,
+    /// returned in strictly ascending order (clones only `1 / BUFFER_BUCKETS`
+    /// of the heap's buffer slots).
+    pub(crate) fn buffer_slots_bucket(&self, bucket: usize) -> Vec<u32> {
+        let slots = self.buffers[bucket % BUFFER_BUCKETS]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        slots.iter().copied().collect()
+    }
+
+    /// All title slots holding buffer views across every bucket (tests).
+    #[cfg(test)]
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
-        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
+        let mut all = Vec::new();
+        for bucket in &self.buffers {
+            let slots = bucket.lock().unwrap_or_else(|e| e.into_inner());
+            all.extend(slots.iter().copied());
+        }
+        all.sort_unstable();
+        all
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -1982,10 +2004,21 @@ impl HostHeap {
     /// Returns the title slots whose placed texture view the write made
     /// stale ([`Spans`]): out of the queue of textures already, their host
     /// slots are the caller's to make null (it holds `made`).
+    #[cfg(test)]
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
+        self.note_buffer_in(index, view, seen, true)
+    }
+
+    /// [`HostHeap::note_buffer`] with `mark_changed` controlling whether a
+    /// buffer slot update is queued into `self.changed` (`false` when called
+    /// from `State::heap_buffers`, which updates its own `ranges` cache
+    /// immediately and would otherwise re-process every new buffer slot on
+    /// the following frame).
+    fn note_buffer_in(&self, index: u32, view: Option<&View>, seen: bool, mark_changed: bool) -> Vec<u32> {
         if self.sampler {
             return Vec::new();
         }
+        let frame = crate::frame::current();
         // Measured for the texture side of the same gap (textures a shader
         // picks by a computed index are neither made, if placed, nor
         // uploaded): slots written with a placed texture view, and with a
@@ -2001,14 +2034,14 @@ impl HostHeap {
             }
             _ => false,
         };
-        self.queue_texture(index, texture, seen, crate::frame::current());
+        self.queue_texture(index, texture, seen, frame);
         // The memory a placed texture view describes. Not for a slot
         // tables read (thousands of writes a frame, each read by its
         // draw): no pass looks at it, and the same texture's view in a
         // slot shaders pick by index says what it says.
         let placed_view = match view {
             Some(View::Placed(false, resource, desc))
-                if resource[0] != 1 && !self.tabled_lately(index, crate::frame::current()) =>
+                if resource[0] != 1 && !self.tabled_lately(index, frame) =>
             {
                 // (And the level the view starts at: word 4 of a texture
                 // view's description, after format, dimension, mapping
@@ -2025,8 +2058,12 @@ impl HostHeap {
             });
             match span {
                 Some((start, end, first)) => {
-                    SPANNED[0].fetch_min(start, Relaxed);
-                    SPANNED[1].fetch_max(end, Relaxed);
+                    if start < SPANNED[0].load(Relaxed) {
+                        SPANNED[0].fetch_min(start, Relaxed);
+                    }
+                    if end > SPANNED[1].load(Relaxed) {
+                        SPANNED[1].fetch_max(end, Relaxed);
+                    }
                     placed.rule = stale_rule();
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first);
@@ -2053,14 +2090,18 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        let was = if stride.is_some() {
-            buffers.insert(index);
-            true
-        } else {
-            buffers.remove(&index)
+        let was = {
+            let mut bucket = self.buffers[(index as usize) % BUFFER_BUCKETS]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if stride.is_some() {
+                bucket.insert(index);
+                true
+            } else {
+                bucket.remove(&index)
+            }
         };
-        if was {
+        if was && mark_changed {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2244,58 +2285,274 @@ impl HostHeap {
         }
     }
 
-    /// For a slot on a page of the title's heap that changed with no call
-    /// (`super::sync_heaps`: the title copies records into its heap as
-    /// bytes): [`HostHeap::mirror`], if the `bytes` bytes of the record at
-    /// `handle` are not the ones this last saw there. True if it did.
+    /// Scans complete title slots `first..last` (each `step` bytes, starting at
+    /// `start`) on one changed heap page and mirrors only untabled slots whose
+    /// 12-byte `[tag, i, generation]` record key changed since last seen.
     ///
-    /// The page says only that something on it was written, and `mirror`
-    /// by itself would take every buffer or placed-texture record on it for
-    /// newly written each time (it leaves such a slot unmade until a draw
-    /// or a pass uses it): the texture queue's entry for the slot would
-    /// start again, and the buffer pass would look at 2,048 slots for one
-    /// that changed.
-    /// `record`: the record's bytes as the caller read them (through the
-    /// kernel, which fails on a page the title unmapped meanwhile where a
-    /// read in place would fault: the title unmaps heap pages too).
-    /// Lock-free variant of [`HostHeap::mirror_copied`] with `frame` hoisted
-    /// by the caller: reads the exact 12-byte `[tag, i, generation]` key that
-    /// [`HostHeap::mirror`] consumes (zero hashing, zero mutex locking).
-    pub(crate) fn mirror_copied_in(&self, index: u32, handle: u64, record: &[u8], frame: u64) -> bool {
+    /// Trims leading/trailing tabled runs BEFORE copying title memory (so pages
+    /// filled wholly by per-draw tables skip `read_into` / `try_copy_fast` and
+    /// `self.copied` entirely) and returns `(page_ok, looked, mirrored, tabled)`
+    /// so the caller flushes `COPIED_TABLED` once per `sync_heaps` pass instead
+    /// of doing a per-slot atomic `fetch_add`.
+    pub(crate) fn sync_copied_page(
+        &self,
+        first: u32,
+        last: u32,
+        start: u64,
+        step: u64,
+        frame: u64,
+        page_bytes: &mut [u8],
+    ) -> (bool, u64, u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        let mirrored = self.mirrored_count();
-        if index >= mirrored {
-            return false;
+        let mirrored_limit = self.mirrored_count();
+        let first = first.min(mirrored_limit);
+        let last = last.min(mirrored_limit);
+        if first >= last || step < 12 {
+            return (false, 0, 0, 0);
         }
-        if !sync_tables() && self.tabled_lately(index, frame) {
-            COPIED_TABLED.fetch_add(1, Relaxed);
-            return false;
-        }
-        if record.len() < 12 {
-            return false;
-        }
-        let tag = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
-        let i = u32::from_le_bytes([record[4], record[5], record[6], record[7]]);
-        let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-        // Generations start at 1 (and inline kinds set upper bits), so any
-        // valid VIEW_TAG record has a non-zero key; non-VIEW_TAG / zeros map to 0.
-        let key = if tag == VIEW_TAG {
-            u64::from(generation) << 32 | u64::from(i)
-        } else {
-            0
+        let total = u64::from(last - first);
+        let skip_tabled = !sync_tables() && tabled_out() && !self.tabled.is_empty();
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        let is_tabled_raw = |raw: u32| -> bool {
+            let stamp = raw & !TABLED_READ;
+            stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
         };
+
+        let (scan_first, scan_last, mut tabled) = if skip_tabled {
+            let tabled_end = (last as usize).min(self.tabled.len());
+            let mut f = first as usize;
+            while f < tabled_end && is_tabled_raw(self.tabled[f].load(Relaxed)) {
+                f += 1;
+            }
+            if f == last as usize {
+                return (true, total, 0, total);
+            }
+            let mut l = last as usize;
+            while l > f && l <= tabled_end && is_tabled_raw(self.tabled[l - 1].load(Relaxed)) {
+                l -= 1;
+            }
+            let trimmed = (f - first as usize) + (last as usize - l);
+            (f as u32, l as u32, trimmed as u64)
+        } else {
+            (first, last, 0u64)
+        };
+
+        let copy_from = start + u64::from(scan_first) * step;
+        let copy_len = (scan_last - scan_first) as usize * step as usize;
+        if copy_len > page_bytes.len() {
+            return (false, 0, 0, 0);
+        }
+        let slice = &mut page_bytes[..copy_len];
+        // `read_into` uses VEH-guarded `try_copy_fast` first and falls back to
+        // `ReadProcessMemory` so an unmapped heap page fails cleanly without
+        // turning into zeros.
+        if !crate::host::read_into(copy_from as *const u8, slice) {
+            return (false, 0, 0, 0);
+        }
+
+        let (mirrored, inner_tabled) = self.mirror_copied_slice(
+            scan_first,
+            scan_last,
+            start,
+            step,
+            slice,
+            skip_tabled,
+            now,
+        );
+        tabled += inner_tabled;
+        (true, total, mirrored, tabled)
+    }
+
+    /// Inner hot loop for [`HostHeap::sync_copied_page`]: walks `slice` holding
+    /// `step`-byte records for title slots `first..last`, skips tabled slots,
+    /// compares each untabled slot's 12-byte key against `self.copied`, and
+    /// mirrors only changed keys. Returns `(mirrored, tabled_skipped)`.
+    fn mirror_copied_slice(
+        &self,
+        first: u32,
+        last: u32,
+        start: u64,
+        step: u64,
+        slice: &[u8],
+        skip_tabled: bool,
+        now: u32,
+    ) -> (u64, u64) {
+        let mirrored_limit = self.mirrored_count();
         let copied = self
             .copied
-            .get_or_init(|| (0..mirrored as usize).map(|_| AtomicU64::new(0)).collect());
-        let Some(slot) = copied.get(index as usize) else {
-            return false;
+            .get_or_init(|| (0..mirrored_limit as usize).map(|_| AtomicU64::new(0)).collect());
+        let copied_slice = &copied[first as usize..last as usize];
+        let tabled_slice = if skip_tabled {
+            let end = (last as usize).min(self.tabled.len());
+            if (first as usize) < end {
+                &self.tabled[first as usize..end]
+            } else {
+                &[]
+            }
+        } else {
+            &[]
         };
-        if slot.load(Relaxed) == key {
-            return false;
+
+        match step {
+            32 => self.scan_copied_chunks::<32>(first, start, slice, copied_slice, tabled_slice, now),
+            16 => self.scan_copied_chunks::<16>(first, start, slice, copied_slice, tabled_slice, now),
+            _ => self.scan_copied_dynamic(first, start, step, slice, copied_slice, tabled_slice, now),
         }
-        slot.store(key, Relaxed);
-        self.mirror(index, handle, false);
-        true
+    }
+
+    /// Constant-stride inner scan for view (`32`) and sampler (`16`) heaps:
+    /// hoists `OnceLock`/`frame` checks out of the loop, eliminates per-slot
+    /// bounds checks and atomic RMWs, and keeps key extraction branchless.
+    fn scan_copied_chunks<const STEP: usize>(
+        &self,
+        first: u32,
+        start: u64,
+        slice: &[u8],
+        copied_slice: &[AtomicU64],
+        tabled_slice: &[std::sync::atomic::AtomicU32],
+        now: u32,
+    ) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        const { assert!(STEP >= 12) };
+        let step_u64 = STEP as u64;
+        let mut mirrored = 0u64;
+        let mut tabled = 0u64;
+
+        if tabled_slice.len() >= copied_slice.len() {
+            for (off, ((record, seen_slot), tabled_slot)) in slice
+                .chunks_exact(STEP)
+                .zip(copied_slice.iter())
+                .zip(tabled_slice.iter())
+                .enumerate()
+            {
+                let stamp = tabled_slot.load(Relaxed) & !TABLED_READ;
+                if stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES {
+                    tabled += 1;
+                    continue;
+                }
+                let tag = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+                let key = if tag == VIEW_TAG {
+                    u64::from_le_bytes([
+                        record[4], record[5], record[6], record[7],
+                        record[8], record[9], record[10], record[11],
+                    ])
+                } else {
+                    0
+                };
+                if seen_slot.load(Relaxed) == key {
+                    continue;
+                }
+                seen_slot.store(key, Relaxed);
+                let index = first + off as u32;
+                let handle = start + u64::from(index) * step_u64;
+                self.mirror(index, handle, false);
+                mirrored += 1;
+            }
+        } else {
+            for (off, (record, seen_slot)) in slice
+                .chunks_exact(STEP)
+                .zip(copied_slice.iter())
+                .enumerate()
+            {
+                if let Some(tabled_slot) = tabled_slice.get(off) {
+                    let stamp = tabled_slot.load(Relaxed) & !TABLED_READ;
+                    if stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES {
+                        tabled += 1;
+                        continue;
+                    }
+                }
+                let tag = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+                let key = if tag == VIEW_TAG {
+                    u64::from_le_bytes([
+                        record[4], record[5], record[6], record[7],
+                        record[8], record[9], record[10], record[11],
+                    ])
+                } else {
+                    0
+                };
+                if seen_slot.load(Relaxed) == key {
+                    continue;
+                }
+                seen_slot.store(key, Relaxed);
+                let index = first + off as u32;
+                let handle = start + u64::from(index) * step_u64;
+                self.mirror(index, handle, false);
+                mirrored += 1;
+            }
+        }
+        (mirrored, tabled)
+    }
+
+    /// Fallback for non-16/32 descriptor strides.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_copied_dynamic(
+        &self,
+        first: u32,
+        start: u64,
+        step: u64,
+        slice: &[u8],
+        copied_slice: &[AtomicU64],
+        tabled_slice: &[std::sync::atomic::AtomicU32],
+        now: u32,
+    ) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut mirrored = 0u64;
+        let mut tabled = 0u64;
+        for (off, (record, seen_slot)) in slice
+            .chunks_exact(step as usize)
+            .zip(copied_slice.iter())
+            .enumerate()
+        {
+            if let Some(tabled_slot) = tabled_slice.get(off) {
+                let stamp = tabled_slot.load(Relaxed) & !TABLED_READ;
+                if stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES {
+                    tabled += 1;
+                    continue;
+                }
+            }
+            if record.len() < 12 {
+                continue;
+            }
+            let tag = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+            let key = if tag == VIEW_TAG {
+                u64::from_le_bytes([
+                    record[4], record[5], record[6], record[7],
+                    record[8], record[9], record[10], record[11],
+                ])
+            } else {
+                0
+            };
+            if seen_slot.load(Relaxed) == key {
+                continue;
+            }
+            seen_slot.store(key, Relaxed);
+            let index = first + off as u32;
+            let handle = start + u64::from(index) * step;
+            self.mirror(index, handle, false);
+            mirrored += 1;
+        }
+        (mirrored, tabled)
+    }
+
+    /// Checks, in bounded chunks under `self.made`, which `(index, expected_key)`
+    /// candidates still have their host slot made from `expected_key` (and
+    /// mapped to a pool slot if past the identity window). Appends any slot
+    /// that does not match to `mismatched`.
+    pub(crate) fn collect_unmade_slots(&self, candidates: &[(u32, u64)], mismatched: &mut Vec<u32>) {
+        const CHUNK: usize = 512;
+        for chunk in candidates.chunks(CHUNK) {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for &(index, key) in chunk {
+                let matched = key != 0
+                    && made
+                        .host(index)
+                        .and_then(|host| made.keys.get(host as usize))
+                        .is_some_and(|&made_key| made_key == key);
+                if !matched {
+                    mismatched.push(index);
+                }
+            }
+        }
     }
 
     /// Makes title slot `index`'s host slot (its own, or with a heap map
@@ -2304,12 +2561,32 @@ impl HostHeap {
     /// there. Buffer views are made only for draws (`for_draw`), which also
     /// copy their data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_inner(index, handle, for_draw, true).map(|(view, _)| view)
+    }
+
+    /// [`HostHeap::mirror`] for `State::heap_buffers` (`for_draw = true`):
+    /// returns the view paired with the exact 64-bit key mirrored so the
+    /// caller can cache it without re-reading title memory, and avoids
+    /// re-inserting `index` into `self.changed` since the caller updates its
+    /// own cached range immediately.
+    pub(crate) fn mirror_for_buffers(&self, index: u32, handle: u64) -> Option<(View, u64)> {
+        self.mirror_inner(index, handle, true, false)
+    }
+
+    fn mirror_inner(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        mark_changed: bool,
+    ) -> Option<(View, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
         let mirrored = self.mirrored_count();
         if index >= mirrored {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            if index > HIGHEST.load(Relaxed) && HIGHEST.fetch_max(index, Relaxed) < index {
                 tracing::warn!(
                     index,
                     count = self.count,
@@ -2319,15 +2596,15 @@ impl HostHeap {
             }
             return None;
         }
-        if self.map.is_some() && index >= self.count {
+        if self.map.is_some()
+            && index >= self.count
+            && self.title_start.load(Relaxed) == 0
+        {
             // Where the title's descriptors start, for `reclaim`.
             let start = handle.wrapping_sub(u64::from(index) * TITLE_SLOT_BYTES);
-            let _ = self.title_start.compare_exchange(
-                0,
-                start,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            let _ = self
+                .title_start
+                .compare_exchange(0, start, Relaxed, Relaxed);
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -2336,17 +2613,17 @@ impl HostHeap {
         if let Some(copied) = self.copied.get()
             && let Some(slot) = copied.get(index as usize)
         {
-            slot.store(
-                if tag == VIEW_TAG { key } else { 0 },
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            let seen_key = if tag == VIEW_TAG { key } else { 0 };
+            if slot.load(Relaxed) != seen_key {
+                slot.store(seen_key, Relaxed);
+            }
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            self.empty_slot(&mut made, index, for_draw);
+            self.empty_slot(&mut made, index, for_draw, mark_changed);
             return None;
         };
         let Some((host, taken)) = self.host_slot(&mut made, index) else {
@@ -2354,19 +2631,19 @@ impl HostHeap {
             // guard. What the title wrote is noted all the same (the sets
             // of slots shaders pick by index retry it).
             if !for_draw {
-                for stale in self.note_buffer(index, Some(&view), false) {
+                for stale in self.note_buffer_in(index, Some(&view), false, mark_changed) {
                     if stale != index {
                         self.unmake(&mut made, stale);
                     }
                 }
             }
-            return Some(view);
+            return Some((view, key));
         };
         if taken || made.keys[host as usize] != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
+            for stale in self.note_buffer_in(index, Some(&view), for_draw, mark_changed) {
                 if stale != index {
                     self.unmake(&mut made, stale);
                 }
@@ -2393,8 +2670,8 @@ impl HostHeap {
                 && view_at(old as u32, (old >> 32) as u32)
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
-                KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
+                KEPT_VIEWS.fetch_add(1, Relaxed);
+                return Some((view, key));
             }
             made.keys[host as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -2412,7 +2689,7 @@ impl HostHeap {
                 note_pool(&made);
             }
         }
-        Some(view)
+        Some((view, key))
     }
 
     /// Whether title slot `index` is backed by a made host descriptor (tests).
@@ -2592,26 +2869,24 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if len == 0 {
         return None;
     }
-    // A view off its buffer's elements is made on a copy of its own bytes
-    // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
-    // of the copy they find, so that the copy brought up to date is the
-    // one the slot shows.
-    if let Some((base, width)) = buffer_extent(view)
-        && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
-        && let Some(whole) = crate::shadow::find(base, width)
-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
-        && let Some(own) = crate::shadow::exact(start, bytes)
-    {
-        return Some((own, start, bytes));
-    }
-    if view_extent()
-        && let Some((base, width)) = buffer_extent(view)
-        // (The console is lax: a view may begin past its buffer's end.)
-        && address >= base
-        && address - base < width.max(1)
-        && let Some(shadow) = crate::shadow::find(base, width)
-    {
-        return Some((shadow, address, len));
+    // Single `buffer_extent` + `shadow::find(base, width)` shared by both
+    // `own_bytes` and `view_extent`, avoiding a duplicate global shadow lookup.
+    if let Some((base, width)) = buffer_extent(view) {
+        let fields = own_copy_on().then(|| buffer_fields(view)).flatten();
+        let use_extent = view_extent() && address >= base && address - base < width.max(1);
+        if (fields.is_some() || use_extent)
+            && let Some(whole) = crate::shadow::find(base, width)
+        {
+            if let Some((first, count, element, stride, unknown)) = fields
+                && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
+                && let Some(own) = crate::shadow::exact(start, bytes)
+            {
+                return Some((own, start, bytes));
+            }
+            if use_extent {
+                return Some((whole, address, len));
+            }
+        }
     }
     crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
 }
@@ -4221,6 +4496,134 @@ mod tests {
         }
         assert_eq!(entry(heap, 30), (!freed, Some(freed)));
         assert_eq!(release(title), 0);
+    }
+
+    /// `HostHeap::buffers` is partitioned into `BUFFER_BUCKETS` (16) buckets
+    /// by `index % 16`: each bucket returns only its sorted `1 / 16` slice,
+    /// and `mark_changed = false` updates buckets without re-queuing `changed`.
+    #[test]
+    fn buffer_slots_are_partitioned_into_16_sorted_buckets() {
+        let Some(heap) = HostHeap::new(false, 256) else {
+            return; // no host GPU
+        };
+        let mut raw_desc = [0u32; 16];
+        // Buffer SRV (dimension = 1, raw flag = 1, R32_TYPELESS = 39).
+        raw_desc[0] = 39;
+        raw_desc[1] = 1;
+        raw_desc[6] = 16;
+        raw_desc[8] = 1;
+        let buf_view = View::Placed(false, [1, 0, 0, 0, 64, 0, 1, 1, 0, 1, 0, 0, 0, 0], raw_desc);
+        let inserted = [0u32, 1, 15, 16, 17, 31, 32, 48, 63, 128, 255];
+        for &slot in &inserted {
+            assert!(heap.note_buffer_in(slot, Some(&buf_view), false, true).is_empty());
+        }
+        let mut changes = heap.buffer_changes();
+        changes.sort_unstable();
+        assert_eq!(changes, inserted);
+        assert!(heap.buffer_changes().is_empty());
+
+        let mut union = Vec::new();
+        for bucket in 0..BUFFER_BUCKETS {
+            let slice = heap.buffer_slots_bucket(bucket);
+            assert!(slice.windows(2).all(|w| w[0] < w[1]), "bucket {bucket} must be strictly sorted");
+            for &slot in &slice {
+                assert_eq!((slot as usize) % BUFFER_BUCKETS, bucket);
+            }
+            union.extend(slice);
+        }
+        union.sort_unstable();
+        assert_eq!(union, inserted);
+        assert_eq!(heap.buffer_slots(), inserted);
+
+        // `mark_changed = false` (used by `mirror_for_buffers`) removes slot 16
+        // from bucket 0 without re-inserting it into `changed`.
+        assert!(heap.note_buffer_in(16, None, false, false).is_empty());
+        assert_eq!(heap.buffer_slots_bucket(0), vec![0, 32, 48, 128]);
+        assert!(heap.buffer_changes().is_empty());
+
+        // `mark_changed = true` removes slot 32 and queues it in `changed`.
+        assert!(heap.note_buffer_in(32, None, false, true).is_empty());
+        assert_eq!(heap.buffer_slots_bucket(0), vec![0, 48, 128]);
+        assert_eq!(heap.buffer_changes(), vec![32]);
+    }
+
+    /// `sync_copied_page` skips reading title memory on all-tabled pages, trims
+    /// leading/trailing tabled runs on mixed pages, skips unchanged untabled
+    /// slots, detects zeroing of previously mirrored slots, and batches the
+    /// tabled count in its return value instead of incrementing `COPIED_TABLED`
+    /// per slot.
+    #[test]
+    fn sync_copied_page_skips_tabled_and_unchanged_slots() {
+        let Some(heap) = HostHeap::new(false, 64) else {
+            return; // no host GPU
+        };
+        let frame = 500u64;
+        let mut page_bytes = vec![0u8; crate::watch::PAGE];
+
+        // Mark slots 0..16 as tabled in `frame`. Even with an unreadable `start = 0`,
+        // an all-tabled page must return `(true, 16, 0, 16)` without touching memory.
+        for slot in 0..16u32 {
+            heap.tabled_in(slot, true, frame);
+        }
+        let tabled_before = COPIED_TABLED.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            heap.sync_copied_page(0, 16, 0, TITLE_SLOT_BYTES, frame, &mut page_bytes),
+            (true, 16, 0, 16)
+        );
+        assert_eq!(
+            COPIED_TABLED.load(std::sync::atomic::Ordering::Relaxed),
+            tabled_before,
+            "sync_copied_page must batch tabled count instead of touching COPIED_TABLED per slot"
+        );
+
+        // Allocate a real 64-slot title heap buffer: mark leading (0..4), middle (6),
+        // and trailing (8..16) slots as tabled; leave slots 4, 5, 7 untabled.
+        let mut backing = vec![0u8; 64 * TITLE_SLOT_BYTES as usize];
+        let start = backing.as_mut_ptr() as u64;
+        let slot_handle = |s: u32| start + u64::from(s) * TITLE_SLOT_BYTES;
+        // Write NullConstant views (mirrored immediately with `for_draw = false`) at slots 5 and 7,
+        // and also at tabled slot 2 (which must be ignored!).
+        super::super::create_cbv(std::ptr::null(), std::ptr::null(), slot_handle(2));
+        super::super::create_cbv(std::ptr::null(), std::ptr::null(), slot_handle(5));
+        super::super::create_cbv(std::ptr::null(), std::ptr::null(), slot_handle(7));
+
+        let Some(mixed) = HostHeap::new(false, 64) else {
+            return;
+        };
+        for s in (0..4u32).chain(std::iter::once(6)).chain(8..16u32) {
+            mixed.tabled_in(s, true, frame);
+        }
+        // First pass: 16 looked, 2 untabled non-zero slots mirrored (5, 7), 13 tabled skipped.
+        assert_eq!(
+            mixed.sync_copied_page(0, 16, start, TITLE_SLOT_BYTES, frame, &mut page_bytes),
+            (true, 16, 2, 13)
+        );
+        assert!(!mixed.made(2), "tabled slot 2 must not be mirrored");
+        assert!(!mixed.made(4), "empty untabled slot 4 stays unmade");
+        assert!(mixed.made(5), "untabled slot 5 mirrored");
+        assert!(mixed.made(7), "untabled slot 7 mirrored");
+
+        // Second pass with nothing changed: 0 mirrored, 13 tabled skipped.
+        assert_eq!(
+            mixed.sync_copied_page(0, 16, start, TITLE_SLOT_BYTES, frame, &mut page_bytes),
+            (true, 16, 0, 13)
+        );
+
+        // Verify `collect_unmade_slots` matches live key at slot 5 and flags slot 4 / wrong key.
+        let (k5, _) = super::super::record_key(slot_handle(5)).expect("key at slot 5");
+        let mut mismatched = Vec::new();
+        mixed.collect_unmade_slots(&[(5, k5), (4, k5), (5, k5 ^ 1), (7, 0)], &mut mismatched);
+        assert_eq!(mismatched, vec![4, 5, 7]);
+
+        // Zero slot 5 in memory: next sync must detect `key = 0 != old_key` and clear slot 5.
+        let off5 = 5 * TITLE_SLOT_BYTES as usize;
+        backing[off5..off5 + TITLE_SLOT_BYTES as usize].fill(0);
+        assert_eq!(
+            mixed.sync_copied_page(0, 16, start, TITLE_SLOT_BYTES, frame, &mut page_bytes),
+            (true, 16, 1, 13)
+        );
+        assert!(!mixed.made(5), "zeroed slot 5 must be cleared");
+        assert!(mixed.made(7), "unchanged slot 7 stays made");
     }
 }
 

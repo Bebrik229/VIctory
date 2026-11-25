@@ -429,26 +429,178 @@ fn heap_recheck() -> bool {
 }
 
 /// Number of passes over which [`State::heap_buffers`] sweeps every buffer slot.
-const BUFFER_SWEEP_BUCKETS: u64 = 16;
+const BUFFER_SWEEP_BUCKETS: usize = crate::descriptor::host::BUFFER_BUCKETS;
 
-/// Combines buffer slots written since the last pass with the `1 / 16` slice
-/// of `all_slots` due in `pass`, deduplicating overlaps, and prunes cached
-/// entries in `ranges` belonging to the swept bucket before they are refreshed.
+/// Prepares one amortized buffer-sweep pass for a single bucket:
+/// - Prunes cached entries in `bucket_ranges` not present in sorted `bucket_slots`.
+/// - Sorts and deduplicates `changed` (slots forced onto the slow path).
+/// - Returns `(forced, check, pruned)` where `check = bucket_slots \ forced`
+///   are candidates eligible for the unchanged fast path.
 fn buffer_sweep_slots<V>(
-    pass: u64,
-    changed: Vec<u32>,
-    all_slots: &[u32],
-    ranges: &mut std::collections::HashMap<u32, V>,
-) -> Vec<u32> {
-    let bucket = (pass % BUFFER_SWEEP_BUCKETS) as u32;
-    let buckets = BUFFER_SWEEP_BUCKETS as u32;
-    ranges.retain(|&index, _| index % buckets != bucket);
-    let mut slots = changed;
-    slots.reserve(all_slots.len() / buckets as usize + 1);
-    slots.extend(all_slots.iter().copied().filter(|&index| index % buckets == bucket));
-    slots.sort_unstable();
-    slots.dedup();
-    slots
+    mut changed: Vec<u32>,
+    bucket_slots: &[u32],
+    bucket_ranges: &mut std::collections::HashMap<u32, V>,
+) -> (Vec<u32>, Vec<u32>, bool) {
+    let before = bucket_ranges.len();
+    bucket_ranges.retain(|index, _| bucket_slots.binary_search(index).is_ok());
+    let pruned = bucket_ranges.len() != before;
+
+    changed.sort_unstable();
+    changed.dedup();
+
+    let mut check = Vec::with_capacity(bucket_slots.len());
+    let mut ci = 0;
+    for &slot in bucket_slots {
+        while ci < changed.len() && changed[ci] < slot {
+            ci += 1;
+        }
+        if ci < changed.len() && changed[ci] == slot {
+            ci += 1;
+        } else {
+            check.push(slot);
+        }
+    }
+    (changed, check, pruned)
+}
+
+/// Cached buffer-view target for one title descriptor slot in [`State::heap_buffers`].
+struct BufferRange<S> {
+    key: u64,
+    forget_epoch: u64,
+    shadow: S,
+    from: u64,
+    to: u64,
+}
+
+/// One of [`BUFFER_SWEEP_BUCKETS`] partitions of cached buffer ranges, with its
+/// own pre-merged shadow spans rebuilt only when a slot in this bucket changes.
+struct BufferBucket<S> {
+    ranges: std::collections::HashMap<u32, BufferRange<S>>,
+    spans: Vec<(S, u64, u64)>,
+    dirty: bool,
+}
+
+impl<S> Default for BufferBucket<S> {
+    fn default() -> Self {
+        Self {
+            ranges: std::collections::HashMap::new(),
+            spans: Vec::new(),
+            dirty: false,
+        }
+    }
+}
+
+/// Per-host-heap buffer-sweep cache: 16 bucketed maps matching `HostHeap::buffers`
+/// plus incrementally maintained per-bucket and merged shadow spans.
+struct HeapBufferCache<S> {
+    passes: u64,
+    buckets: [BufferBucket<S>; BUFFER_SWEEP_BUCKETS],
+    merged_spans: Vec<(S, u64, u64)>,
+    merged_dirty: bool,
+    views: u32,
+}
+
+impl<S> Default for HeapBufferCache<S> {
+    fn default() -> Self {
+        Self {
+            passes: 0,
+            buckets: std::array::from_fn(|_| BufferBucket::default()),
+            merged_spans: Vec::new(),
+            merged_dirty: false,
+            views: 0,
+        }
+    }
+}
+
+impl<S: Clone> HeapBufferCache<S> {
+    fn remove(&mut self, index: u32) {
+        let b = (index as usize) % BUFFER_SWEEP_BUCKETS;
+        if self.buckets[b].ranges.remove(&index).is_some() {
+            self.buckets[b].dirty = true;
+            self.merged_dirty = true;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert(
+        &mut self,
+        index: u32,
+        key: u64,
+        forget_epoch: u64,
+        shadow: S,
+        from: u64,
+        to: u64,
+        same_shadow: impl Fn(&S, &S) -> bool,
+    ) {
+        let b = (index as usize) % BUFFER_SWEEP_BUCKETS;
+        let bucket = &mut self.buckets[b];
+        if let Some(existing) = bucket.ranges.get_mut(&index)
+            && same_shadow(&existing.shadow, &shadow)
+            && existing.from == from
+            && existing.to == to
+        {
+            existing.key = key;
+            existing.forget_epoch = forget_epoch;
+            return;
+        }
+        bucket.ranges.insert(
+            index,
+            BufferRange {
+                key,
+                forget_epoch,
+                shadow,
+                from,
+                to,
+            },
+        );
+        bucket.dirty = true;
+        self.merged_dirty = true;
+    }
+
+    /// Rebuilds spans only for dirty buckets, then merges the 16 bucket span
+    /// lists when anything changed. Returns `(total_views, merged_spans)`.
+    fn spans(&mut self, shadow_key: impl Fn(&S) -> usize) -> (u32, Vec<(S, u64, u64)>) {
+        if self.merged_dirty {
+            for b in &mut self.buckets {
+                if b.dirty {
+                    b.spans.clear();
+                    let mut pos_by_shadow: std::collections::HashMap<usize, usize> =
+                        std::collections::HashMap::with_capacity(b.ranges.len().min(512));
+                    for r in b.ranges.values() {
+                        let k = shadow_key(&r.shadow);
+                        if let Some(&pos) = pos_by_shadow.get(&k) {
+                            let span = &mut b.spans[pos];
+                            span.1 = span.1.min(r.from);
+                            span.2 = span.2.max(r.to);
+                        } else {
+                            pos_by_shadow.insert(k, b.spans.len());
+                            b.spans.push((r.shadow.clone(), r.from, r.to));
+                        }
+                    }
+                    b.dirty = false;
+                }
+            }
+            self.merged_spans.clear();
+            let mut pos_by_shadow: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::with_capacity(256);
+            for b in &self.buckets {
+                for (shadow, from, to) in &b.spans {
+                    let k = shadow_key(shadow);
+                    if let Some(&pos) = pos_by_shadow.get(&k) {
+                        let span = &mut self.merged_spans[pos];
+                        span.1 = span.1.min(*from);
+                        span.2 = span.2.max(*to);
+                    } else {
+                        pos_by_shadow.insert(k, self.merged_spans.len());
+                        self.merged_spans.push((shadow.clone(), *from, *to));
+                    }
+                }
+            }
+            self.views = self.buckets.iter().map(|b| b.ranges.len() as u32).sum();
+            self.merged_dirty = false;
+        }
+        (self.views, self.merged_spans.clone())
+    }
 }
 
 /// Uploaded textures after which [`State::heap_textures`] switches from its
@@ -1542,79 +1694,151 @@ impl State {
         }
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000+ slots a pass otherwise, 0.1 s
-        // at best), plus one of 16 buckets of all buffer slots each pass so
-        // every slot is rechecked within 16 passes (a view of a released
-        // resource goes stale without a write, and a slot written before its
-        // memory had a host copy is only made then) without dropping and
-        // rescanning the entire heap on a single frame.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
+        // reads, partitioned into 16 buckets matching `HostHeap::buffers`.
+        // Each pass drains `buffer_changes()` and clones only its `1 / 16`
+        // bucket, keeping unchanged slots on a batched lock-free/single-lock
+        // fast path instead of re-mirroring and calling `shadow::find` per
+        // slot, and incrementally maintaining per-bucket shadow spans.
+        static RANGES: std::sync::Mutex<
+            Option<std::collections::HashMap<usize, HeapBufferCache<std::sync::Arc<crate::shadow::Shadow>>>>,
+        > = std::sync::Mutex::new(None);
+        let forget_epoch = crate::descriptor::forget_epoch();
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let cache = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_default();
+        let bucket = (cache.passes as usize) % BUFFER_SWEEP_BUCKETS;
         let changed = host.buffer_changes();
-        let all_slots = host.buffer_slots();
-        let slots = buffer_sweep_slots(*passes, changed, &all_slots, ranges);
-        *passes += 1;
-        // Whether the device was there before the pass: a view that removes
-        // it is named below.
-        static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
-        HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
-            };
-            let Some(view) = host.mirror(index, handle, true) else {
-                continue;
-            };
-            // Every 64 views while the device lives (a cheap query).
-            if alive
-                && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
-            {
-                alive = false;
-                GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
-                    .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                    .map(|s| s.chars().take(200).collect())
-                    .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
-                crate::host::log_removal_context();
+        let bucket_slots = host.buffer_slots_bucket(bucket);
+        let (mut need_slow, check_slots, pruned) =
+            buffer_sweep_slots(changed, &bucket_slots, &mut cache.buckets[bucket].ranges);
+        if pruned {
+            cache.buckets[bucket].dirty = true;
+            cache.merged_dirty = true;
+        }
+        cache.passes += 1;
+        let looked = need_slow.len() + check_slots.len();
+        HEAP_PASS_PARTS[1].fetch_add(looked as u64, Ordering::Relaxed);
+
+        // Fast path for swept slots not in `changed`: skip `mirror` and
+        // `buffer_copy` when the slot's 12-byte title record key is unchanged,
+        // any table entry is still alive (`forget_epoch`), and the host slot
+        // is still made from that exact key.
+        let mut need_alive: Vec<(u32, u64)> = Vec::new();
+        let mut made_candidates: Vec<(u32, u64)> = Vec::with_capacity(check_slots.len());
+        {
+            let ranges = &cache.buckets[bucket].ranges;
+            for &index in &check_slots {
+                let Some(entry) = ranges.get(&index) else {
+                    need_slow.push(index);
+                    continue;
+                };
+                let Some(handle) = heap.handle(index) else {
+                    need_slow.push(index);
+                    continue;
+                };
+                let Some((key, inline)) = crate::descriptor::record_key(handle) else {
+                    need_slow.push(index);
+                    continue;
+                };
+                if key != entry.key {
+                    need_slow.push(index);
+                    continue;
+                }
+                if !inline && entry.forget_epoch != forget_epoch {
+                    need_alive.push((index, key));
+                } else {
+                    made_candidates.push((index, key));
+                }
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                continue;
-            };
+        }
+        if !need_alive.is_empty() {
+            let mut alive_flags = Vec::with_capacity(need_alive.len());
+            crate::descriptor::filter_alive_entries(&need_alive, &mut alive_flags);
+            let ranges = &mut cache.buckets[bucket].ranges;
+            for (&(index, key), &live) in need_alive.iter().zip(alive_flags.iter()) {
+                if live {
+                    if let Some(entry) = ranges.get_mut(&index) {
+                        entry.forget_epoch = forget_epoch;
+                    }
+                    made_candidates.push((index, key));
+                } else {
+                    need_slow.push(index);
+                }
+            }
+        }
+        if !made_candidates.is_empty() {
+            host.collect_unmade_slots(&made_candidates, &mut need_slow);
+        }
+
+        // Slow path: only changed, newly arrived, stale, or unmade slots.
+        if !need_slow.is_empty() {
+            // Whether the device was there before the pass: a view that removes
+            // it is named below.
+            static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let mut alive = !GONE.load(Ordering::Relaxed)
+                && crate::descriptor::host::device_removed().is_none();
             #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
-                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+            let mut elsewhere = 0u64;
+            for (n, &index) in need_slow.iter().enumerate() {
+                let Some(handle) = heap.handle(index) else {
+                    cache.remove(index);
+                    continue;
+                };
+                let Some((view, key)) = host.mirror_for_buffers(index, handle) else {
+                    cache.remove(index);
+                    continue;
+                };
+                // Every 64 views while the device lives (a cheap query).
+                if alive
+                    && n % 64 == 63
+                    && let Some(why) = crate::descriptor::host::device_removed()
+                {
+                    alive = false;
+                    GONE.store(true, Ordering::Relaxed);
+                    let last: Vec<String> = need_slow[n - 63..=n]
+                        .iter()
+                        .filter_map(|&i| {
+                            crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}"))
+                        })
+                        .map(|s| s.chars().take(200).collect())
+                        .collect();
+                    tracing::error!(
+                        why,
+                        slot = index,
+                        "the host device went while buffer views of the heap were made; one of: {last:#?}"
+                    );
+                    crate::host::log_removal_context();
+                }
+                // The copy the slot shows (`buffer_copy`), not the one the
+                // view's range alone would find.
+                let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                    cache.remove(index);
+                    continue;
+                };
+                #[cfg(feature = "diagnostics")]
+                if host.shows(index, &shadow.buffer) == Some(false) {
+                    elsewhere += 1;
+                }
+                cache.upsert(
+                    index,
+                    key,
+                    forget_epoch,
+                    shadow,
+                    address,
+                    address + len,
+                    std::sync::Arc::ptr_eq,
+                );
             }
-            ranges.insert(index, (shadow, address, address + len));
-        }
-        let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::with_capacity(ranges.len().min(4096));
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            if let Some(span) = spans.get_mut(&key) {
-                span.1 = span.1.min(*from);
-                span.2 = span.2.max(*to);
-            } else {
-                spans.insert(key, (std::sync::Arc::clone(shadow), *from, *to));
+            #[cfg(feature = "diagnostics")]
+            if elsewhere > 0 {
+                HEAP_VIEWS_ELSEWHERE.fetch_add(elsewhere, Ordering::Relaxed);
             }
         }
+        let (views, spans) = cache.spans(|s| std::sync::Arc::as_ptr(s) as usize);
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1625,7 +1849,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, from, to) in &spans {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -1658,7 +1882,7 @@ impl State {
         if u64::from(views) > seen + seen / 2 {
             LOGGED.store(u64::from(views), Ordering::Relaxed);
             tracing::info!(
-                slots = slots.len(),
+                slots = looked,
                 views,
                 copies = spans.len(),
                 mb = bytes >> 20,
@@ -3686,17 +3910,31 @@ mod tests {
     fn buffer_sweep_covers_all_slots_exactly_once_over_16_passes() {
         let mut all_slots: Vec<u32> = (0..100).collect();
         all_slots.extend([256, 257, 271, 272, 1023, 1024, 65_535, 209_492]);
-        let mut ranges: std::collections::HashMap<u32, u64> =
-            all_slots.iter().map(|&s| (s, u64::from(s))).collect();
+        let mut buckets: [Vec<u32>; BUFFER_SWEEP_BUCKETS] = std::array::from_fn(|_| Vec::new());
+        let mut ranges: [std::collections::HashMap<u32, u64>; BUFFER_SWEEP_BUCKETS] =
+            std::array::from_fn(|_| std::collections::HashMap::new());
+        for &s in &all_slots {
+            let b = (s as usize) % BUFFER_SWEEP_BUCKETS;
+            buckets[b].push(s);
+            ranges[b].insert(s, u64::from(s));
+        }
+        for b in &mut buckets {
+            b.sort_unstable();
+        }
         let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
 
         for pass in 0..BUFFER_SWEEP_BUCKETS {
-            let bucket = (pass % BUFFER_SWEEP_BUCKETS) as u32;
-            let swept = buffer_sweep_slots(pass, Vec::new(), &all_slots, &mut ranges);
-            for &slot in &swept {
-                assert_eq!(slot % 16, bucket, "slot {slot} swept in wrong bucket {bucket}");
+            let (forced, check, pruned) =
+                buffer_sweep_slots(Vec::new(), &buckets[pass], &mut ranges[pass]);
+            assert!(forced.is_empty());
+            assert!(!pruned);
+            for &slot in &check {
+                assert_eq!(
+                    (slot as usize) % BUFFER_SWEEP_BUCKETS,
+                    pass,
+                    "slot {slot} swept in wrong bucket {pass}"
+                );
                 *counts.entry(slot).or_insert(0) += 1;
-                ranges.insert(slot, u64::from(slot));
             }
         }
 
@@ -3708,9 +3946,14 @@ mod tests {
 
     #[test]
     fn buffer_sweep_dedups_changed_and_prunes_stale_entries_in_bucket() {
-        let all_slots = vec![0, 1, 2, 16, 17, 32];
-        // Include stale keys no longer in `all_slots`: 48 (bucket 0) and 49 (bucket 1).
-        let mut ranges: std::collections::HashMap<u32, &'static str> = [
+        let mut buckets: [Vec<u32>; BUFFER_SWEEP_BUCKETS] = std::array::from_fn(|_| Vec::new());
+        for s in [0u32, 1, 2, 16, 17, 32] {
+            buckets[(s as usize) % BUFFER_SWEEP_BUCKETS].push(s);
+        }
+        // Include stale keys no longer in live buckets: 48 (bucket 0) and 49 (bucket 1).
+        let mut ranges: [std::collections::HashMap<u32, &'static str>; BUFFER_SWEEP_BUCKETS] =
+            std::array::from_fn(|_| std::collections::HashMap::new());
+        for (slot, tag) in [
             (0, "old0"),
             (1, "old1"),
             (2, "old2"),
@@ -3719,32 +3962,77 @@ mod tests {
             (32, "old32"),
             (48, "stale_b0"),
             (49, "stale_b1"),
-        ]
-        .into_iter()
-        .collect();
-
-        // Pass 0 (bucket 0): `0` and `16` overlap with bucket 0, `2` is in another bucket.
-        let swept0 = buffer_sweep_slots(0, vec![2, 0, 16, 2], &all_slots, &mut ranges);
-        assert_eq!(swept0, vec![0, 2, 16, 32], "changed and bucket 0 merged without duplicates");
-        // Stale bucket-0 key `48` pruned; bucket-0 keys removed before re-insert;
-        // other buckets (including stale bucket-1 key `49`) left intact for their pass.
-        assert!(!ranges.contains_key(&48), "stale key in bucket 0 must be pruned");
-        assert!(!ranges.contains_key(&0));
-        assert!(!ranges.contains_key(&16));
-        assert!(!ranges.contains_key(&32));
-        assert_eq!(ranges.get(&1), Some(&"old1"));
-        assert_eq!(ranges.get(&17), Some(&"old17"));
-        assert_eq!(ranges.get(&49), Some(&"stale_b1"));
-        for &slot in &swept0 {
-            ranges.insert(slot, "fresh0");
+        ] {
+            ranges[(slot as usize) % BUFFER_SWEEP_BUCKETS].insert(slot, tag);
         }
 
-        // Pass 1 (bucket 1): prunes stale key `49` and sweeps live bucket-1 slots `1`, `17`.
-        let swept1 = buffer_sweep_slots(1, Vec::new(), &all_slots, &mut ranges);
-        assert_eq!(swept1, vec![1, 17]);
-        assert!(!ranges.contains_key(&49), "stale key in bucket 1 must be pruned");
-        assert_eq!(ranges.get(&0), Some(&"fresh0"));
-        assert_eq!(ranges.get(&32), Some(&"fresh0"));
+        // Pass 0 (bucket 0): `0` and `16` overlap with bucket 0, `2` is in another bucket.
+        let (forced0, check0, pruned0) =
+            buffer_sweep_slots(vec![2, 0, 16, 2], &buckets[0], &mut ranges[0]);
+        assert!(pruned0, "stale key 48 in bucket 0 must be pruned");
+        assert_eq!(forced0, vec![0, 2, 16], "changed slots deduped and sorted");
+        assert_eq!(check0, vec![32], "unchanged live bucket-0 slot eligible for fast path");
+        assert!(!ranges[0].contains_key(&48), "stale key in bucket 0 must be pruned");
+        // Live bucket-0 entries stay cached until slow path updates them;
+        // other buckets (including stale bucket-1 key `49`) left intact for their pass.
+        assert_eq!(ranges[0].get(&32), Some(&"old32"));
+        assert_eq!(ranges[1].get(&1), Some(&"old1"));
+        assert_eq!(ranges[1].get(&17), Some(&"old17"));
+        assert_eq!(ranges[1].get(&49), Some(&"stale_b1"));
+        for &slot in &forced0 {
+            ranges[(slot as usize) % BUFFER_SWEEP_BUCKETS].insert(slot, "fresh0");
+        }
+
+        // Pass 1 (bucket 1): prunes stale key `49` and returns live bucket-1 slots `1`, `17`.
+        let (forced1, check1, pruned1) =
+            buffer_sweep_slots(Vec::new(), &buckets[1], &mut ranges[1]);
+        assert!(pruned1, "stale key 49 in bucket 1 must be pruned");
+        assert!(forced1.is_empty());
+        assert_eq!(check1, vec![1, 17]);
+        assert!(!ranges[1].contains_key(&49), "stale key in bucket 1 must be pruned");
+        assert_eq!(ranges[0].get(&0), Some(&"fresh0"));
+        assert_eq!(ranges[0].get(&32), Some(&"old32"));
+    }
+
+    #[test]
+    fn heap_buffer_cache_merges_spans_incrementally_and_skips_clean_rebuilds() {
+        let mut cache: HeapBufferCache<usize> = HeapBufferCache::default();
+        let same = |a: &usize, b: &usize| a == b;
+        let key_of = |a: &usize| *a;
+
+        // Shadow 100 spanned across bucket 0 (slot 16) and bucket 3 (slot 3);
+        // shadow 200 in bucket 1 (slot 17).
+        cache.upsert(16, 1, 0, 100, 0x1000, 0x2000, same);
+        cache.upsert(3, 2, 0, 100, 0x1800, 0x4000, same);
+        cache.upsert(17, 3, 0, 200, 0x8000, 0x9000, same);
+
+        let (views, mut spans) = cache.spans(key_of);
+        spans.sort_unstable();
+        assert_eq!(views, 3);
+        assert_eq!(spans, vec![(100, 0x1000, 0x4000), (200, 0x8000, 0x9000)]);
+        assert!(!cache.merged_dirty);
+        assert!(cache.buckets.iter().all(|b| !b.dirty));
+
+        // Updating a slot's key/epoch with identical `(shadow, from, to)` keeps cache clean.
+        cache.upsert(16, 99, 5, 100, 0x1000, 0x2000, same);
+        assert!(!cache.merged_dirty);
+        assert!(!cache.buckets[0].dirty);
+
+        // Removing slot 3 shrinks shadow 100 back to bucket 0's span [0x1000, 0x2000).
+        cache.remove(3);
+        assert!(cache.merged_dirty);
+        assert!(cache.buckets[3].dirty);
+        assert!(!cache.buckets[0].dirty);
+        let (views, mut spans) = cache.spans(key_of);
+        spans.sort_unstable();
+        assert_eq!(views, 2);
+        assert_eq!(spans, vec![(100, 0x1000, 0x2000), (200, 0x8000, 0x9000)]);
+
+        // Removing slot 17 drops shadow 200 completely.
+        cache.remove(17);
+        let (views, spans) = cache.spans(key_of);
+        assert_eq!(views, 1);
+        assert_eq!(spans, vec![(100, 0x1000, 0x2000)]);
     }
 
     #[test]

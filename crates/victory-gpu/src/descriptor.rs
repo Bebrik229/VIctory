@@ -178,12 +178,15 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    let (mut pages, mut looked, mut mirrored, mut tabled) = (0u64, 0u64, 0u64, 0u64);
     thread_local! {
         static PAGE_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     PAGE_BYTES.with(|cell| {
         let mut page_bytes = cell.borrow_mut();
+        if page_bytes.len() < crate::watch::PAGE {
+            page_bytes.resize(crate::watch::PAGE, 0);
+        }
         let frame = crate::frame::current();
         let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         for &(start, end, at) in heaps.iter() {
@@ -203,29 +206,15 @@ pub(crate) fn sync_heaps() {
                 while page < range_end {
                     let from = page.max(range_from);
                     let to = (page + crate::watch::PAGE).min(range_end);
-                    // The page's records are read through the kernel, into a
-                    // copy: a page the title unmaps meanwhile fails the read
-                    // where 2,048 reads in place would fault.
-                    page_bytes.resize(to - from, 0);
-                    if crate::host::read_into(from as *const u8, &mut page_bytes) {
-                        pages += 1;
-                        let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                        for index in slots {
-                            let handle = start + index * step;
-                            // A record that straddles the range's ends is left
-                            // to the range that holds its first byte.
-                            let Some(at) = (handle as usize).checked_sub(from) else {
-                                continue;
-                            };
-                            let Some(record) = page_bytes.get(at..at + step as usize) else {
-                                continue;
-                            };
-                            looked += 1;
-                            // Only a record whose 12-byte view key changed
-                            // (`HostHeap::mirror_copied_in`).
-                            if host.mirror_copied_in(index as u32, handle, record, frame) {
-                                mirrored += 1;
-                            }
+                    let slots = whole_slots(from, to, start as usize, step, mirrored_count);
+                    if !slots.is_empty() {
+                        let (page_ok, page_looked, page_mirrored, page_tabled) =
+                            host.sync_copied_page(slots.start, slots.end, start, step, frame, &mut page_bytes);
+                        if page_ok {
+                            pages += 1;
+                            looked += page_looked;
+                            mirrored += page_mirrored;
+                            tabled += page_tabled;
                         }
                     }
                     page += crate::watch::PAGE;
@@ -233,6 +222,9 @@ pub(crate) fn sync_heaps() {
             }
         }
     });
+    if tabled > 0 {
+        host::COPIED_TABLED.fetch_add(tabled, Relaxed);
+    }
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
@@ -265,7 +257,7 @@ pub(crate) fn sync_line(frames: f64) {
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
 /// `range_end` is exclusive.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn changed_slots(
     range_from: usize,
     range_end: usize,
@@ -277,6 +269,28 @@ fn changed_slots(
     let to = (range_end - heap_start) as u64;
     let first = from / step;
     let last = to.div_ceil(step).min(u64::from(mirrored_count));
+    first.min(last)..last
+}
+
+/// Complete title descriptor slots contained inside `[range_from, range_end)`
+/// that have host counterparts (`< mirrored_count`). Records straddling the
+/// byte range's ends are excluded so `sync_heaps` can scan without per-slot
+/// bounds checks.
+#[cfg(windows)]
+fn whole_slots(
+    range_from: usize,
+    range_end: usize,
+    heap_start: usize,
+    step: u64,
+    mirrored_count: u32,
+) -> std::ops::Range<u32> {
+    if range_end <= range_from || range_from < heap_start || step == 0 {
+        return 0..0;
+    }
+    let from = (range_from - heap_start) as u64;
+    let to = (range_end - heap_start) as u64;
+    let first = from.div_ceil(step).min(u64::from(mirrored_count)) as u32;
+    let last = (to / step).min(u64::from(mirrored_count)) as u32;
     first.min(last)..last
 }
 
@@ -841,6 +855,58 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// Monotonic epoch bumped whenever [`forget`] invalidates at least one
+/// table-entry view. Inline records (`CONSTANT`, `PLACED`) are never
+/// invalidated by `forget`.
+#[cfg(windows)]
+static FORGET_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current [`FORGET_EPOCH`], paired with `Release` updates in [`forget`].
+#[cfg(windows)]
+pub(crate) fn forget_epoch() -> u64 {
+    FORGET_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The packed 64-bit record key `(generation << 32) | i` at `handle` if it
+/// holds a [`VIEW_TAG`] record, paired with whether the record is inline
+/// (`CONSTANT` or `PLACED`, hence unaffected by [`forget`]).
+#[cfg(windows)]
+pub(crate) fn record_key(handle: u64) -> Option<(u64, bool)> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot in title memory.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return None;
+    }
+    let key = u64::from(generation) << 32 | u64::from(i);
+    Some((key, (generation >> KIND_SHIFT) != 0))
+}
+
+/// Checks, under one shared `VIEWS` read lock, whether each `(slot, key)` in
+/// `keys` still names a live view (matching generation for table entries;
+/// always true for inline records). Writes parallel booleans into `out`.
+#[cfg(windows)]
+pub(crate) fn filter_alive_entries(keys: &[(u32, u64)], out: &mut Vec<bool>) {
+    out.clear();
+    out.reserve(keys.len());
+    let views = views_read();
+    for &(_, key) in keys {
+        let i = key as u32;
+        let generation = (key >> 32) as u32;
+        let live = if (generation >> KIND_SHIFT) != 0 {
+            true
+        } else {
+            views
+                .list
+                .get(i as usize)
+                .is_some_and(|&(_, current)| current == generation)
+        };
+        out.push(live);
+    }
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]
@@ -852,6 +918,7 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    let mut freed = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -865,6 +932,11 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        freed = true;
+    }
+    #[cfg(windows)]
+    if freed {
+        FORGET_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1442,5 +1514,56 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn whole_slots_excludes_straddling_records_and_clamps_to_mirrored_count() {
+        let start = 0x1000usize;
+        let step = 32;
+        assert_eq!(whole_slots(start, start + 64 * step, start, step as u64, 64), 0..64);
+        assert_eq!(whole_slots(start, start + 64 * step, start, step as u64, 10), 0..10);
+        // Straddling start and end: slots 3 (starts at +96 < +100) and 4 (ends at +160 > +136) both excluded.
+        assert_eq!(whole_slots(start + 3 * step + 4, start + 4 * step + 8, start, step as u64, 10), 4..4);
+        // Partial start, complete middle, partial end: only slot 4 is wholly contained.
+        assert_eq!(whole_slots(start + 3 * step + 4, start + 5 * step + 8, start, step as u64, 10), 4..5);
+        // Past mirrored_count: empty.
+        assert_eq!(whole_slots(start + 10 * step, start + 15 * step, start, step as u64, 10), 10..10);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forget_epoch_and_filter_alive_entries_track_released_resources() {
+        let null = std::ptr::null();
+        let slots = [0u64; 3 * 4];
+        let at = |k: usize| slots.as_ptr() as u64 + 32 * k as u64;
+        let res_a = 0x7788_1000usize as This;
+        let res_b = 0x7788_2000usize as This;
+        create_srv(null, res_a, std::ptr::null(), at(0));
+        create_srv(null, res_b, std::ptr::null(), at(1));
+        create_cbv(null, &[0x4000, 0, 256, 0], at(2));
+
+        let (k0, inline0) = record_key(at(0)).expect("srv a key");
+        let (k1, inline1) = record_key(at(1)).expect("srv b key");
+        let (k2, inline2) = record_key(at(2)).expect("cbv key");
+        assert!(!inline0 && !inline1);
+        if inline() {
+            assert!(inline2);
+        }
+
+        let epoch_before = forget_epoch();
+        let mut alive = Vec::new();
+        filter_alive_entries(&[(0, k0), (1, k1), (2, k2)], &mut alive);
+        assert_eq!(alive, vec![true, true, true]);
+
+        forget(res_a as usize);
+        let epoch_after = forget_epoch();
+        assert!(epoch_after > epoch_before, "forget must bump FORGET_EPOCH");
+        filter_alive_entries(&[(0, k0), (1, k1), (2, k2)], &mut alive);
+        assert_eq!(alive, vec![false, true, true]);
+
+        forget(res_b as usize);
+        filter_alive_entries(&[(0, k0), (1, k1), (2, k2)], &mut alive);
+        assert_eq!(alive, vec![false, false, true]);
     }
 }
