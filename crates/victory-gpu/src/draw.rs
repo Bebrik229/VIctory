@@ -8,6 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
@@ -239,6 +240,11 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// Host pipelines and root signatures already kept on the current host list
+    /// (`list.keep` / `list.used_pipeline`), cleared only when the host list
+    /// resets or switches (`State::reset` / `State::replay`).
+    kept_pipelines: HashSet<usize>,
+    kept_roots: HashSet<usize>,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
@@ -1049,6 +1055,8 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.kept_pipelines.clear();
+        self.kept_roots.clear();
         self.window = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
@@ -1356,16 +1364,19 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut n = 0;
+            for &h in &self.heaps {
+                if h != 0
+                    && let Some(host_heap) = crate::descriptor::heap(h as This).host()
+                {
+                    list.keep(&host_heap.heap);
+                    heaps[n] = Some(host_heap.heap.clone());
+                    n += 1;
+                }
+            }
             // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
+            unsafe { l.SetDescriptorHeaps(&heaps[..n]) };
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
@@ -1388,17 +1399,22 @@ impl State {
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            if self.kept_roots.insert(root) {
+                list.keep(&p.root);
+            }
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        let pso = p.pso.as_raw() as usize;
+        if self.host_pipeline != pso {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
-            // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            self.host_pipeline = pso;
+            if self.kept_pipelines.insert(pso) {
+                list.used_pipeline(&p.name);
+                // The title may release the pipeline before it submits the list.
+                list.keep(&p.pso);
+            }
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -4336,5 +4352,43 @@ mod tests {
         assert!(direct_cbv_fits(0x10100, 256, 256));
         assert!(!direct_cbv_fits(0x10100, 256, 257)); // rounded SizeInBytes=512 exceeds left=256
         assert!(direct_cbv_fits(0x10100, 512, 257));
+    }
+
+    #[test]
+    fn kept_pipelines_and_roots_dedup_and_clear_on_reset() {
+        let mut state = State::default();
+        assert!(state.kept_pipelines.is_empty());
+        assert!(state.kept_roots.is_empty());
+
+        // First bind of a pipeline and root marks each as newly kept.
+        assert!(state.kept_pipelines.insert(0x1000));
+        assert!(state.kept_roots.insert(0x2000));
+        // Repeated binds of the same pipeline/root on the same list deduplicate.
+        assert!(!state.kept_pipelines.insert(0x1000));
+        assert!(!state.kept_roots.insert(0x2000));
+        // Distinct pipeline sharing the same root keeps only the new pipeline.
+        assert!(state.kept_pipelines.insert(0x1008));
+        assert!(!state.kept_roots.insert(0x2000));
+
+        // Resetting host_roots on SetDescriptorHeaps does not invalidate kept_roots.
+        state.host_roots = [0; 2];
+        assert!(!state.kept_roots.insert(0x2000));
+
+        // State::reset clears both sets for the new command list recording.
+        state.reset(std::ptr::null());
+        assert!(state.kept_pipelines.is_empty());
+        assert!(state.kept_roots.is_empty());
+        assert!(state.kept_pipelines.insert(0x1000));
+        assert!(state.kept_roots.insert(0x2000));
+
+        // If a host GPU is available, verify State::replay also clears both sets.
+        if let Some(host) = crate::host::host()
+            && let Ok(list) = host.new_list()
+        {
+            state.replay(&list);
+            assert!(state.kept_pipelines.is_empty());
+            assert!(state.kept_roots.is_empty());
+            list.close();
+        }
     }
 }

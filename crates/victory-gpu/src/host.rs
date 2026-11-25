@@ -6294,6 +6294,8 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else {
+                        batch.flush_textures();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
@@ -6327,7 +6329,11 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if wide_textures() {
+                            batch.pending_textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -6355,6 +6361,61 @@ fn wide_refresh() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
 
+fn parse_wide_textures(val: Option<&std::ffi::OsStr>, wide_refresh: bool) -> bool {
+    match val {
+        Some(v) if v == "0" => false,
+        Some(v) if v == "1" => true,
+        _ => wide_refresh,
+    }
+}
+
+/// Whether a submission's due texture refreshes run on several threads
+/// (`VICTORY_WIDE_TEXTURES=1`/`0`; defaults to [`wide_refresh`]).
+fn wide_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_wide_textures(std::env::var_os("VICTORY_WIDE_TEXTURES").as_deref(), wide_refresh())
+    })
+}
+
+/// Runs `jobs` via [`crate::shadow::wide_run`] and adjusts `counter` so it
+/// reflects wall-clock elapsed microseconds instead of the sum across threads.
+fn wide_timed(counter: &std::sync::atomic::AtomicU64, jobs: Vec<Box<dyn FnOnce() + Send>>) {
+    let started = std::time::Instant::now();
+    let before = counter.load(Ordering::Relaxed);
+    crate::shadow::wide_run(jobs);
+    let summed = counter.load(Ordering::Relaxed).saturating_sub(before);
+    counter.fetch_sub(
+        summed.saturating_sub(started.elapsed().as_micros() as u64),
+        Ordering::Relaxed,
+    );
+}
+
+/// Runs queued `pending` items: inline when only one is queued, or in parallel
+/// via [`wide_timed`] when two or more are queued.
+fn dispatch_pending<T>(
+    pending: &mut Vec<T>,
+    counter: &std::sync::atomic::AtomicU64,
+    mut run: impl FnMut(T) + Clone + Send + 'static,
+) where
+    T: Send + 'static,
+{
+    match pending.len() {
+        0 => {}
+        1 => run(pending.pop().unwrap()),
+        _ => {
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = pending
+                .drain(..)
+                .map(|item| {
+                    let mut run = run.clone();
+                    Box::new(move || run(item)) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            wide_timed(counter, jobs);
+        }
+    }
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -6373,6 +6434,8 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Due texture refreshes deferred so a submission's textures can refresh in parallel.
+    pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -6429,6 +6492,11 @@ impl Batch {
         self.textures.clear();
     }
 
+    /// Runs any deferred texture refreshes, inline for one and wide for two or more.
+    fn flush_textures(&mut self) {
+        dispatch_pending(&mut self.pending_textures, &PREPARING[2], |staging| staging.refresh());
+    }
+
     fn flush(&mut self) {
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
@@ -6449,16 +6517,12 @@ impl Batch {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
-            let started = std::time::Instant::now();
-            let before = PREPARING[0].load(Ordering::Relaxed);
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
                 .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
                 .collect();
-            crate::shadow::wide_run(jobs);
-            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            wide_timed(&PREPARING[0], jobs);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
@@ -6467,6 +6531,7 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        self.flush_textures();
     }
 }
 
@@ -7858,5 +7923,75 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn wide_textures_env_overrides_or_falls_back_to_wide_refresh() {
+        use super::parse_wide_textures;
+        use std::ffi::OsStr;
+        assert!(!parse_wide_textures(Some(OsStr::new("0")), true));
+        assert!(!parse_wide_textures(Some(OsStr::new("0")), false));
+        assert!(parse_wide_textures(Some(OsStr::new("1")), false));
+        assert!(parse_wide_textures(Some(OsStr::new("1")), true));
+        assert!(parse_wide_textures(None, true));
+        assert!(!parse_wide_textures(None, false));
+        assert!(parse_wide_textures(Some(OsStr::new("auto")), true));
+        assert!(!parse_wide_textures(Some(OsStr::new("auto")), false));
+    }
+
+    #[test]
+    fn dispatch_pending_handles_empty_single_and_wide() {
+        use super::dispatch_pending;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Empty: no-op.
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut pending: Vec<usize> = Vec::new();
+        dispatch_pending(&mut pending, &counter, |_| unreachable!());
+        assert!(pending.is_empty());
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        // Single item: runs inline on caller thread without wide dispatch.
+        let caller = std::thread::current().id();
+        let ran = Arc::new(AtomicU64::new(0));
+        let ran_clone = ran.clone();
+        pending.push(7);
+        dispatch_pending(&mut pending, &counter, move |v| {
+            assert_eq!(std::thread::current().id(), caller);
+            ran_clone.fetch_add(v as u64, Ordering::Relaxed);
+        });
+        assert!(pending.is_empty());
+        assert_eq!(ran.load(Ordering::Relaxed), 7);
+
+        // Multiple items: runs all via wide_run and keeps counter at wall-clock, not sum.
+        let counter = Arc::new(AtomicU64::new(500));
+        let ran = Arc::new(AtomicU64::new(0));
+        let mut pending = vec![1u64, 2, 3, 4];
+        let counter_job = counter.clone();
+        let ran_job = ran.clone();
+        dispatch_pending(&mut pending, &counter, move |v| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            counter_job.fetch_add(20_000, Ordering::Relaxed);
+            ran_job.fetch_add(v, Ordering::Relaxed);
+        });
+        assert!(pending.is_empty());
+        assert_eq!(ran.load(Ordering::Relaxed), 10);
+        // 4 * 20 ms = 80 ms summed; wall-clock stays well below 80 ms (+ 500 baseline).
+        let recorded = counter.load(Ordering::Relaxed);
+        assert!(recorded >= 500, "baseline preserved: {recorded}");
+        assert!(recorded < 500 + 75_000, "expected wall-clock adjustment, got {recorded}");
+    }
+
+    #[test]
+    fn batch_flush_preserves_dedup_while_title_written_clears_it() {
+        let mut batch = Batch::default();
+        assert!(batch.pending_textures.is_empty());
+        let a = Arc::new(1u32);
+        assert!(batch.texture_due(&a));
+        assert!(!batch.texture_due(&a));
+        batch.flush();
+        assert!(!batch.texture_due(&a), "flush keeps texture deduplication for the submission");
+        batch.title_written();
+        assert!(batch.texture_due(&a), "title_written clears texture deduplication");
     }
 }

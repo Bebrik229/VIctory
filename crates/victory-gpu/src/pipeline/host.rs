@@ -5,10 +5,11 @@
 //! user data, root views for the title's root views, static samplers for
 //! the immediate samplers, and directly indexed heaps.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fmt::Write as _;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -264,6 +265,7 @@ impl GraphicsState {
 
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn describe(&self) -> String {
         let mut out = String::new();
         let _ = self.write_description(&mut out);
@@ -864,32 +866,39 @@ impl HostPipeline {
             inputs: g.elements(),
             rects: rect_gs.is_some(),
             state: {
-                let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
-                let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
+                #[cfg(feature = "diagnostics")]
+                {
+                    let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
+                    let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
+                        format!(
+                            "fail {} depth-fail {} pass {} func {}",
+                            f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
+                        )
+                    };
+                    let bounds = if depth_bounds { " bounds true" } else { "" };
                     format!(
-                        "fail {} depth-fail {} pass {} func {}",
-                        f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
+                        "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
+                        d.DepthEnable.as_bool(),
+                        d.DepthWriteMask.0,
+                        d.DepthFunc.0,
+                        d.StencilEnable.as_bool(),
+                        d.StencilReadMask,
+                        d.StencilWriteMask,
+                        face(&d.FrontFace),
+                        face(&d.BackFace),
+                        r.CullMode.0,
+                        r.FrontCounterClockwise.as_bool(),
+                        b.BlendEnable.as_bool(),
+                        b.SrcBlend.0,
+                        b.DestBlend.0,
+                        b.BlendOp.0,
+                        b.RenderTargetWriteMask
                     )
-                };
-                let bounds = if depth_bounds { " bounds true" } else { "" };
-                format!(
-                    "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
-                    d.DepthEnable.as_bool(),
-                    d.DepthWriteMask.0,
-                    d.DepthFunc.0,
-                    d.StencilEnable.as_bool(),
-                    d.StencilReadMask,
-                    d.StencilWriteMask,
-                    face(&d.FrontFace),
-                    face(&d.BackFace),
-                    r.CullMode.0,
-                    r.FrontCounterClockwise.as_bool(),
-                    b.BlendEnable.as_bool(),
-                    b.SrcBlend.0,
-                    b.DestBlend.0,
-                    b.BlendOp.0,
-                    b.RenderTargetWriteMask
-                )
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                {
+                    String::new()
+                }
             },
         })
     }
@@ -1099,12 +1108,103 @@ fn shader_bytecode(dxil: Option<&[u8]>) -> D3D12_SHADER_BYTECODE {
     )
 }
 
+struct SendRoot(ID3D12RootSignature);
+// SAFETY: ID3D12RootSignature is immutable and free-threaded after creation.
+unsafe impl Send for SendRoot {}
+// SAFETY: same as above.
+unsafe impl Sync for SendRoot {}
+
+fn root_signature_key(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER1],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    compute: bool,
+) -> [u8; 32] {
+    use windows::core::Interface;
+    let mut h = blake3::Hasher::new();
+    h.update(&(device.as_raw() as usize as u64).to_le_bytes());
+    h.update(&[u8::from(compute)]);
+    h.update(&(params.len() as u64).to_le_bytes());
+    for p in params {
+        h.update(&p.ParameterType.0.to_le_bytes());
+        h.update(&p.ShaderVisibility.0.to_le_bytes());
+        // SAFETY: `p.ParameterType` selects the active union field; any
+        // descriptor-table range array pointed to by `pDescriptorRanges`
+        // is live for the duration of `root_signature`.
+        unsafe {
+            match p.ParameterType {
+                D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => {
+                    let c = &p.Anonymous.Constants;
+                    h.update(&c.ShaderRegister.to_le_bytes());
+                    h.update(&c.RegisterSpace.to_le_bytes());
+                    h.update(&c.Num32BitValues.to_le_bytes());
+                }
+                D3D12_ROOT_PARAMETER_TYPE_CBV
+                | D3D12_ROOT_PARAMETER_TYPE_SRV
+                | D3D12_ROOT_PARAMETER_TYPE_UAV => {
+                    let d = &p.Anonymous.Descriptor;
+                    h.update(&d.ShaderRegister.to_le_bytes());
+                    h.update(&d.RegisterSpace.to_le_bytes());
+                    h.update(&d.Flags.0.to_le_bytes());
+                }
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => {
+                    let t = &p.Anonymous.DescriptorTable;
+                    h.update(&t.NumDescriptorRanges.to_le_bytes());
+                    if t.NumDescriptorRanges > 0 && !t.pDescriptorRanges.is_null() {
+                        let ranges = std::slice::from_raw_parts(
+                            t.pDescriptorRanges,
+                            t.NumDescriptorRanges as usize,
+                        );
+                        for r in ranges {
+                            h.update(&r.RangeType.0.to_le_bytes());
+                            h.update(&r.NumDescriptors.to_le_bytes());
+                            h.update(&r.BaseShaderRegister.to_le_bytes());
+                            h.update(&r.RegisterSpace.to_le_bytes());
+                            h.update(&r.Flags.0.to_le_bytes());
+                            h.update(&r.OffsetInDescriptorsFromTableStart.to_le_bytes());
+                        }
+                    }
+                }
+                _ => {
+                    h.update(&[0u8]);
+                }
+            }
+        }
+    }
+    h.update(&(samplers.len() as u64).to_le_bytes());
+    for s in samplers {
+        h.update(&s.Filter.0.to_le_bytes());
+        h.update(&s.AddressU.0.to_le_bytes());
+        h.update(&s.AddressV.0.to_le_bytes());
+        h.update(&s.AddressW.0.to_le_bytes());
+        h.update(&s.MipLODBias.to_bits().to_le_bytes());
+        h.update(&s.MaxAnisotropy.to_le_bytes());
+        h.update(&s.ComparisonFunc.0.to_le_bytes());
+        h.update(&s.BorderColor.0.to_le_bytes());
+        h.update(&s.MinLOD.to_bits().to_le_bytes());
+        h.update(&s.MaxLOD.to_bits().to_le_bytes());
+        h.update(&s.ShaderRegister.to_le_bytes());
+        h.update(&s.RegisterSpace.to_le_bytes());
+        h.update(&s.ShaderVisibility.0.to_le_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
-) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
+) -> windows::core::Result<(ID3D12RootSignature, Arc<[u8]>)> {
+    static ROOTS: OnceLock<RwLock<HashMap<[u8; 32], (SendRoot, Arc<[u8]>)>>> = OnceLock::new();
+    let cache = ROOTS.get_or_init(|| RwLock::new(HashMap::new()));
+    let key = root_signature_key(device, params, samplers, compute);
+    {
+        let guard = cache.read().unwrap_or_else(|e| e.into_inner());
+        if let Some((root, blob)) = guard.get(&key) {
+            return Ok((root.0.clone(), blob.clone()));
+        }
+    }
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
@@ -1126,7 +1226,7 @@ fn root_signature(
     };
     // SAFETY: the description points at live arrays; the blob is read in
     // full before it is released.
-    unsafe {
+    let (made_root, blob) = unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
@@ -1142,8 +1242,13 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
-    }
+        (device.CreateRootSignature(0, bytes)?, Arc::<[u8]>::from(bytes))
+    };
+    let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+    let (root, blob) = guard
+        .entry(key)
+        .or_insert_with(|| (SendRoot(made_root), blob));
+    Ok((root.0.clone(), blob.clone()))
 }
 
 #[cfg(test)]
@@ -1939,5 +2044,122 @@ mod tests {
         let state = GraphicsState::default();
         assert_eq!(padding_of(&state.depth, &[depth_padding()]), [0, 0]);
         assert_eq!(padding_of(&state.blend, &blend_padding()), vec![0; 24]);
+    }
+
+    #[test]
+    fn root_signature_deduplicates_identical_layouts_and_separates_different_ones() {
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+
+        let make_params =
+            |num_32bit_values: u32, ranges: &[D3D12_DESCRIPTOR_RANGE1]| -> Vec<D3D12_ROOT_PARAMETER1> {
+                vec![
+                    D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Constants: D3D12_ROOT_CONSTANTS {
+                                ShaderRegister: 0,
+                                RegisterSpace: USER_DATA_SPACE,
+                                Num32BitValues: num_32bit_values,
+                            },
+                        },
+                        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                    },
+                    D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                ShaderRegister: 1,
+                                RegisterSpace: ROOT_CBV_SPACE,
+                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                            },
+                        },
+                        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                    },
+                    D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                NumDescriptorRanges: ranges.len() as u32,
+                                pDescriptorRanges: ranges.as_ptr(),
+                            },
+                        },
+                        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                    },
+                ]
+            };
+        let make_range = |base_reg: u32| {
+            [D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                BaseShaderRegister: base_reg,
+                RegisterSpace: ROOT_CBV_SPACE,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                    | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                OffsetInDescriptorsFromTableStart: 0,
+            }]
+        };
+        let make_sampler = |filter: D3D12_FILTER| {
+            [D3D12_STATIC_SAMPLER_DESC {
+                Filter: filter,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+                MinLOD: 0.0,
+                MaxLOD: f32::MAX,
+                ShaderRegister: 0,
+                RegisterSpace: SAMPLER_SPACE,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            }]
+        };
+
+        let ranges_a = make_range(2);
+        let ranges_b = make_range(2);
+        assert_ne!(ranges_a.as_ptr(), ranges_b.as_ptr());
+        let params_a = make_params(4, &ranges_a);
+        let params_b = make_params(4, &ranges_b);
+        let samplers_a = make_sampler(D3D12_FILTER_MIN_MAG_MIP_POINT);
+        let samplers_b = make_sampler(D3D12_FILTER_MIN_MAG_MIP_POINT);
+
+        let (root_a, blob_a) =
+            root_signature(&host.device, &params_a, &samplers_a, false).unwrap();
+        let (root_b, blob_b) =
+            root_signature(&host.device, &params_b, &samplers_b, false).unwrap();
+        assert_eq!(root_a.as_raw(), root_b.as_raw());
+        assert!(Arc::ptr_eq(&blob_a, &blob_b));
+
+        // Varying compute flag produces a distinct root signature and blob.
+        let (root_compute, blob_compute) =
+            root_signature(&host.device, &params_a, &samplers_a, true).unwrap();
+        assert_ne!(root_a.as_raw(), root_compute.as_raw());
+        assert!(!Arc::ptr_eq(&blob_a, &blob_compute));
+
+        // Varying Constants value produces a distinct root signature and blob.
+        let params_const = make_params(8, &ranges_a);
+        let (root_const, blob_const) =
+            root_signature(&host.device, &params_const, &samplers_a, false).unwrap();
+        assert_ne!(root_a.as_raw(), root_const.as_raw());
+        assert!(!Arc::ptr_eq(&blob_a, &blob_const));
+
+        // Varying table range BaseShaderRegister produces a distinct root signature and blob.
+        let ranges_diff = make_range(3);
+        let params_range = make_params(4, &ranges_diff);
+        let (root_range, blob_range) =
+            root_signature(&host.device, &params_range, &samplers_a, false).unwrap();
+        assert_ne!(root_a.as_raw(), root_range.as_raw());
+        assert!(!Arc::ptr_eq(&blob_a, &blob_range));
+
+        // Varying static sampler filter produces a distinct root signature and blob.
+        let samplers_diff = make_sampler(D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+        let (root_sampler, blob_sampler) =
+            root_signature(&host.device, &params_a, &samplers_diff, false).unwrap();
+        assert_ne!(root_a.as_raw(), root_sampler.as_raw());
+        assert!(!Arc::ptr_eq(&blob_a, &blob_sampler));
     }
 }
