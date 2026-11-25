@@ -6,6 +6,8 @@
 //! the immediate samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
+use std::fmt::Write as _;
+use std::ops::Range;
 use std::sync::Arc;
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
@@ -54,7 +56,7 @@ impl Default for GraphicsState {
             StencilPassOp: D3D12_STENCIL_OP_KEEP,
             StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
         };
-        GraphicsState {
+        let mut state = GraphicsState {
             blend: D3D12_BLEND_DESC {
                 RenderTarget: [target; 8],
                 ..Default::default()
@@ -87,8 +89,45 @@ impl Default for GraphicsState {
                 Count: 1,
                 Quality: 0,
             },
-        }
+        };
+        zero_padding(&mut state.blend, &blend_padding());
+        zero_padding(&mut state.depth, &[depth_padding()]);
+        state
     }
+}
+
+/// Zeroes the bytes of `value` at `padding`, in place: a structure read
+/// from the title's memory carries whatever lay between its fields, and the
+/// host's pipeline library tells descriptions apart by their bytes, padding
+/// included (an entry stored with other padding bytes never loads). The
+/// caller keeps `value` where it is: a move may rewrite its padding.
+fn zero_padding<T>(value: &mut T, padding: &[Range<usize>]) {
+    let bytes = std::ptr::from_mut(value).cast::<u8>();
+    for range in padding {
+        assert!(range.start <= range.end && range.end <= size_of::<T>());
+        // SAFETY: `value` is a whole `T`; these checked ranges contain only
+        // padding. Raw writes do not read the other, possibly uninitialised,
+        // padding bytes as `u8` values.
+        unsafe { bytes.add(range.start).write_bytes(0, range.len()) };
+    }
+}
+
+/// Where the padding of a blend description lies: after each target's
+/// write mask, a byte in a four-byte field.
+fn blend_padding() -> [Range<usize>; 8] {
+    std::array::from_fn(|i| {
+        let target = std::mem::offset_of!(D3D12_BLEND_DESC, RenderTarget)
+            + i * size_of::<D3D12_RENDER_TARGET_BLEND_DESC>();
+        target + std::mem::offset_of!(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 1
+            ..target + size_of::<D3D12_RENDER_TARGET_BLEND_DESC>()
+    })
+}
+
+/// Where the padding of a depth-stencil description lies: between the
+/// stencil write mask and the front face's operations.
+fn depth_padding() -> Range<usize> {
+    std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC, StencilWriteMask) + 1
+        ..std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC, FrontFace)
 }
 
 impl GraphicsState {
@@ -102,11 +141,15 @@ impl GraphicsState {
         unsafe {
             let data = at.add(4);
             match kind {
-                8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
+                8 => {
+                    self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned();
+                    zero_padding(&mut self.blend, &blend_padding());
+                }
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
                 11 => {
                     self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
+                    zero_padding(&mut self.depth, &[depth_padding()]);
                     self.depth_bounds = false;
                 }
                 21 => {
@@ -122,6 +165,7 @@ impl GraphicsState {
                         FrontFace: d.FrontFace,
                         BackFace: d.BackFace,
                     };
+                    zero_padding(&mut self.depth, &[depth_padding()]);
                 }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
@@ -174,37 +218,56 @@ impl GraphicsState {
         }
     }
 
-    /// Everything the state holds, as text: part of a pipeline's name in
-    /// the library and of the key a title pipeline is started early by.
-    pub(crate) fn describe(&self) -> String {
-        let inputs: Vec<String> = self
-            .inputs
-            .iter()
-            .zip(&self.names)
-            .map(|(e, name)| {
-                format!(
-                    "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
-                )
-            })
-            .collect();
+    /// Streams everything the state holds as text, matching [`Self::describe`]
+    /// byte-for-byte without allocating intermediate `String` or `Vec` buffers.
+    pub(crate) fn write_description(
+        &self,
+        out: &mut (impl std::fmt::Write + ?Sized),
+    ) -> std::fmt::Result {
         let bounds = if self.depth_bounds {
             " depth-bounds"
         } else {
             ""
         };
-        format!(
-            "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
-            self.sample_mask,
-            self.rasterizer,
-            self.depth,
+        write!(
+            out,
+            "{:?} {} {:?} {:?}{bounds} [",
+            self.blend, self.sample_mask, self.rasterizer, self.depth,
+        )?;
+        for (i, (e, name)) in self.inputs.iter().zip(&self.names).enumerate() {
+            if i > 0 {
+                out.write_str(", ")?;
+            }
+            out.write_char('"')?;
+            write!(
+                DebugStrContent(&mut *out),
+                "{name:?} {} {} {} {} {} {}",
+                e.SemanticIndex,
+                e.Format.0,
+                e.InputSlot,
+                e.AlignedByteOffset,
+                e.InputSlotClass.0,
+                e.InstanceDataStepRate,
+            )?;
+            out.write_char('"')?;
+        }
+        write!(
+            out,
+            "] {} {} {:?} {} {:?}",
             self.strip_cut.0,
             self.topology.0,
             self.targets,
             self.depth_format.0,
-            self.samples
+            self.samples,
         )
+    }
+
+    /// Everything the state holds, as text: part of a pipeline's name in
+    /// the library and of the key a title pipeline is started early by.
+    pub(crate) fn describe(&self) -> String {
+        let mut out = String::new();
+        let _ = self.write_description(&mut out);
+        out
     }
 
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
@@ -240,16 +303,16 @@ impl GraphicsState {
                     .as_bool()
             })
             .collect();
-        if fix.is_empty() {
-            return blend;
+        if !fix.is_empty() {
+            if !independent {
+                blend.RenderTarget = [blend.RenderTarget[0]; 8];
+                blend.IndependentBlendEnable = true.into();
+            }
+            for i in fix {
+                blend.RenderTarget[i].BlendEnable = false.into();
+            }
         }
-        if !independent {
-            blend.RenderTarget = [blend.RenderTarget[0]; 8];
-            blend.IndependentBlendEnable = true.into();
-        }
-        for i in fix {
-            blend.RenderTarget[i].BlendEnable = false.into();
-        }
+        zero_padding(&mut blend, &blend_padding());
         blend
     }
 
@@ -292,6 +355,46 @@ impl GraphicsState {
                 }
             })
             .collect()
+    }
+}
+
+/// Escapes written text identically to `Debug` for `str` (without enclosing
+/// quotes) so each input element streams inline inside `["...", "..."]`.
+struct DebugStrContent<'a, W: std::fmt::Write + ?Sized>(&'a mut W);
+
+impl<W: std::fmt::Write + ?Sized> std::fmt::Write for DebugStrContent<'_, W> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        let mut from = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            if !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\' {
+                if from < i {
+                    self.0.write_str(&s[from..i])?;
+                }
+                if b < 0x80 {
+                    // Single ASCII byte: `'` (0x27) is handled by the unescaped fast path.
+                    for esc in (b as char).escape_debug() {
+                        self.0.write_char(esc)?;
+                    }
+                    from = i + 1;
+                } else {
+                    for ch in s[i..].chars() {
+                        if ch == '\'' {
+                            self.0.write_char('\'')?;
+                        } else {
+                            for esc in ch.escape_debug() {
+                                self.0.write_char(esc)?;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if from < s.len() {
+            self.0.write_str(&s[from..])?;
+        }
+        Ok(())
     }
 }
 
@@ -549,15 +652,14 @@ impl HostPipeline {
                 return None;
             }
         };
-        let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
-                },
-            )
+        let stage_dxil = |i: usize| {
+            stages
+                .get(i)
+                .and_then(|(s, _)| s.translated())
+                .map(|t| t.host.dxil.as_slice())
         };
+        let code = |i: usize| shader_bytecode(stage_dxil(i));
+        let stage_bytes = |i: usize| stage_dxil(i).unwrap_or(&[]);
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
@@ -565,7 +667,7 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name("compute", &root_blob, &[stage_bytes(0)], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -614,17 +716,16 @@ impl HostPipeline {
         } else {
             false
         };
-        let state = g.describe();
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
             // looked up again.
-            let name = super::library::name(
+            let name = super::library::name_with(
                 "mesh triangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
+                &[stage_bytes(0), stage_bytes(1)],
+                |out| g.write_description(out),
             );
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
@@ -698,17 +799,17 @@ impl HostPipeline {
         // A pipeline with the geometry stage has a name of its own in the
         // library; the others keep theirs.
         let name = |gs: Option<&Vec<u8>>| match gs {
-            Some(gs) => super::library::name(
+            Some(gs) => super::library::name_with(
                 "graphics rectangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
-                &state,
+                &[stage_bytes(0), stage_bytes(1), &gs[..]],
+                |out| g.write_description(out),
             ),
-            None => super::library::name(
+            None => super::library::name_with(
                 "graphics",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
+                &[stage_bytes(0), stage_bytes(1)],
+                |out| g.write_description(out),
             ),
         };
         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
@@ -987,13 +1088,15 @@ fn mesh_pipeline(
     }
 }
 
-/// The bytes of shader code (none for an absent stage).
-fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
-    if code.pShaderBytecode.is_null() {
-        return Vec::new();
-    }
-    // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+/// Shader bytecode referencing a translated DXIL slice (default for an absent stage).
+fn shader_bytecode(dxil: Option<&[u8]>) -> D3D12_SHADER_BYTECODE {
+    dxil.map_or(
+        D3D12_SHADER_BYTECODE::default(),
+        |bytes| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        },
+    )
 }
 
 fn root_signature(
@@ -1436,5 +1539,405 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+
+    fn legacy_describe(g: &GraphicsState) -> String {
+        let inputs: Vec<String> = g
+            .inputs
+            .iter()
+            .zip(&g.names)
+            .map(|(e, name)| {
+                format!(
+                    "{name:?} {} {} {} {} {} {}",
+                    e.SemanticIndex,
+                    e.Format.0,
+                    e.InputSlot,
+                    e.AlignedByteOffset,
+                    e.InputSlotClass.0,
+                    e.InstanceDataStepRate,
+                )
+            })
+            .collect();
+        let bounds = if g.depth_bounds {
+            " depth-bounds"
+        } else {
+            ""
+        };
+        format!(
+            "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
+            g.blend,
+            g.sample_mask,
+            g.rasterizer,
+            g.depth,
+            g.strip_cut.0,
+            g.topology.0,
+            g.targets,
+            g.depth_format.0,
+            g.samples,
+        )
+    }
+
+    type InputSpec<'a> = (
+        &'a [u8],
+        u32,
+        DXGI_FORMAT,
+        u32,
+        u32,
+        D3D12_INPUT_CLASSIFICATION,
+        u32,
+    );
+
+    fn with_inputs(mut g: GraphicsState, elems: &[InputSpec<'_>]) -> GraphicsState {
+        g.names = elems
+            .iter()
+            .map(|(name, ..)| CString::new(*name).unwrap())
+            .collect();
+        g.inputs = elems
+            .iter()
+            .zip(&g.names)
+            .map(|(&(_, index, format, slot, offset, class, step), name)| {
+                D3D12_INPUT_ELEMENT_DESC {
+                    SemanticName: PCSTR(name.as_ptr().cast()),
+                    SemanticIndex: index,
+                    Format: format,
+                    InputSlot: slot,
+                    AlignedByteOffset: offset,
+                    InputSlotClass: class,
+                    InstanceDataStepRate: step,
+                }
+            })
+            .collect();
+        g
+    }
+
+    #[test]
+    fn write_description_matches_legacy_describe() {
+        let empty = GraphicsState::default();
+
+        let single = with_inputs(
+            GraphicsState::default(),
+            &[(
+                b"POSITION",
+                0,
+                DXGI_FORMAT_R32G32B32_FLOAT,
+                0,
+                0,
+                D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                0,
+            )],
+        );
+
+        let escaped = with_inputs(
+            GraphicsState::default(),
+            &[
+                (
+                    b"TEXCOORD",
+                    2,
+                    DXGI_FORMAT_R32G32_FLOAT,
+                    1,
+                    8,
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    0,
+                ),
+                (
+                    br#"QUO"TE\SLASH'APOS"#,
+                    1,
+                    DXGI_FORMAT_R8G8B8A8_UNORM,
+                    2,
+                    D3D12_APPEND_ALIGNED_ELEMENT,
+                    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                    4,
+                ),
+                (
+                    b"LINE\nTAB\tCR\rCTRL\x01DEL\x7f",
+                    3,
+                    DXGI_FORMAT_R16G16_FLOAT,
+                    0,
+                    16,
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    0,
+                ),
+                (
+                    b"RAW\xff\x80BYTES",
+                    4,
+                    DXGI_FORMAT_R32_UINT,
+                    3,
+                    24,
+                    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                    1,
+                ),
+                (
+                    "caf\u{00e9}\u{0301}'x".as_bytes(),
+                    5,
+                    DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    1,
+                    32,
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    0,
+                ),
+                (
+                    b"",
+                    0,
+                    DXGI_FORMAT_R8_UNORM,
+                    0,
+                    48,
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    0,
+                ),
+            ],
+        );
+
+        let build_custom = |depth_bounds: bool| {
+            let mut custom = GraphicsState {
+                sample_mask: 0xdead_beef,
+                depth_bounds,
+                strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF,
+                topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                depth_format: DXGI_FORMAT_D32_FLOAT,
+                samples: DXGI_SAMPLE_DESC {
+                    Count: 4,
+                    Quality: 2,
+                },
+                ..GraphicsState::default()
+            };
+            custom.blend.AlphaToCoverageEnable = true.into();
+            custom.blend.IndependentBlendEnable = true.into();
+            custom.blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                LogicOpEnable: false.into(),
+                SrcBlend: D3D12_BLEND_SRC_ALPHA,
+                DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+                BlendOp: D3D12_BLEND_OP_REV_SUBTRACT,
+                SrcBlendAlpha: D3D12_BLEND_ONE,
+                DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+                BlendOpAlpha: D3D12_BLEND_OP_MAX,
+                LogicOp: D3D12_LOGIC_OP_XOR,
+                RenderTargetWriteMask: 0x07,
+            };
+            custom.blend.RenderTarget[3].RenderTargetWriteMask = 0x01;
+            custom.rasterizer = D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_WIREFRAME,
+                CullMode: D3D12_CULL_MODE_NONE,
+                FrontCounterClockwise: true.into(),
+                DepthBias: -7,
+                DepthBiasClamp: 0.25,
+                SlopeScaledDepthBias: 1.5,
+                DepthClipEnable: false.into(),
+                MultisampleEnable: true.into(),
+                AntialiasedLineEnable: true.into(),
+                ForcedSampleCount: 4,
+                ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON,
+            };
+            custom.depth = D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                DepthFunc: D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+                StencilEnable: true.into(),
+                StencilReadMask: 0x0f,
+                StencilWriteMask: 0xf0,
+                FrontFace: D3D12_DEPTH_STENCILOP_DESC {
+                    StencilFailOp: D3D12_STENCIL_OP_REPLACE,
+                    StencilDepthFailOp: D3D12_STENCIL_OP_INCR_SAT,
+                    StencilPassOp: D3D12_STENCIL_OP_INVERT,
+                    StencilFunc: D3D12_COMPARISON_FUNC_NOT_EQUAL,
+                },
+                BackFace: D3D12_DEPTH_STENCILOP_DESC {
+                    StencilFailOp: D3D12_STENCIL_OP_ZERO,
+                    StencilDepthFailOp: D3D12_STENCIL_OP_DECR,
+                    StencilPassOp: D3D12_STENCIL_OP_INCR,
+                    StencilFunc: D3D12_COMPARISON_FUNC_EQUAL,
+                },
+            };
+            custom.targets = D3D12_RT_FORMAT_ARRAY {
+                RTFormats: [
+                    DXGI_FORMAT_R8G8B8A8_UNORM,
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_FORMAT_UNKNOWN,
+                ],
+                NumRenderTargets: 3,
+            };
+            with_inputs(
+                custom,
+                &[
+                    (
+                        b"SV_Position",
+                        0,
+                        DXGI_FORMAT_R32G32B32A32_FLOAT,
+                        0,
+                        0,
+                        D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                        0,
+                    ),
+                    (
+                        b"COLOR\"0'",
+                        1,
+                        DXGI_FORMAT_R8G8B8A8_UNORM,
+                        1,
+                        16,
+                        D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                        2,
+                    ),
+                ],
+            )
+        };
+        let custom = build_custom(false);
+        let custom_depth_bounds = build_custom(true);
+
+        for (label, g) in [
+            ("empty", &empty),
+            ("single", &single),
+            ("escaped", &escaped),
+            ("custom", &custom),
+            ("custom_depth_bounds", &custom_depth_bounds),
+        ] {
+            let legacy = legacy_describe(g);
+            assert_eq!(g.describe(), legacy, "{label}: describe()");
+
+            let mut written = String::new();
+            g.write_description(&mut written).unwrap();
+            assert_eq!(written, legacy, "{label}: write_description(&mut String)");
+
+            let mut h = blake3::Hasher::new();
+            g.write_description(&mut super::super::Blake3Writer(&mut h))
+                .unwrap();
+            assert_eq!(
+                h.finalize(),
+                blake3::hash(legacy.as_bytes()),
+                "{label}: Blake3Writer digest"
+            );
+
+            assert_eq!(
+                super::super::library::name_with(
+                    "graphics",
+                    b"root-blob",
+                    &[b"vs-code", b"ps-code"],
+                    |out| g.write_description(out),
+                ),
+                super::super::library::name(
+                    "graphics",
+                    b"root-blob",
+                    &[b"vs-code", b"ps-code"],
+                    &legacy,
+                ),
+                "{label}: library::name_with"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_bytes_matches_code_bytes_for_pipeline_names() {
+        fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
+            if code.pShaderBytecode.is_null() {
+                return Vec::new();
+            }
+            // SAFETY: test slice lives for the duration of this call.
+            unsafe {
+                std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength)
+            }
+            .to_vec()
+        }
+
+        let root_blob = b"root-blob";
+        let s0 = b"DXBC-stage0";
+        let s1 = b"DXBC-stage1";
+        let gs = b"DXBC-rect-gs";
+
+        for dx0 in [None, Some(&[][..]), Some(&s0[..])] {
+            let n_old = super::super::library::name(
+                "compute",
+                root_blob,
+                &[&code_bytes(&shader_bytecode(dx0))],
+                "",
+            );
+            let n_new =
+                super::super::library::name("compute", root_blob, &[dx0.unwrap_or(&[])], "");
+            assert_eq!(n_new, n_old);
+
+            for dx1 in [None, Some(&[][..]), Some(&s1[..])] {
+                let mesh_old = super::super::library::name(
+                    "mesh triangles",
+                    root_blob,
+                    &[
+                        &code_bytes(&shader_bytecode(dx0)),
+                        &code_bytes(&shader_bytecode(dx1)),
+                    ],
+                    "mesh-state",
+                );
+                let mesh_new = super::super::library::name(
+                    "mesh triangles",
+                    root_blob,
+                    &[dx0.unwrap_or(&[]), dx1.unwrap_or(&[])],
+                    "mesh-state",
+                );
+                assert_eq!(mesh_new, mesh_old);
+
+                for (kind, gs_bytes) in [("graphics", &[][..]), ("graphics rectangles", &gs[..])] {
+                    let gfx_old = super::super::library::name(
+                        kind,
+                        root_blob,
+                        &[
+                            &code_bytes(&shader_bytecode(dx0)),
+                            &code_bytes(&shader_bytecode(dx1)),
+                            gs_bytes,
+                        ],
+                        "gfx-state",
+                    );
+                    let gfx_new = super::super::library::name(
+                        kind,
+                        root_blob,
+                        &[dx0.unwrap_or(&[]), dx1.unwrap_or(&[]), gs_bytes],
+                        "gfx-state",
+                    );
+                    assert_eq!(gfx_new, gfx_old);
+                }
+            }
+        }
+    }
+
+    /// The bytes of `value` no field reads (see `zero_padding`).
+    fn padding_of<T>(value: &T, padding: &[Range<usize>]) -> Vec<u8> {
+        // SAFETY: `value` is a whole `T`; only known padding ranges are read.
+        unsafe {
+            let bytes =
+                std::slice::from_raw_parts(std::ptr::from_ref(value).cast::<u8>(), size_of::<T>());
+            padding
+                .iter()
+                .flat_map(|r| r.clone().map(|i| bytes[i]))
+                .collect()
+        }
+    }
+
+    /// Descriptions read with other bytes between their fields are the same
+    /// to the host: the title leaves what it likes there, and the pipeline
+    /// library compares those padding bytes too.
+    #[test]
+    fn read_states_carry_no_padding() {
+        // 4 bytes of type, then the longest description, the blend's.
+        let junk = vec![0xffu8; 4 + size_of::<D3D12_BLEND_DESC>()];
+        let mut state = GraphicsState::default();
+        for kind in [21, 11, 8] {
+            // SAFETY: 0xff bytes, a whole subobject of each kind.
+            unsafe { state.read(kind, junk.as_ptr()) };
+            assert_eq!(padding_of(&state.depth, &[depth_padding()]), [0, 0]);
+        }
+        assert_eq!(padding_of(&state.blend, &blend_padding()), vec![0; 24]);
+        // The fields themselves are the title's.
+        assert_eq!(state.blend.RenderTarget[7].RenderTargetWriteMask, 0xff);
+        assert_eq!(state.depth.StencilWriteMask, 0xff);
+        assert_eq!(state.depth.FrontFace.StencilFailOp, D3D12_STENCIL_OP(-1));
+        // `host_blend` also keeps padding zeroed.
+        state.targets.NumRenderTargets = 1;
+        state.targets.RTFormats[0] = DXGI_FORMAT_R8_UINT;
+        let host_b = state.host_blend();
+        assert_eq!(padding_of(&host_b, &blend_padding()), vec![0; 24]);
+        // So does the default state.
+        let state = GraphicsState::default();
+        assert_eq!(padding_of(&state.depth, &[depth_padding()]), [0, 0]);
+        assert_eq!(padding_of(&state.blend, &blend_padding()), vec![0; 24]);
     }
 }

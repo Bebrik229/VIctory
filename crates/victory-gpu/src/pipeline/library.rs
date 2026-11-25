@@ -48,6 +48,7 @@
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
@@ -59,7 +60,74 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
+    sweep_staging(&dir, std::process::id(), STAGING_KEPT);
+    crate::shader_meta::init(&dir);
     let _ = DIR.set(dir);
+}
+
+/// How long another process's staging file is left alone: the folder is
+/// shared, and a running instance may be writing it.
+const STAGING_KEPT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+const STAGING_PREFIXES: &[&str] = &[
+    "host-pipelines.bin.tmp-",
+    "host-pipelines.tmp-",
+    "early-pipelines.txt.tmp-",
+    "early-pipelines.tmp-",
+    "prebuilt-pipelines.txt.tmp-",
+    "shader-meta.bin.tmp-",
+];
+
+const LEGACY_STAGING_FILES: &[&str] = &["host-pipelines.tmp", "early-pipelines.tmp"];
+
+/// Removes the staging files of cut writes (`write_atomically` / `save`)
+/// from `dir`: those of process `pid` now (no write of this run has started
+/// yet), other processes' (and legacy `.tmp` files without a pid) once
+/// untouched for `kept`.
+fn sweep_staging(dir: &std::path::Path, pid: u32, kept: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        let writer = staging_pid(name_str);
+        let legacy_tmp = writer.is_none() && LEGACY_STAGING_FILES.contains(&name_str);
+        if writer.is_none() && !legacy_tmp {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let age = meta.modified().ok().and_then(|t| t.elapsed().ok());
+        if writer == Some(pid) || age.is_some_and(|age| age >= kept) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The process whose staging file `name` is (`<file>.tmp-<pid>-<n>` or
+/// `<stem>.tmp-<pid>-<n>` of a cache file), if it is one.
+fn staging_pid(name: &str) -> Option<u32> {
+    let rest = STAGING_PREFIXES
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))?;
+    let (pid, n) = rest.split_once('-')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(pid) || !digits(n) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// Unique staging path beside `path` (`<path>.tmp-<pid>-<n>`), so concurrent
+/// processes or threads never collide on a shared `.tmp` filename.
+fn staging_path(path: &std::path::Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".tmp-{pid}-{n}"));
+    PathBuf::from(name)
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -88,6 +156,66 @@ fn mapped() -> bool {
 fn holds() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_HANDLE").is_none_or(|v| v != "0"))
+}
+
+/// Whether the mapped library file's pages are prefetched in the background
+/// when opened (`VICTORY_LIBRARY_PREFETCH=0` disables it).
+fn prefetch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_PREFETCH").is_none_or(|v| v != "0"))
+}
+
+fn prefetch_mapped(at: usize, len: usize) {
+    #[repr(C)]
+    struct Win32MemoryRangeEntry {
+        virtual_address: *mut std::ffi::c_void,
+        number_of_bytes: usize,
+    }
+    type PrefetchVirtualMemoryFn = unsafe extern "system" fn(
+        windows::Win32::Foundation::HANDLE,
+        usize,
+        *const Win32MemoryRangeEntry,
+        u32,
+    ) -> i32;
+
+    let work = move || {
+        let started = std::time::Instant::now();
+        // SAFETY: `kernel32.dll` is loaded in the process; `PrefetchVirtualMemory`
+        // (resolved dynamically for older Windows / Wine compatibility) accepts the
+        // current process handle and the mapped view range kept alive by `Library`.
+        let ok = unsafe {
+            let Ok(kernel32) = windows::Win32::System::LibraryLoader::GetModuleHandleW(
+                windows::core::w!("kernel32.dll"),
+            ) else {
+                return;
+            };
+            let Some(proc) = windows::Win32::System::LibraryLoader::GetProcAddress(
+                kernel32,
+                windows::core::PCSTR(c"PrefetchVirtualMemory".as_ptr().cast()),
+            ) else {
+                return;
+            };
+            let prefetch_vm: PrefetchVirtualMemoryFn = std::mem::transmute(proc);
+            let entry = Win32MemoryRangeEntry {
+                virtual_address: at as *mut std::ffi::c_void,
+                number_of_bytes: len,
+            };
+            prefetch_vm(
+                windows::Win32::System::Threading::GetCurrentProcess(),
+                1,
+                &entry,
+                0,
+            ) != 0
+        };
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+        tracing::debug!(len, ok, elapsed_ms, "prefetched mapped host pipeline library");
+        crate::host::trail(|| {
+            format!("pipeline library: prefetched {len} bytes in {elapsed_ms:.1} ms (ok={ok})")
+        });
+    };
+    let _ = std::thread::Builder::new()
+        .name("victory-library-prefetch".into())
+        .spawn(work);
 }
 
 /// A whole file mapped into memory: read-only (the library's file) or
@@ -287,7 +415,6 @@ impl Drop for Call {
 /// the module's notes), and a pipeline stored there is what the driver was
 /// handed.
 pub(crate) fn removal_note() -> String {
-    use std::fmt::Write;
     let now = crate::host::now_us();
     let mut text = String::from("pipeline library: ");
     {
@@ -471,6 +598,9 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     VIEW[1].store(file.len, Ordering::Relaxed);
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
                     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+                    if prefetch() {
+                        prefetch_mapped(file.at.Value as usize, file.len);
+                    }
                 }
                 return Some(Library {
                     library,
@@ -499,11 +629,38 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
 /// A pipeline's name in the library: the hash of what its host
 /// description holds.
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
+    name_with(kind, root, code, |out| out.write_str(state))
+}
+
+/// A pipeline's name in the library, streaming its state description into the
+/// hasher with no intermediate `String` allocation while keeping the exact
+/// length-prefixed hash layout of [`name`].
+pub(crate) fn name_with(
+    kind: &str,
+    root: &[u8],
+    code: &[&[u8]],
+    write_state: impl Fn(&mut dyn std::fmt::Write) -> std::fmt::Result,
+) -> String {
+    struct Len(usize);
+    impl std::fmt::Write for Len {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 += s.len();
+            Ok(())
+        }
+    }
+
     let mut h = blake3::Hasher::new();
-    for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
+    for part in [kind.as_bytes(), root]
+        .into_iter()
+        .chain(code.iter().copied())
+    {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
+    let mut len = Len(0);
+    let _ = write_state(&mut len);
+    h.update(&(len.0 as u64).to_le_bytes());
+    let _ = write_state(&mut super::Blake3Writer(&mut h));
     h.finalize().to_hex()[..32].to_owned()
 }
 
@@ -581,7 +738,8 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    crate::shader_meta::save(dir);
+    let tmp = staging_path(&dir.join(LIBRARY_FILE));
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -610,8 +768,18 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let used = {
+        let before = early_before();
+        let now = USED_NOW.lock().unwrap_or_else(|e| e.into_inner());
+        match now.as_ref() {
+            Some(now) => early_list(before, now),
+            None => early_list(before, &KeySet::default()),
+        }
+    };
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    if bytes > 0 && library_written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
@@ -673,39 +841,143 @@ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Res
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    let tmp = staging_path(path);
+    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
-/// Title pipeline keys requested by draws or dispatches (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Parses a canonical 32-character lowercase hexadecimal pipeline key as `u128`.
+/// Non-canonical keys (different length, uppercase, sign, non-hex) return `None`
+/// and fall back to exact string storage so semantics and round-tripping stay identical.
+fn parse_key_u128(key: &str) -> Option<u128> {
+    (key.len() == 32 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| u128::from_str_radix(key, 16).ok())
+        .flatten()
+}
+
+/// Compact set of pipeline keys: canonical 32-hex keys live in `HashSet<u128>`
+/// with zero per-key heap `String` allocations; any non-32-hex line falls back
+/// to `other`.
+#[derive(Default)]
+struct KeySet {
+    hex: HashSet<u128>,
+    other: Vec<String>,
+}
+
+impl KeySet {
+    fn from_lines(text: &str) -> Self {
+        let mut set = Self::default();
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            set.insert(line);
+        }
+        set
+    }
+
+    fn insert(&mut self, key: &str) -> bool {
+        if let Some(id) = parse_key_u128(key) {
+            self.hex.insert(id)
+        } else if self.other.iter().any(|s| s == key) {
+            false
+        } else {
+            self.other.push(key.to_owned());
+            true
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        if let Some(id) = parse_key_u128(key) {
+            self.hex.contains(&id)
+        } else {
+            self.other.iter().any(|s| s == key)
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.hex.len() + self.other.len()
+    }
+}
+
+/// The list to keep: this run's keys, then earlier runs' others, at most
+/// `EARLY_MAX` (the oldest go once it is full).
+fn early_list(before: &KeySet, now: &KeySet) -> Vec<String> {
+    let mut out = Vec::with_capacity((now.len() + before.len()).min(EARLY_MAX));
+    for &id in &now.hex {
+        if out.len() == EARLY_MAX {
+            return out;
+        }
+        out.push(format!("{id:032x}"));
+    }
+    for key in &now.other {
+        if out.len() == EARLY_MAX {
+            return out;
+        }
+        out.push(key.clone());
+    }
+    for &id in &before.hex {
+        if out.len() == EARLY_MAX {
+            return out;
+        }
+        if !now.hex.contains(&id) {
+            out.push(format!("{id:032x}"));
+        }
+    }
+    for key in &before.other {
+        if out.len() == EARLY_MAX {
+            return out;
+        }
+        if !now.other.iter().any(|k| k == key) {
+            out.push(key.clone());
+        }
+    }
+    out
+}
+
+/// Earlier runs' early-start keys, loaded once so [`wanted_early`] is lock-free.
+static EARLY_BEFORE: OnceLock<KeySet> = OnceLock::new();
+/// Title pipeline keys drawn or dispatched with in this run.
+static USED_NOW: Mutex<Option<KeySet>> = Mutex::new(None);
+/// Whether [`USED_NOW`] holds at least one key recorded in this run.
+static HAS_USED_NOW: AtomicBool = AtomicBool::new(false);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
-    if used.is_none() {
-        let listed = DIR
-            .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
-            .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
-    }
-    used
+fn load_early_before(dir: Option<&std::path::Path>) -> KeySet {
+    let listed = dir
+        .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
+        .unwrap_or_default();
+    let before = KeySet::from_lines(&listed);
+    tracing::info!(pipelines = before.len(), "title pipelines to start early");
+    before
+}
+
+fn early_before() -> &'static KeySet {
+    EARLY_BEFORE.get_or_init(|| load_early_before(DIR.get().map(PathBuf::as_path)))
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|s| s.contains(key))
+    if early_before().contains(key) {
+        return true;
+    }
+    if !HAS_USED_NOW.load(Ordering::Acquire) {
+        return false;
+    }
+    USED_NOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(key))
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    let _ = early_before();
+    let mut now = USED_NOW.lock().unwrap_or_else(|e| e.into_inner());
+    let set = now.get_or_insert_with(KeySet::default);
+    if set.len() < EARLY_MAX && set.insert(key) {
+        HAS_USED_NOW.store(true, Ordering::Release);
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -837,5 +1109,184 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    #[test]
+    fn name_with_matches_name() {
+        let chunks = ["alpha ", "beta\n", "gamma \"quoted\" ", "δ"];
+        let full: String = chunks.concat();
+        assert_eq!(
+            name_with("graphics", b"root-blob", &[b"vs-code", b"ps-code"], |out| {
+                for chunk in chunks {
+                    out.write_str(chunk)?;
+                }
+                Ok(())
+            }),
+            name("graphics", b"root-blob", &[b"vs-code", b"ps-code"], &full),
+        );
+        assert_eq!(
+            name_with("compute", b"", &[b""], |_| Ok(())),
+            name("compute", b"", &[b""], ""),
+        );
+    }
+
+    /// This run's keys stay in the list; earlier runs' fill it up to the cap.
+    #[test]
+    fn the_early_list_keeps_this_run_first() {
+        let keys = |r: std::ops::Range<usize>| {
+            let mut set = KeySet::default();
+            for i in r {
+                set.insert(&format!("{i:032x}"));
+            }
+            set
+        };
+        let before = keys(0..EARLY_MAX);
+        let now = keys(EARLY_MAX - 10..EARLY_MAX + 10);
+        let list = early_list(&before, &now);
+        assert_eq!(list.len(), EARLY_MAX);
+        assert!((EARLY_MAX - 10..EARLY_MAX + 10).all(|i| list.contains(&format!("{i:032x}"))));
+        assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
+    }
+
+    #[test]
+    fn parse_key_u128_accepts_only_canonical_32_hex() {
+        assert_eq!(
+            parse_key_u128("00000000000000000000000000000000"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_key_u128("ffffffffffffffffffffffffffffffff"),
+            Some(u128::MAX)
+        );
+        assert_eq!(
+            parse_key_u128("0123456789abcdef0123456789abcdef"),
+            Some(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef)
+        );
+        for non_canonical in [
+            "",
+            "deadbeef",
+            "0123456789abcdef0123456789abcde",   // 31 chars
+            "0123456789abcdef0123456789abcdef0", // 33 chars
+            "0123456789ABCDEF0123456789ABCDEF",  // uppercase
+            "+0123456789abcdef0123456789abcde",  // leading +
+            "-0123456789abcdef0123456789abcde",  // leading -
+            " 0123456789abcdef0123456789abcde",  // leading space
+            "0123456789abcdef0123456789abcdeg",  // non-hex char
+        ] {
+            assert_eq!(parse_key_u128(non_canonical), None, "{non_canonical:?}");
+        }
+    }
+
+    #[test]
+    fn early_before_lock_free_lookup_handles_hex_and_non_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let hex_a = "00000000000000000000000000000001";
+        let hex_b = "abcdef0123456789abcdef0123456789";
+        let hex_missing = "abcdef0123456789abcdef0123456780";
+        let upper = "ABCDEF0123456789ABCDEF0123456789";
+        let plus = "+0000000000000000000000000000001";
+        let non_hex = "custom-pipeline-key";
+
+        let content = format!(
+            "\n{hex_a}\n{hex_b}\n{hex_a}\n\n{upper}\n{plus}\n{non_hex}\n{non_hex}\n"
+        );
+        std::fs::write(dir.path().join(EARLY_FILE), content).unwrap();
+
+        let cell: OnceLock<KeySet> = OnceLock::new();
+        let loaded = cell.get_or_init(|| load_early_before(Some(dir.path())));
+        assert_eq!(loaded.hex.len(), 2);
+        assert_eq!(loaded.other.len(), 3);
+        assert_eq!(loaded.len(), 5);
+
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    let before = cell.get().unwrap();
+                    assert!(before.contains(hex_a));
+                    assert!(before.contains(hex_b));
+                    assert!(!before.contains(hex_missing));
+                    assert!(before.contains(upper));
+                    assert!(before.contains(plus));
+                    assert!(before.contains(non_hex));
+                    assert!(!before.contains("00000000000000000000000000000002"));
+                    assert!(!before.contains("other-missing"));
+                });
+            }
+        });
+
+        // Missing directory / file loads cleanly as empty.
+        assert_eq!(load_early_before(None).len(), 0);
+        let empty_dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_early_before(Some(empty_dir.path())).len(), 0);
+
+        // `early_list` merges both hex and fallback keys with `now` first and no duplicates.
+        let mut now = KeySet::default();
+        now.insert(hex_b);
+        now.insert(hex_missing);
+        now.insert(non_hex);
+        now.insert("new-custom");
+        let merged = early_list(loaded, &now);
+        assert_eq!(merged.len(), 7);
+        assert_eq!(merged.iter().collect::<HashSet<_>>().len(), 7);
+        for expected in [hex_a, hex_b, hex_missing, upper, plus, non_hex, "new-custom"] {
+            assert!(merged.iter().any(|k| k == expected), "missing {expected}");
+        }
+    }
+
+    /// Staging files of cut writes go: this process's at once, others' and
+    /// legacy `.tmp` once old; the files themselves and anything else stay.
+    #[test]
+    fn stale_staging_files_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - 2 * STAGING_KEPT;
+        let file = |d: &std::path::Path, name: &str, modified: Option<std::time::SystemTime>| {
+            let f = std::fs::File::create(d.join(name)).unwrap();
+            if let Some(t) = modified {
+                f.set_modified(t).unwrap();
+            }
+        };
+        let gone = [
+            "host-pipelines.bin.tmp-7-0",
+            "host-pipelines.tmp-7-1",
+            "early-pipelines.txt.tmp-7-3",
+            "early-pipelines.tmp-7-4",
+            "shader-meta.bin.tmp-7-5",
+            "host-pipelines.bin.tmp-8-1",
+            "host-pipelines.tmp-8-1",
+            "prebuilt-pipelines.txt.tmp-9-12",
+            "host-pipelines.tmp",
+            "early-pipelines.tmp",
+        ];
+        let kept = [
+            "host-pipelines.bin",
+            "early-pipelines.txt",
+            "host-pipelines.bin.tmp-8-2", // another process's, recent
+            "host-pipelines.tmp-8-2",     // another process's stem-tmp, recent
+            "host-pipelines.bin.tmp-7-x", // not a staging name
+            "host-pipelines.bin.tmp-7",   // not a staging name
+            "other.bin.tmp-7-0",          // not a file of ours
+        ];
+        for (i, name) in gone.iter().enumerate() {
+            file(dir.path(), name, (i >= 5).then_some(old));
+        }
+        for name in kept {
+            file(dir.path(), name, (!name.contains("tmp-8-2")).then_some(old));
+        }
+        std::fs::create_dir(dir.path().join("host-pipelines.bin.tmp-9-0")).unwrap();
+        sweep_staging(dir.path(), 7, STAGING_KEPT);
+        for name in gone {
+            assert!(!dir.path().join(name).exists(), "{name} swept");
+        }
+        for name in kept.into_iter().chain(["host-pipelines.bin.tmp-9-0"]) {
+            assert!(dir.path().join(name).exists(), "{name} kept");
+        }
+
+        // Legacy `.tmp` files without a pid are kept while recent.
+        let recent_dir = tempfile::tempdir().unwrap();
+        file(recent_dir.path(), "host-pipelines.tmp", None);
+        file(recent_dir.path(), "early-pipelines.tmp", None);
+        sweep_staging(recent_dir.path(), 7, STAGING_KEPT);
+        assert!(recent_dir.path().join("host-pipelines.tmp").exists());
+        assert!(recent_dir.path().join("early-pipelines.tmp").exists());
     }
 }

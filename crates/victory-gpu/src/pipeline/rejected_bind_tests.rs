@@ -70,6 +70,7 @@ fn compute_pipeline(used: &[UsedResource]) -> HostPipeline {
     let shader = Shader {
         stage: "compute",
         hash: "rejected_bind".to_owned(),
+        full_hash: [0; 32],
         container: Vec::new(),
         resolves_light: false,
         translated: Some(Translated {

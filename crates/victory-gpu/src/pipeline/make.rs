@@ -51,7 +51,9 @@ impl Pending {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        if let Some(g) = &graphics {
+            let _ = g.write_description(&mut super::Blake3Writer(&mut key));
+        }
         let screen = graphics.as_ref().is_some_and(|g| g.screen_pass());
         Pending {
             shaders,
@@ -328,16 +330,19 @@ fn workers() -> bool {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .map(|n| n.clamp(1, 16))
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)));
-        tracing::info!(workers, "pipeline workers");
+        let low_prio = std::env::var_os("VICTORY_PIPELINE_LOW_PRIO").is_some_and(|v| v == "1");
+        tracing::info!(workers, low_prio, "pipeline workers");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                .spawn(move || {
+                    if low_prio {
+                        // Below the title's own threads (loading, recording).
+                        // SAFETY: a plain call on our own thread.
+                        unsafe {
+                            use windows::Win32::System::Threading::*;
+                            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
                     }
                     loop {
                         next().make();

@@ -60,6 +60,9 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    /// Full BLAKE3 digest of `container`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    full_hash: [u8; 32],
     container: Vec<u8>,
     /// Its result gets constant indirect diffuse light ([`crate::ambient`]).
     #[cfg(windows)]
@@ -103,24 +106,33 @@ pub(crate) fn kept() -> [u64; 7] {
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    let key = *full.as_bytes();
+    {
+        let shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = shaders.as_ref().and_then(|map| map.get(&key)) {
+            return existing.clone();
+        }
+    }
+    let candidate = Arc::new(Shader {
+        stage,
+        hash: full.to_hex()[..16].to_owned(),
+        full_hash: key,
+        container: bytes.to_vec(),
+        #[cfg(windows)]
+        resolves_light: bytes
+            .windows(crate::ambient::PROGRAM.len())
+            .any(|w| w == crate::ambient::PROGRAM),
+        #[cfg(windows)]
+        translated: OnceLock::new(),
+    });
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry(key)
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(Shader {
-                stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
-                #[cfg(windows)]
-                resolves_light: bytes
-                    .windows(crate::ambient::PROGRAM.len())
-                    .any(|w| w == crate::ambient::PROGRAM),
-                #[cfg(windows)]
-                translated: OnceLock::new(),
-            })
+            candidate
         })
         .clone()
 }
@@ -142,7 +154,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.full_hash, &self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -180,27 +192,30 @@ impl Shader {
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(full_hash: &[u8; 32], container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
-    let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
-        None => Vec::new(),
-    };
+    let (used, stores) = crate::shader_meta::get_or_compute(full_hash, || {
+        let c = Container::parse(container).map_err(|e| e.to_string())?;
+        let programs = match c.part(FourCC::DXIL) {
+            Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
+            None => Vec::new(),
+        };
+        let stores = programs.is_empty() || programs.iter().any(stores);
+        let used = programs
+            .into_iter()
+            .find(|p| {
+                matches!(
+                    p.stage,
+                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+                )
+            })
+            .map(|p| p.used)
+            .unwrap_or_default();
+        Ok((used, stores))
+    })?;
     let host = crate::shader_cache::host_shader(container)?;
-    let stores = programs.is_empty() || programs.iter().any(stores);
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
     Ok(Translated { host, used, stores })
 }
 
@@ -699,6 +714,19 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+/// Streams formatted text directly into a BLAKE3 hasher without allocating an
+/// intermediate `String`.
+#[cfg(windows)]
+pub(crate) struct Blake3Writer<'a>(pub &'a mut blake3::Hasher);
+
+#[cfg(windows)]
+impl std::fmt::Write for Blake3Writer<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.update(s.as_bytes());
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
@@ -865,5 +893,44 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[test]
+    fn shader_deduplicates_and_matches_blake3_prefix() {
+        let a = b"victory-pipeline-shader-dedup-test-payload-a";
+        let b = b"victory-pipeline-shader-dedup-test-payload-b";
+        let s1 = shader("vertex", a);
+        let s2 = shader("vertex", a);
+        let sb = shader("pixel", b);
+
+        assert!(Arc::ptr_eq(&s1, &s2));
+        assert!(!Arc::ptr_eq(&s1, &sb));
+        assert_eq!(s1.hash.len(), 16);
+        assert_eq!(s1.hash, blake3::hash(a).to_hex()[..16]);
+        assert_eq!(sb.hash, blake3::hash(b).to_hex()[..16]);
+        assert_eq!(s1.full_hash, *blake3::hash(a).as_bytes());
+        assert_eq!(sb.full_hash, *blake3::hash(b).as_bytes());
+        assert_eq!(s1.container, a);
+        assert_eq!(sb.container, b);
+
+        // Concurrent misses on the same fresh bytes converge to one shared `Arc`.
+        let c = b"victory-pipeline-shader-dedup-test-payload-race";
+        let start = std::sync::Barrier::new(8);
+        let results: Vec<Arc<Shader>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let start = &start;
+                    s.spawn(move || {
+                        start.wait();
+                        shader("compute", c)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for r in &results[1..] {
+            assert!(Arc::ptr_eq(&results[0], r));
+        }
+        assert_eq!(results[0].hash, blake3::hash(c).to_hex()[..16]);
     }
 }
