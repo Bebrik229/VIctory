@@ -5923,6 +5923,7 @@ impl HostList {
 
     /// Clears `in_indirect` on the current indirect scratch buffer if set,
     /// returning whether a transition to `COMMON` is needed.
+    #[cfg(test)]
     pub(crate) fn take_indirect_ready(&self) -> bool {
         if let Some((_, _, in_indirect)) = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             let was = *in_indirect;
