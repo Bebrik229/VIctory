@@ -717,6 +717,39 @@ pub(crate) fn dispatched() -> u64 {
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+fn direct_table_cbv() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_TABLE_CBV").is_none_or(|v| v != "0"))
+}
+
+/// Checks whether a constant buffer view at `(gpu, left)` of `size` bytes
+/// satisfies D3D12's 256-byte alignment and size-rounding bounds for direct
+/// `Shadow` binding (no `Step::Fill` upload scratch copy).
+fn direct_cbv_fits(gpu: u64, left: u64, size: u32) -> bool {
+    if size == 0 || gpu % 256 != 0 {
+        return false;
+    }
+    let Some(aligned) = u64::from(size).checked_next_multiple_of(256) else {
+        return false;
+    };
+    left >= aligned
+}
+
+/// Resolves a table `View::Constant(address, size)` directly to its `Shadow`
+/// when 256-byte aligned and in-bounds, avoiding `Step::Fill` upload copies
+/// and `WHY_READ` settles against in-flight shader writes.
+fn direct_cbv_shadow(address: u64, size: u32) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    if !direct_table_cbv() || size == 0 {
+        return None;
+    }
+    let aligned = u64::from(size).checked_next_multiple_of(256)?;
+    let shadow = crate::shadow::find(address, aligned)?;
+    if !direct_cbv_fits(shadow.gpu(address), shadow.left(address), size) {
+        return None;
+    }
+    Some(shadow)
+}
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -2970,10 +3003,18 @@ impl State {
                 (table, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries.iter() {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                    match crate::descriptor::view(handle) {
+                        Some(View::Constant(address, size)) => {
+                            if let Some(shadow) = direct_cbv_shadow(address, size) {
+                                shadow.refresh(list, address, u64::from(size));
+                            }
+                        }
+                        Some(view) if u.kind != ResourceType::Cbv => {
+                            readable(list, u.kind, &view);
+                        }
+                        _ => {}
                     }
                 }
                 for k in selected {
@@ -2981,10 +3022,18 @@ impl State {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
-                    if let Some(view) = crate::descriptor::view(handle)
-                        && let Some(kind) = view_kind(&view)
-                    {
-                        readable(list, kind, &view);
+                    match crate::descriptor::view(handle) {
+                        Some(View::Constant(address, size)) => {
+                            if let Some(shadow) = direct_cbv_shadow(address, size) {
+                                shadow.refresh(list, address, u64::from(size));
+                            }
+                        }
+                        Some(view) => {
+                            if let Some(kind) = view_kind(&view) {
+                                readable(list, kind, &view);
+                            }
+                        }
+                        None => {}
                     }
                 }
                 made.push((slot, first * 32));
@@ -3015,6 +3064,11 @@ impl State {
                     Some(View::Constant(address, size)) => {
                         if let Some(title) = title_first {
                             host.texture_slot_tabled(title + k, false);
+                        }
+                        if let Some(shadow) = direct_cbv_shadow(address, size) {
+                            host.make_at(index, &View::Constant(address, size));
+                            shadow.refresh(list, address, u64::from(size));
+                            continue;
                         }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
@@ -4076,5 +4130,16 @@ mod tests {
         // Custom steady limits are respected once steady state is reached.
         let custom_steady = TextureStageConfig { steady_ms: 8, steady_mb: 16, ..default };
         assert_eq!(custom_steady.budget(TEXTURE_STEADY_AFTER, 1024), (8, 16 << 20));
+    }
+
+    #[test]
+    fn direct_cbv_fits_enforces_256b_alignment_and_rounded_bounds() {
+        assert!(!direct_cbv_fits(0x10000, 512, 0));
+        assert!(!direct_cbv_fits(0x10010, 512, 64));
+        assert!(!direct_cbv_fits(0x10000, 128, 64)); // rounded SizeInBytes=256 exceeds left=128
+        assert!(direct_cbv_fits(0x10000, 256, 64));
+        assert!(direct_cbv_fits(0x10100, 256, 256));
+        assert!(!direct_cbv_fits(0x10100, 256, 257)); // rounded SizeInBytes=512 exceeds left=256
+        assert!(direct_cbv_fits(0x10100, 512, 257));
     }
 }
