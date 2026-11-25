@@ -1510,10 +1510,8 @@ struct CardWork {
     inflight: Option<CardInflight>,
 }
 
-/// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
+/// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_COMPARE_FETCH`]).
 struct CardInflight {
-    root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
     /// PC memory, mapped (buffer, mapping, bytes): dword 0 the counter of
     /// tickets, then one dword per dword of `CardWork::differs`, the entry
     /// of that piece.
@@ -1547,6 +1545,105 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// gets a dword per piece, 1 where a byte differs. The offsets are widened
 /// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
 /// byte just outside the range costs a fetch that finds nothing.
+/// Coalesced 64-thread-per-piece card hash/compare + fused inflight fetch:
+/// 1 threadgroup (`[numthreads(64,1,1)]`) per 64 KiB piece reads 64 coalesced
+/// `Load4` chunks (`at += 1024u`) with deterministic 6-step tree reduction
+/// (64x shorter dependency chain, 8x less L2/DRAM traffic vs 1-thread/piece).
+/// In `compare == 3` (`flown && inflight_fetch`), thread 0 takes a ticket on
+/// diff and all 64 threads copy the L2-hot piece into `fetched` in the same
+/// pass — eliminating the mid-`check` UAV barrier and separate `CARD_FETCH`.
+pub(crate) const CARD_COMPARE_FETCH: &str = r#"
+#define RS "RootConstants(num32BitConstants=9, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
+#define SLOT 65552u
+#define NONE 0xffffffffu
+cbuffer Span : register(b0) {
+    uint first;    // the first piece
+    uint skew;     // where the copy starts in its piece 0
+    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
+    uint pieces;
+    uint out_at;   // the first piece's dword in `differs`, in bytes
+    uint compare;  // 0: store hashes; 1: compare; 2: compare+store; 3: compare+store+inflight fetch
+    uint landed;   // every ticket below it is landed (compare == 3)
+    uint slots;    // slots of `fetched` (compare == 3)
+    uint groups;   // groups dispatched
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+RWByteAddressBuffer table : register(u2);
+RWByteAddressBuffer fetched : register(u3);
+groupshared uint4 s_h[64];
+groupshared uint s_ticket;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
+    [loop]
+    for (uint i = group.x; i < pieces; i += groups) {
+        uint piece = first + i;
+        uint lo = piece * 65536u;
+        lo = lo > skew ? lo - skew : 0u;
+        uint hi = min((piece + 1u) * 65536u - skew, size);
+        lo = lo & ~15u;
+        hi = (hi + 15u) & ~15u;
+        uint4 h = uint4(
+            0x9E3779B9u ^ (t * 0x9E3779B1u),
+            0x85EBCA6Bu ^ (t * 0x85EBCA77u),
+            0xC2B2AE35u ^ (t * 0xC2B2AE3Du),
+            0x27D4EB2Fu ^ (t * 0x01000193u)
+        );
+        [loop]
+        for (uint at = lo + t * 16u; at < hi; at += 1024u) {
+            h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+        }
+        s_h[t] = h;
+        GroupMemoryBarrierWithGroupSync();
+        [unroll]
+        for (uint d = 32u; d > 0u; d >>= 1u) {
+            if (t < d) {
+                uint4 a = s_h[t];
+                uint4 b = s_h[t + d];
+                a = (a ^ b) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+                s_h[t] = a.yzwx ^ (a >> 15);
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (t == 0u) {
+            uint4 fin = s_h[0];
+            uint entry = NONE;
+            if (compare != 0u) {
+                uint diff = any(fin != hashes.Load4(piece * 16u)) ? 1u : 0u;
+                differs.Store(out_at + i * 4u, diff);
+                if (compare >= 2u) hashes.Store4(piece * 16u, fin);
+                if (compare == 3u) {
+                    if (diff != 0u) {
+                        uint k;
+                        table.InterlockedAdd(0, 1u, k);
+                        entry = k;
+                    }
+                    table.Store(4u + out_at + i * 4u, entry);
+                }
+            } else {
+                hashes.Store4(piece * 16u, fin);
+            }
+            s_ticket = entry;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        uint k = s_ticket;
+        GroupMemoryBarrierWithGroupSync();
+        if (compare == 3u && k != NONE && (k - landed) < slots) {
+            uint into = (k % slots) * SLOT;
+            [loop]
+            for (uint at = lo + t * 16u; at < hi; at += 1024u) {
+                fetched.Store4(into + (at - lo), now.Load4(at));
+            }
+        }
+    }
+}
+"#;
+
+/// Legacy 1-thread-per-piece compare shader kept for existing WARP tests.
+#[cfg(test)]
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1615,13 +1712,13 @@ fn inflight_fetch() -> bool {
 }
 
 /// The bytes of the PC's memory pieces fetched inside flights go to
-/// ([`inflight_fetch`]; `VICTORY_CARD_FETCH_INFLIGHT_MB`, 64): 1,024 slots
+/// ([`inflight_fetch`]; `VICTORY_CARD_FETCH_INFLIGHT_MB`, 256): 4,096 slots
 /// ([`inflight_slots`]). A flight whose flagged pieces find no free slot
 /// lands the old way.
 fn inflight_fetch_bytes() -> u64 {
     static MOST: OnceLock<u64> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_FETCH_INFLIGHT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64).max(1) << 20
+        std::env::var("VICTORY_CARD_FETCH_INFLIGHT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256).max(1) << 20
     })
 }
 
@@ -1676,6 +1773,7 @@ pub(crate) fn inflight_gets_slot(k: u32, floor: u32, slots: u32) -> bool {
 /// its dword in `differs`) is written: the ticket, also one that got no
 /// slot (the landing repeats the test with the plan's `landed`), or
 /// [`INFLIGHT_NONE`].
+#[cfg(test)]
 pub(crate) const CARD_FETCH: &str = r#"
 #define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2)"
 #define SLOT 65552u
@@ -3307,9 +3405,9 @@ impl Host {
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
+                CARD_COMPARE_FETCH.as_ptr().cast(),
+                CARD_COMPARE_FETCH.len(),
+                windows::core::s!("card compare fetch"),
                 None,
                 None,
                 windows::core::s!("main"),
@@ -3322,9 +3420,9 @@ impl Host {
         }
         let code = code.ok_or_else(windows::core::Error::empty)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
-        // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
-        // in one submission.
-        const RESULTS: u64 = 1 << 20;
+        // 4 MiB of results: 1,048,576 pieces, avoids card_results_low pipeline
+        // drains when 2-3 frames are in flight simultaneously.
+        const RESULTS: u64 = 4 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
@@ -3358,28 +3456,7 @@ impl Host {
     /// [`CardInflight`] for `results` bytes of the compare's results; `None`
     /// (and the old fetch) if the shader or the memory cannot be had.
     fn make_card_inflight(&self, results: u64) -> Option<CardInflight> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let made = (|| -> windows::core::Result<CardInflight> {
-            let mut code: Option<ID3DBlob> = None;
-            // SAFETY: the source and names live through the call; the out
-            // pointer is ours.
-            unsafe {
-                D3DCompile(
-                    CARD_FETCH.as_ptr().cast(),
-                    CARD_FETCH.len(),
-                    windows::core::s!("card fetch in flight"),
-                    None,
-                    None,
-                    windows::core::s!("main"),
-                    windows::core::s!("cs_5_1"),
-                    0,
-                    0,
-                    &mut code,
-                    None,
-                )?;
-            }
-            let code = code.ok_or_else(windows::core::Error::empty)?;
             let slots = inflight_slots(inflight_fetch_bytes());
             let (table, table_data) = self.shared_buffer(4 + results).ok_or_else(windows::core::Error::empty)?;
             name(&table, || "card fetch in flight: tickets".into());
@@ -3389,34 +3466,18 @@ impl Host {
             // SAFETY: the mapping holds the counter; nothing of ours ran
             // on the card with it yet.
             unsafe { table_data.cast::<u32>().write_volatile(0) };
-            // SAFETY: the blob's own bytes; the root signature is inside
-            // the shader.
-            unsafe {
-                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
-                let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: bytes.as_ptr().cast(),
-                        BytecodeLength: bytes.len(),
-                    },
-                    ..Default::default()
-                })?;
-                Ok(CardInflight {
-                    root,
-                    pso,
-                    table: (table, table_data as usize, 4 + results),
-                    fetched: (fetched, fetched_data as usize, slots),
-                    landed: 0,
-                    brought: Vec::new(),
-                })
-            }
+            Ok(CardInflight {
+                table: (table, table_data as usize, 4 + results),
+                fetched: (fetched, fetched_data as usize, slots),
+                landed: 0,
+                brought: Vec::new(),
+            })
         })();
         match made {
             Ok(inflight) => {
                 tracing::info!(
                     slots = inflight.fetched.2,
-                    "card copies' flagged pieces come down inside their flights (VICTORY_CARD_FETCH_INFLIGHT=1)"
+                    "card copies' flagged pieces come down inside their flights (fused, VICTORY_CARD_FETCH_INFLIGHT=1)"
                 );
                 Some(inflight)
             }
@@ -3505,6 +3566,12 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    // 3-phase sync: (1) all CopyBufferRegions across dirty shadows,
+                    // (2) ONE batched barrier COPY_DEST -> NON_PIXEL_SHADER_RESOURCE,
+                    // (3) bind root sig/PSO once and emit all coalesced rehashes back-to-back.
+                    let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+                    let mut to_hash: Vec<(&Arc<crate::shadow::Shadow>, &Vec<(usize, usize)>, ID3D12Resource, u64)> =
+                        Vec::new();
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3514,40 +3581,47 @@ impl Host {
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
-                        let Some(before) = before else {
-                            continue;
-                        };
-                        // No twin (it cost the card the copy's size again,
-                        // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
-                        // hashed again, all of them the first time; the
-                        // compare after the lists hashes the declared
-                        // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
+                        if let Some(before) = before {
+                            if !ranges.is_empty() {
+                                barriers.push(transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                ));
+                            }
+                            to_hash.push((shadow, ranges, before, size));
                         }
+                    }
+                    if !barriers.is_empty() {
+                        list.ResourceBarrier(&barriers);
+                    }
+                    if !to_hash.is_empty() {
+                        let dummy_uav = work.differs.0.GetGPUVirtualAddress();
                         list.SetComputeRootSignature(&work.root);
                         list.SetPipelineState(&work.pso);
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                        list.SetComputeRootUnorderedAccessView(3, dummy_uav);
+                        list.SetComputeRootUnorderedAccessView(4, dummy_uav);
+                        list.SetComputeRootUnorderedAccessView(5, dummy_uav);
+                        for (shadow, ranges, before, size) in to_hash {
+                            list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                                vec![shadow.card_run(0, usize::MAX)]
+                            } else {
+                                ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            };
+                            let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                            CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                            for run in runs {
+                                if run.pieces == 0 {
+                                    continue;
+                                }
+                                let groups = run.pieces.clamp(1, 65535);
+                                let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0, 0, 1, groups];
+                                list.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
+                                list.Dispatch(groups, 1, 1);
+                            }
                         }
                     }
                     list.Close()?;
@@ -3626,51 +3700,52 @@ impl Host {
                     }]);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    let differs_gpu = work.differs.0.GetGPUVirtualAddress();
+                    list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                    // Fused compare + inflight fetch (`compare == 3`): copies each
+                    // changed piece while still hot in L2 cache, eliminating the
+                    // mid-`check` full-GPU UAV barrier and all separate CARD_FETCH passes.
+                    let (mode, landed, slots, every_ok) = if flown
+                        && let Some(inflight) = &work.inflight
+                    {
+                        list.SetComputeRootUnorderedAccessView(4, inflight.table.0.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(5, inflight.fetched.0.GetGPUVirtualAddress());
+                        (3u32, inflight.landed, inflight.fetched.2, true)
+                    } else {
+                        list.SetComputeRootUnorderedAccessView(4, differs_gpu);
+                        list.SetComputeRootUnorderedAccessView(5, differs_gpu);
+                        (if flown { 2u32 } else { 1u32 }, 0u32, 1u32, false)
+                    };
+                    let mut every = every_ok;
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
+                            every = false;
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                        if r.span.pieces == 0 {
+                            continue;
+                        }
+                        let groups = r.span.pieces.clamp(1, 65535);
+                        let constants = [
+                            r.span.first,
+                            r.span.skew,
+                            size as u32,
+                            r.span.pieces,
+                            r.at * 4,
+                            mode,
+                            landed,
+                            slots,
+                            groups,
+                        ];
+                        list.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(groups, 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
-                    // The fetch inside the flight (`inflight_fetch`): behind
-                    // every compare of the list, the pieces they flagged go
-                    // to slots in the PC's memory.
-                    if flown && let Some(inflight) = &work.inflight {
-                        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                                    pResource: std::mem::ManuallyDrop::new(None),
-                                }),
-                            },
-                        }]);
-                        list.SetComputeRootSignature(&inflight.root);
-                        list.SetPipelineState(&inflight.pso);
-                        list.SetComputeRootUnorderedAccessView(2, work.differs.0.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, inflight.table.0.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(4, inflight.fetched.0.GetGPUVirtualAddress());
-                        let mut every = true;
-                        for r in plan.ranges.iter().filter(|r| r.compared) {
-                            let Some((_, Some(_), size)) = r.shadow.card_sides() else {
-                                every = false;
-                                continue;
-                            };
-                            let groups = r.span.pieces.clamp(1, 65535);
-                            let constants =
-                                [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, inflight.landed, inflight.fetched.2, groups];
-                            list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
-                            list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                            list.Dispatch(groups, 1, 1);
-                        }
+                    if mode == 3 {
                         plan.inflight = every;
-                        plan.inflight_landed = inflight.landed;
+                        plan.inflight_landed = landed;
                     }
                     list.Close()?;
                     list.cast()

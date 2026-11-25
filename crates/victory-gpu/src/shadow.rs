@@ -3035,7 +3035,8 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        // Run of dirty pages: `(first_page, all_previously_copied)`.
+        let (mut bytes, mut run): (usize, Option<(usize, bool)>) = (0, None);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -3046,36 +3047,83 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
+            let seen = *at != 0;
+            if !seen || write > *at {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
                 }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                match run {
+                    Some((first, run_seen)) if run_seen != seen => {
+                        bytes += self.copy_filtered((first * PAGE).max(from), (page * PAGE).min(to), run_seen);
+                        run = Some((page, seen));
+                    }
+                    None => run = Some((page, seen)),
+                    Some(_) => {}
+                }
+            } else if let Some((first, run_seen)) = run.take() {
+                bytes += self.copy_filtered((first * PAGE).max(from), (page * PAGE).min(to), run_seen);
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        if let Some((first, run_seen)) = run {
+            bytes += self.copy_filtered((first * PAGE).max(from), ((last + 1) * PAGE).min(to), run_seen);
         }
         bytes
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
+        self.copy_filtered(from, to, false)
+    }
+
+    /// [`Self::copy`], with SIMD echo-filtering when `filter_echo` is true on
+    /// a card-backed copy: `card_merge_relay` writes GPU shader outputs back
+    /// into title memory, dirtying write-watch pages whose contents already
+    /// match `self.data`. Diff-filtering avoids re-uploading and re-hashing
+    /// those unchanged echoed pages over PCIe/GPU.
+    fn copy_filtered(&self, from: usize, to: usize, filter_echo: bool) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        let len = to.saturating_sub(from);
+        if len == 0 {
+            return 0;
+        }
+        let off = from - start;
+        if filter_echo && self.card.is_some() {
+            thread_local! {
+                static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            return SCRATCH.with(|cell| {
+                let mut tmp = cell.borrow_mut();
+                if tmp.len() < len {
+                    tmp.resize(len, 0);
+                }
+                let buf = &mut tmp[..len];
+                crate::host::copy_mapped(buf.as_mut_ptr(), from as *const u8, len, false);
+                // SAFETY: inside the mapping (`from` and `to` are within the buffer),
+                // and `copy_stale` only runs on ranges outside `self.pending`.
+                let cur = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) };
+                let Some(first) = first_difference(buf, cur) else {
+                    return 0;
+                };
+                let last = last_difference(buf, cur).unwrap_or(first);
+                let changed_len = last + 1 - first;
+                cur[first..=last].copy_from_slice(&buf[first..=last]);
+                self.changed(off + first, off + last + 1);
+                self.card_changed(off + first, off + last + 1);
+                changed_len
+            });
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        let at = unsafe { self.data.add(off) };
+        crate::host::copy_mapped(at, from as *const u8, len, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
-        self.changed(from - start, to - start);
-        self.card_changed(from - start, to - start);
-        to - from
+        self.changed(off, to - start);
+        self.card_changed(off, to - start);
+        len
     }
 
     /// Whether shaders read and write this copy in the card's own memory
