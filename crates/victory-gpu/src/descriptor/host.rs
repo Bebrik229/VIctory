@@ -2266,13 +2266,25 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, None);
+        self.constant_at_kept(index, gpu, size, None);
+    }
+
+    /// Makes slot `index` (a dynamic one) a constant buffer view of `resource`
+    /// at `gpu`, holding `resource` alive while the slot views it.
+    pub(crate) fn constant_at_kept(
+        &self,
+        index: u32,
+        gpu: u64,
+        size: u32,
+        resource: Option<ID3D12Resource>,
+    ) {
+        self.keep(index, resource);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
             SizeInBytes: size.next_multiple_of(256),
         };
-        // SAFETY: a slot of our heap; the memory is the caller's.
+        // SAFETY: a slot of our heap; the memory is kept alive by `self.keep` or the caller.
         unsafe {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))

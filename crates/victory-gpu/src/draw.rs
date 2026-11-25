@@ -3008,7 +3008,8 @@ impl State {
                     match crate::descriptor::view(handle) {
                         Some(View::Constant(address, size)) => {
                             if let Some(shadow) = direct_cbv_shadow(address, size) {
-                                shadow.refresh(list, address, u64::from(size));
+                                let aligned = u64::from(size).next_multiple_of(256);
+                                shadow.refresh(list, address, aligned);
                             }
                         }
                         Some(view) if u.kind != ResourceType::Cbv => {
@@ -3025,7 +3026,8 @@ impl State {
                     match crate::descriptor::view(handle) {
                         Some(View::Constant(address, size)) => {
                             if let Some(shadow) = direct_cbv_shadow(address, size) {
-                                shadow.refresh(list, address, u64::from(size));
+                                let aligned = u64::from(size).next_multiple_of(256);
+                                shadow.refresh(list, address, aligned);
                             }
                         }
                         Some(view) => {
@@ -3066,8 +3068,14 @@ impl State {
                             host.texture_slot_tabled(title + k, false);
                         }
                         if let Some(shadow) = direct_cbv_shadow(address, size) {
-                            host.make_at(index, &View::Constant(address, size));
-                            shadow.refresh(list, address, u64::from(size));
+                            let aligned = u64::from(size).next_multiple_of(256);
+                            host.constant_at_kept(
+                                index,
+                                shadow.gpu(address),
+                                size,
+                                Some(shadow.buffer.clone()),
+                            );
+                            shadow.refresh(list, address, aligned);
                             continue;
                         }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
