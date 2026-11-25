@@ -350,6 +350,13 @@ pub(crate) fn log_removal_context() {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Microseconds per phase of [`Host::submit`] since the last frame-rate line:
+/// `[0]` `sync_heaps` + `make_waiting`, `[1]` `ask_once`, `[2]` `run_deferred` + `plan_prelude`,
+/// `[3]` `record_preludes`, `[4]` `batch.flush` + `ask_once_end`, `[5]` `take_snapshots`,
+/// `[6]` `card_before`, `[7]` `ExecuteCommandLists` + `Signal` + `card_sent`.
+static SUBMIT_PARTS: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -1946,6 +1953,15 @@ fn rehash_runs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
 }
 
+/// Whether the `sync` list of [`Host::card_before`] is placed ahead of the
+/// submission's lists in the single [`ID3D12CommandQueue::ExecuteCommandLists`]
+/// call (`VICTORY_CARD_SINGLE_SUBMIT=0` falls back to submitting it on its
+/// own before the lists).
+fn card_single_submit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SINGLE_SUBMIT").is_none_or(|v| v != "0"))
+}
+
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
@@ -1979,6 +1995,9 @@ struct CardRange {
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
     ranges: Vec<CardRange>,
+    /// The sync list (CPU-to-card copies and initial hashes), run before
+    /// the submission's lists when [`card_single_submit`] is on.
+    sync: Option<ID3D12CommandList>,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
     /// The copies whose card side was brought up to date, alive until the
@@ -3917,7 +3936,9 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let mut sync_cmd: Option<ID3D12CommandList> = None;
         if !dirty.is_empty() {
+            let single = card_single_submit();
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
@@ -3926,13 +3947,14 @@ impl Host {
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
             let recorded = unsafe {
-                (|| -> windows::core::Result<()> {
+                (|| -> windows::core::Result<Option<ID3D12CommandList>> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     // 3-phase sync: (1) all CopyBufferRegions across dirty shadows,
                     // (2) ONE batched barrier COPY_DEST -> NON_PIXEL_SHADER_RESOURCE,
                     // (3) bind root sig/PSO once and emit all coalesced rehashes back-to-back.
                     let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+                    let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
                     let mut to_hash: Vec<(&Arc<crate::shadow::Shadow>, &Vec<(usize, usize)>, ID3D12Resource, u64)> =
                         Vec::new();
                     for (shadow, ranges) in &dirty {
@@ -3953,6 +3975,15 @@ impl Host {
                                 ));
                             }
                             to_hash.push((shadow, ranges, before, size));
+                        } else if single && !ranges.is_empty() {
+                            // No automatic state decay occurs between lists inside
+                            // a single ExecuteCommandLists; return COPY_DEST buffers
+                            // to COMMON so subsequent draw lists can promote them.
+                            post_barriers.push(transition(
+                                &shadow.buffer,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_COMMON,
+                            ));
                         }
                     }
                     if !barriers.is_empty() {
@@ -3976,6 +4007,7 @@ impl Host {
                             let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
                             CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                             CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                            let mut dispatched = false;
                             for run in runs {
                                 if run.pieces == 0 {
                                     continue;
@@ -3984,22 +4016,40 @@ impl Host {
                                 let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0, 0, 1, groups];
                                 list.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
                                 list.Dispatch(groups, 1, 1);
+                                dispatched = true;
+                            }
+                            if single && (!ranges.is_empty() || dispatched) {
+                                post_barriers.push(transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                    D3D12_RESOURCE_STATE_COMMON,
+                                ));
                             }
                         }
                     }
-                    list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    Ok(())
+                    if single {
+                        if !post_barriers.is_empty() {
+                            list.ResourceBarrier(&post_barriers);
+                        }
+                        list.Close()?;
+                        Ok(Some(list.cast()?))
+                    } else {
+                        list.Close()?;
+                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        Ok(None)
+                    }
                 })()
             };
-            if let Err(e) = recorded {
-                fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
+            match recorded {
+                Ok(cmd) => sync_cmd = cmd,
+                Err(e) => fail(format_args!("host copies in the card's memory could not be brought up to date ({e})")),
             }
             used.push((false, sync));
         }
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
+            sync: sync_cmd,
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
@@ -5016,7 +5066,11 @@ impl Host {
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        {
+            let t0 = std::time::Instant::now();
+            crate::descriptor::sync_heaps();
+            SUBMIT_PARTS[0].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5036,7 +5090,11 @@ impl Host {
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
-        crate::descriptor::make_waiting();
+        {
+            let t0 = std::time::Instant::now();
+            crate::descriptor::make_waiting();
+            SUBMIT_PARTS[0].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -5045,7 +5103,7 @@ impl Host {
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len() + 2);
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
@@ -5055,36 +5113,41 @@ impl Host {
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
-        let ask_ranges: Vec<(usize, usize)> = if crate::watch::once() {
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    match step {
-                        Step::Refresh(shadow, address, len) if !shadow.unwatched() => {
-                            let span = spans
-                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                                .or_insert((*address, *address + *len));
-                            *span = (span.0.min(*address), span.1.max(*address + *len));
-                        }
-                        Step::Texture(staging) => {
-                            let (at, len) = staging.memory();
-                            if len > 0
-                                && let Some(end) = at.checked_add(len)
-                            {
-                                spans
-                                    .entry(std::sync::Arc::as_ptr(staging) as usize)
-                                    .or_insert((at, end));
+        let ask_ranges: Vec<(usize, usize)> = {
+            let t1 = std::time::Instant::now();
+            let ranges = if crate::watch::once() {
+                let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        match step {
+                            Step::Refresh(shadow, address, len) if !shadow.unwatched() => {
+                                let span = spans
+                                    .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                    .or_insert((*address, *address + *len));
+                                *span = (span.0.min(*address), span.1.max(*address + *len));
                             }
+                            Step::Texture(staging) => {
+                                let (at, len) = staging.memory();
+                                if len > 0
+                                    && let Some(end) = at.checked_add(len)
+                                {
+                                    spans
+                                        .entry(std::sync::Arc::as_ptr(staging) as usize)
+                                        .or_insert((at, end));
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
-            crate::watch::ask_once(&ranges);
+                let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+                crate::watch::ask_once(&ranges);
+                ranges
+            } else {
+                Vec::new()
+            };
+            SUBMIT_PARTS[1].fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
             ranges
-        } else {
-            Vec::new()
         };
         // Behind flights: the title wrote memory that a flight's shaders
         // may write too, and this submission refreshes it. With `relay_exact`,
@@ -5119,10 +5182,14 @@ impl Host {
         }
         let parallel = parallel_preludes(runs);
         let mut plans = Vec::new();
+        let mut deferred_us = 0u64;
         for list in runs {
+            let t2 = std::time::Instant::now();
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(plan) = list.plan_prelude() {
+            let planned = list.plan_prelude();
+            deferred_us += t2.elapsed().as_micros() as u64;
+            if let Some(plan) = planned {
                 lists.push(plan.commands.1.cast().ok());
                 if parallel {
                     plans.push(plan);
@@ -5132,18 +5199,28 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        record_preludes(plans);
-        batch.flush();
-        crate::watch::ask_once_end();
+        SUBMIT_PARTS[2].fetch_add(deferred_us, Ordering::Relaxed);
+        {
+            let t3 = std::time::Instant::now();
+            record_preludes(plans);
+            SUBMIT_PARTS[3].fetch_add(t3.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        {
+            let t4 = std::time::Instant::now();
+            batch.flush();
+            crate::watch::ask_once_end();
+            SUBMIT_PARTS[4].fetch_add(t4.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
         {
-            #[cfg(feature = "diagnostics")]
-            let snapshots = std::time::Instant::now();
+            let t5 = std::time::Instant::now();
             crate::shadow::take_snapshots();
+            let us = t5.elapsed().as_micros() as u64;
+            SUBMIT_PARTS[5].fetch_add(us, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
+            crate::copystat::add(crate::copystat::C::SnapshotUs, us);
         }
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
@@ -5154,19 +5231,33 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown);
+        let card = {
+            let t6 = std::time::Instant::now();
+            let card = self.card_before(runs, flown);
+            SUBMIT_PARTS[6].fetch_add(t6.elapsed().as_micros() as u64, Ordering::Relaxed);
+            card
+        };
+        if let Some(sync) = card.as_ref().and_then(|c| c.sync.clone()) {
+            lists.insert(0, Some(sync));
+            // Keep `firsts[0] == 0` so `sync` runs in group 0 when `timing()` is on.
+            for f in firsts.iter_mut().skip(1) {
+                *f += 1;
+            }
+        }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
+            let t7 = std::time::Instant::now();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            SUBMIT_PARTS[7].fetch_add(t7.elapsed().as_micros() as u64, Ordering::Relaxed);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -5204,12 +5295,12 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                let t7 = std::time::Instant::now();
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                let signalled = self.queue.Signal(&self.fence, *submitted);
+                SUBMIT_PARTS[7].fetch_add(t7.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let waited = signalled.and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
                         working(false);
@@ -7163,6 +7254,15 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        {
+            let [p0, p1, p2, p3, p4, p5, p6, p7] =
+                [0, 1, 2, 3, 4, 5, 6, 7].map(|i| SUBMIT_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            if p0 + p1 + p2 + p3 + p4 + p5 + p6 + p7 >= 1.0 {
+                tracing::info!(
+                    "submit phases per frame: sync_heaps {p0:.1} ms, ask_once {p1:.1} ms, deferred {p2:.1} ms, preludes {p3:.1} ms, flush {p4:.1} ms, snapshots {p5:.1} ms, card_before {p6:.1} ms, execute {p7:.1} ms"
+                );
+            }
+        }
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
