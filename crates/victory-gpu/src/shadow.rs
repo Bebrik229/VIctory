@@ -1984,6 +1984,14 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// `[not_watched, watch_none, runs_limit, no_snapshot]` failures in [`Shadow::merge_under_writes`].
+static MERGE_FAIL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// `[not_watched, watch_none, runs_limit, no_snapshot]`, taken.
+pub(crate) fn merge_fail_stats() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| MERGE_FAIL[i].swap(0, Ordering::Relaxed))
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -3117,6 +3125,7 @@ impl Shadow {
             return Vec::new();
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            MERGE_FAIL[0].fetch_add(1, Ordering::Relaxed);
             return busy;
         }
         let base = start / PAGE;
@@ -3130,6 +3139,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                MERGE_FAIL[1].fetch_add(1, Ordering::Relaxed);
                 unmerged.push((a, e));
                 continue;
             };
@@ -3166,6 +3176,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
+                        MERGE_FAIL[2].fetch_add(1, Ordering::Relaxed);
                         unmerged.push((lo, e));
                         break;
                     }
@@ -3183,6 +3194,7 @@ impl Shadow {
                     card.take_echoed(base, page);
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        MERGE_FAIL[3].fetch_add(1, Ordering::Relaxed);
                         unmerged.push((lo, e));
                         break;
                     };

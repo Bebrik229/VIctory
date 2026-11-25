@@ -832,6 +832,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// Timestamp query heap and readback buffer for release GPU profiling (`VICTORY_GPU_PROFILE=1`).
+    profile_stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// Recorded `(start_query_idx, pipeline_label)` spans on this list.
+    profile_spans: Mutex<Vec<(u32, String)>>,
 }
 
 /// A list's buffers for hoisted clamped indirect arguments with their
@@ -1404,6 +1408,15 @@ fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
+
+/// Whether per-pipeline GPU timestamps are collected in release builds (`VICTORY_GPU_PROFILE=1`).
+pub(crate) fn gpu_profile_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_PROFILE").is_some_and(|v| v == "1"))
+}
+
+/// Maximum timestamp queries reserved per host list for `VICTORY_GPU_PROFILE=1` (1024 spans).
+const PROFILE_STAMPS: u32 = 2048;
 
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
@@ -2846,7 +2859,13 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize)> {
     let exact = late_exact();
     // At most this many changed runs go up to copies in the card's memory,
     // each a copy of its own there.
-    let mut runs_left = 512;
+    static RUNS_LIMIT: OnceLock<usize> = OnceLock::new();
+    let mut runs_left = *RUNS_LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_MERGE_RUNS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4096)
+    });
     for (shadow, mut ranges) in per_shadow {
         let raw = std::mem::take(&mut ranges);
         join_ranges(&mut ranges, raw);
@@ -3270,9 +3289,10 @@ fn late_line(frames: f64) {
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [f_nw, f_wn, f_rl, f_ns] = crate::shadow::merge_fail_stats();
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
+             {runs:.0} changed runs, {:.2} MB (unmerged: not_watched={f_nw}, watch_none={f_wn}, runs_limit={f_rl}, no_snapshot={f_ns})",
             bytes / (1 << 20) as f64
         );
     }
@@ -3721,6 +3741,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                profile_stamps: OnceLock::new(),
+                profile_spans: Mutex::default(),
             })
         }
     }
@@ -4607,7 +4629,9 @@ impl Host {
                 Late::Run(flight) => {
                     last = flight.number;
                     for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
+                        let list = flight.lists[i].host();
+                        read_backs(list);
+                        self.collect_gpu_profile(list);
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -5408,6 +5432,7 @@ impl Host {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
             read_backs(list);
+            self.collect_gpu_profile(list);
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -5603,7 +5628,170 @@ impl Host {
     }
 }
 
+impl Host {
+    /// Aggregates finished per-list GPU timestamp spans when `VICTORY_GPU_PROFILE=1`
+    /// and logs the top 15 pipelines every 2 seconds.
+    fn collect_gpu_profile(&self, list: &HostList) {
+        if !gpu_profile_on() {
+            return;
+        }
+        let Some((_, back)) = list.profile_stamps.get().and_then(|o| o.as_ref()) else {
+            return;
+        };
+        let spans = list.profile_spans.lock().unwrap_or_else(|e| e.into_inner());
+        if spans.is_empty() {
+            return;
+        }
+        let count = (spans.len() * 2).min(PROFILE_STAMPS as usize);
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: count * 8 };
+        // SAFETY: readback buffer resolved before list close and finished on the GPU.
+        let stamps: Vec<u64> = unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return;
+            }
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), count).to_vec();
+            back.Unmap(0, None);
+            s
+        };
+        static FREQ: OnceLock<u64> = OnceLock::new();
+        // SAFETY: plain query on a live command queue.
+        let frequency = *FREQ.get_or_init(|| unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1).max(1));
+
+        struct ProfileAcc {
+            by_label: std::collections::HashMap<String, (u64, u64, u64)>,
+            last_log_ms: u64,
+            last_frame: u64,
+        }
+        static ACC: Mutex<Option<ProfileAcc>> = Mutex::new(None);
+        let mut guard = ACC.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        let cur_frame = crate::frame::current();
+        let acc = guard.get_or_insert_with(|| ProfileAcc {
+            by_label: std::collections::HashMap::new(),
+            last_log_ms: now,
+            last_frame: cur_frame,
+        });
+        for &(idx, ref label) in spans.iter() {
+            let i = idx as usize;
+            if i + 1 >= stamps.len() {
+                break;
+            }
+            let ticks = stamps[i + 1].saturating_sub(stamps[i]);
+            let us = ((ticks as u128 * 1_000_000) / u128::from(frequency)) as u64;
+            let entry = acc.by_label.entry(label.clone()).or_insert((0, 0, 0));
+            entry.0 += 1;
+            entry.1 += us;
+            entry.2 = entry.2.max(us);
+        }
+        let frames = cur_frame.saturating_sub(acc.last_frame);
+        if now.saturating_sub(acc.last_log_ms) >= 2000 && frames >= 1 {
+            let mut rows: Vec<(String, u64, u64, u64)> = acc
+                .by_label
+                .drain()
+                .map(|(k, (calls, total_us, max_us))| (k, calls, total_us, max_us))
+                .collect();
+            acc.last_log_ms = now;
+            acc.last_frame = cur_frame;
+            rows.sort_by(|a, b| b.2.cmp(&a.2));
+            let total_gpu_ms: f64 = rows.iter().map(|r| r.2 as f64).sum::<f64>() / 1000.0 / frames as f64;
+            tracing::info!(
+                frames,
+                total_gpu_ms = format_args!("{total_gpu_ms:.2}"),
+                pipelines = rows.len(),
+                "VICTORY_GPU_PROFILE top 15 pipelines per frame:"
+            );
+            for (i, (label, calls, total_us, max_us)) in rows.into_iter().take(15).enumerate() {
+                let ms_frame = total_us as f64 / 1000.0 / frames as f64;
+                let calls_frame = calls as f64 / frames as f64;
+                let max_ms = max_us as f64 / 1000.0;
+                tracing::info!(
+                    "  #{:>2}: {ms_frame:6.2} ms/frame ({calls_frame:5.1} calls, max {max_ms:5.2} ms) {label}",
+                    i + 1
+                );
+            }
+        }
+    }
+}
+
 impl HostList {
+    /// Lazily allocates timestamp query heap + readback buffer for release GPU profiling.
+    fn init_profile_stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
+        if !gpu_profile_on() {
+            return None;
+        }
+        self.profile_stamps
+            .get_or_init(|| {
+                let device = &host()?.device;
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                let mut back: Option<ID3D12Resource> = None;
+                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: u64::from(PROFILE_STAMPS) * 8,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                // SAFETY: plain query heap and readback buffer creation.
+                unsafe {
+                    device
+                        .CreateQueryHeap(
+                            &D3D12_QUERY_HEAP_DESC {
+                                Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                                Count: PROFILE_STAMPS,
+                                NodeMask: 0,
+                            },
+                            &mut heap,
+                        )
+                        .ok()?;
+                    device
+                        .CreateCommittedResource(
+                            &readback,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            None,
+                            &mut back,
+                        )
+                        .ok()?;
+                }
+                Some((heap?, back?))
+            })
+            .as_ref()
+    }
+
+    /// Starts a GPU timestamp span when `VICTORY_GPU_PROFILE=1` is active; returns `None`
+    /// with zero allocations when off.
+    pub(crate) fn profile_begin(&self, label: impl FnOnce() -> String) -> Option<u32> {
+        if !gpu_profile_on() {
+            return None;
+        }
+        let (heap, _) = self.init_profile_stamps()?;
+        let mut spans = self.profile_spans.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = (spans.len() as u32) * 2;
+        if idx + 2 > PROFILE_STAMPS {
+            return None;
+        }
+        spans.push((idx, label()));
+        // SAFETY: open command list and valid query heap index.
+        unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, idx) };
+        Some(idx)
+    }
+
+    /// Closes a GPU timestamp span started by [`Self::profile_begin`].
+    pub(crate) fn profile_end(&self, token: Option<u32>) {
+        let Some(idx) = token else {
+            return;
+        };
+        if let Some((heap, _)) = self.profile_stamps.get().and_then(|o| o.as_ref()) {
+            // SAFETY: open command list and paired query heap index.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, idx + 1) };
+        }
+    }
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -5728,6 +5916,25 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        if gpu_profile_on()
+            && let Some((heap, back)) = self.profile_stamps.get().and_then(|o| o.as_ref())
+        {
+            let count = (self.profile_spans.lock().unwrap_or_else(|e| e.into_inner()).len() as u32 * 2)
+                .min(PROFILE_STAMPS);
+            if count > 0 {
+                // SAFETY: open list, initialized profile query heap and readback buffer.
+                unsafe {
+                    self.list.ResolveQueryData(
+                        heap,
+                        D3D12_QUERY_TYPE_TIMESTAMP,
+                        0,
+                        count,
+                        back,
+                        0,
+                    );
+                }
+            }
+        }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -5765,6 +5972,9 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if gpu_profile_on() {
+            self.profile_spans.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -7262,9 +7472,11 @@ impl Meter {
         {
             let [p0, p1, p2, p3, p4, p5, p6, p7] =
                 [0, 1, 2, 3, 4, 5, 6, 7].map(|i| SUBMIT_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let [fc_ok, fc_busy, fc_fault] = crate::watch::fast_copy_stats();
+            let [veh_opens, hot_skips] = crate::watch::hot_guard_stats();
             if p0 + p1 + p2 + p3 + p4 + p5 + p6 + p7 >= 1.0 {
                 tracing::info!(
-                    "submit phases per frame: sync_heaps {p0:.1} ms, ask_once {p1:.1} ms, deferred {p2:.1} ms, preludes {p3:.1} ms, flush {p4:.1} ms, snapshots {p5:.1} ms, card_before {p6:.1} ms, execute {p7:.1} ms"
+                    "submit phases per frame: sync_heaps {p0:.1} ms, ask_once {p1:.1} ms, deferred {p2:.1} ms, preludes {p3:.1} ms, flush {p4:.1} ms, snapshots {p5:.1} ms, card_before {p6:.1} ms, execute {p7:.1} ms | fast_copy ok={fc_ok} busy={fc_busy} fault={fc_fault} | veh_opens={veh_opens} hot_skips={hot_skips}"
                 );
             }
         }

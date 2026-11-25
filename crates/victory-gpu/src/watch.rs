@@ -268,23 +268,17 @@ fn alias_pages_of_range(first: usize, last: usize) -> Vec<usize> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    for (base, bytes) in
-        crate::inplace::views_between(first.saturating_mul(PAGE), last.saturating_mul(PAGE))
-    {
-        let v_first = (base / PAGE).max(first);
-        let v_last = base.saturating_add(bytes).div_ceil(PAGE).min(last);
-        for page in v_first..v_last {
-            let shown = crate::inplace::pages_of(page * PAGE);
-            if shown.len() >= 2 && shown.len() <= MANY_VIEWS {
-                for alias in shown {
-                    let ap = alias / PAGE;
-                    if ap < first || ap >= last {
-                        out.push(ap);
-                    }
-                }
+    crate::inplace::for_each_alias_in_range(
+        first.saturating_mul(PAGE),
+        last.saturating_mul(PAGE),
+        MANY_VIEWS,
+        |_, alias| {
+            let ap = alias / PAGE;
+            if ap < first || ap >= last {
+                out.push(ap);
             }
-        }
-    }
+        },
+    );
     out
 }
 
@@ -368,7 +362,7 @@ fn ask_grouped_runs(
 }
 
 /// Guards coalesced known-view page ranges, appending dirty pages to `dirty`
-/// and covered intervals to `ahead_guarded`.
+/// and non-pinned covered intervals to `ahead_guarded`.
 fn guard_view_pieces(
     view_pieces: &mut Vec<(usize, usize)>,
     ahead_guarded: &mut Vec<(usize, usize)>,
@@ -376,17 +370,19 @@ fn guard_view_pieces(
 ) -> u64 {
     coalesce_ranges(view_pieces);
     let rev_before = GUARD_REV.load(std::sync::atomic::Ordering::SeqCst);
+    let mut bump = true;
     for &(first, last) in view_pieces.iter() {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WatchKnownView, 1);
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
-        let written = guard(first.saturating_mul(PAGE), last.saturating_mul(PAGE));
+        let written = guard_inner(first.saturating_mul(PAGE), last.saturating_mul(PAGE), bump);
         #[cfg(feature = "diagnostics")]
         let us = guarding.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, us);
-        if let Some(pages) = written {
+        if let Some((pages, any_pinned)) = written {
+            bump = false;
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -395,7 +391,9 @@ fn guard_view_pieces(
                 slow(us);
             }
             dirty.extend(pages);
-            ahead_guarded.push((first, last));
+            if !any_pinned {
+                ahead_guarded.push((first, last));
+            }
         }
     }
     rev_before
@@ -1041,6 +1039,52 @@ impl BlockSet {
         count
     }
 
+    /// Whether every block in `first..last` is in `self | other`, without allocating.
+    fn all_covered_by_two(&self, other: &BlockSet, first: usize, last: usize) -> bool {
+        if first >= last {
+            return true;
+        }
+        let (first_chunk, last_chunk) = (first >> Self::SHIFT, (last - 1) >> Self::SHIFT);
+        for chunk in first_chunk..=last_chunk {
+            let a = self.chunks.get(&chunk);
+            let b = other.chunks.get(&chunk);
+            if a.is_none() && b.is_none() {
+                return false;
+            }
+            if !Self::chunk_words(chunk, first, last, |w, mask| {
+                let covered = a.map_or(0, |c| c[w]) | b.map_or(0, |c| c[w]);
+                (covered & mask) == mask
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Calls `f(block)` for every block in `first..last` in neither `self` nor `other`,
+    /// in ascending order, without allocating.
+    fn for_each_missing_in_two(&self, other: &BlockSet, first: usize, last: usize, mut f: impl FnMut(usize)) {
+        if first >= last {
+            return;
+        }
+        let (first_chunk, last_chunk) = (first >> Self::SHIFT, (last - 1) >> Self::SHIFT);
+        for chunk in first_chunk..=last_chunk {
+            let a = self.chunks.get(&chunk);
+            let b = other.chunks.get(&chunk);
+            let base = chunk << Self::SHIFT;
+            Self::chunk_words(chunk, first, last, |w, mask| {
+                let covered = a.map_or(0, |c| c[w]) | b.map_or(0, |c| c[w]);
+                let mut missing = (!covered) & mask;
+                while missing != 0 {
+                    let bit = missing.trailing_zeros() as usize;
+                    missing &= missing - 1;
+                    f(base + w * 64 + bit);
+                }
+                true
+            });
+        }
+    }
+
     /// The blocks of `range` in the set, in order.
     fn range(&self, range: std::ops::Range<usize>) -> std::vec::IntoIter<usize> {
         let mut found = Vec::new();
@@ -1092,9 +1136,12 @@ fn force_view_ask() -> bool {
     })
 }
 
+type BlockMap<V> =
+    std::collections::HashMap<usize, V, std::hash::BuildHasherDefault<ChunkHash>>;
+
 fn known_view_in(g: &Guards, start: usize) -> bool {
     let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first)
+    g.protected.contains(&first) || g.absent.contains(&first) || g.absent_static.contains(&first)
 }
 
 /// Whether the block holding `start` is view memory the guards already
@@ -1108,14 +1155,35 @@ fn known_view(start: usize) -> bool {
     known_view_in(&guards(), start) || crate::inplace::is_view_at(start)
 }
 
+/// Whether repeated VEH write faults temporarily pin hot view blocks writable
+/// (`VICTORY_HOT_GUARD=0` disables).
+fn hot_guard_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOT_GUARD").is_none_or(|v| v != "0"))
+}
+
+static HOT_GUARD_STATS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+pub(crate) fn hot_guard_stats() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        HOT_GUARD_STATS[0].swap(0, Relaxed),
+        HOT_GUARD_STATS[1].swap(0, Relaxed),
+    ]
+}
+
 struct Guards {
     /// Blocks we made read-only.
     protected: BlockSet,
     /// Of those, the ones not written since a copy took them.
     clean: BlockSet,
-    /// Blocks already copied as zeros. While they remain wholly uncommitted,
-    /// the copy can skip hundreds of MB of failing kernel reads per world frame.
+    /// Uncommitted `MEM_RESERVE | MEM_MAPPED` view blocks whose ordinary commit
+    /// can arrive without a runtime remapping notification.
     absent: BlockSet,
+    /// Uncommitted `MEM_FREE` or non-`MEM_MAPPED` placeholder blocks that remain
+    /// uncommitted until `title_memory_remapped`.
+    absent_static: BlockSet,
     /// Blocks whose physical page was guarded together with its other views
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
@@ -1126,6 +1194,12 @@ struct Guards {
     /// faulting into our handler. Until expiry they stay writable and every
     /// check reports them dirty.
     pins: Vec<(usize, usize, std::time::Instant)>,
+    /// Incremented once per `guard_view_pieces` batch or standalone `guard()` check.
+    guard_epoch: u64,
+    /// Per-block `(last_epoch, consecutive_veh_faults)` for hot-block detection.
+    fault_counts: BlockMap<(u64, u16)>,
+    /// Blocks temporarily pinned writable until `guard_epoch` reaches the stored limit.
+    hot_pins: BlockMap<u64>,
 }
 
 /// How long blocks stay writable after [`writing`].
@@ -1165,8 +1239,12 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BlockSet::new(),
     clean: BlockSet::new(),
     absent: BlockSet::new(),
+    absent_static: BlockSet::new(),
     aliased: BTreeSet::new(),
     pins: Vec::new(),
+    guard_epoch: 0,
+    fault_counts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    hot_pins: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1177,80 +1255,111 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    // A range whose first block the guards hold already (read-only by our
-    // hand, or noted absent) is a view: no question to Windows. The
-    // question walks the page tables to the end of the pages that share the
-    // first one's state, and a guarded view is one long run of read-only
-    // pages: 0.6 ms for the title's 174 MB heap, 16 times a frame, and most
-    // of the 68 ms a frame of "guards" (run 58).
-    // `VICTORY_GUARD_ASK=1` asks every time, as before.
-    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
-    };
-    if !known && !crate::inplace::is_view_at(start) && !is_view(start, end) {
-        return None;
-    }
+    guard_inner(start, end, true).map(|(written, _)| written)
+}
+
+/// Same as [`guard`], also returning whether any block in the range was kept
+/// writable (`pinned` or `hot_pins`) and advancing `guard_epoch` once when
+/// `bump_epoch` is true.
+fn guard_inner(start: usize, end: usize, bump_epoch: bool) -> Option<(Vec<usize>, bool)> {
     install();
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
     let mut g = guards();
+    let known = !ask && known_view_in(&g, start);
+    if !known {
+        drop(g);
+        if !crate::inplace::is_view_at(start) && !is_view(start, end) {
+            return None;
+        }
+        g = guards();
+    }
+    if bump_epoch {
+        g.guard_epoch = g.guard_epoch.wrapping_add(1);
+    }
     if !g.pins.is_empty() {
         let now = std::time::Instant::now();
         g.pins.retain(|&(_, _, until)| until > now);
     }
-    let mut written = Vec::new();
-    let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // The range's clean blocks, in order: read off the set in one pass,
-    // not looked up one block at a time. A frame asks about some 10 GB of
-    // view memory, 150,000 blocks, nearly all clean: the lookups were most
-    // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
-    // the set meanwhile is the block it stands at or ones before it.
-    if g.clean.all_in_range(first, last) {
-        // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
+    // Fast zero-alloc check: blocks in `clean | absent_static` require no inspection.
+    if g.clean.all_covered_by_two(&g.absent_static, first, last) {
+        return Some((Vec::new(), false));
     }
-    let clean: Vec<usize> = g.clean.range(first..last).collect();
-    let mut next_clean = 0;
-    let mut uncommitted_until = first;
-    for block in first..=last {
-        while next_clean < clean.len() && clean[next_clean] < block {
-            next_clean += 1;
-        }
-        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
-            // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
+    thread_local! {
+        static MISSING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    MISSING.with(|cell| {
+        let mut missing = cell.borrow_mut();
+        missing.clear();
+        g.clean
+            .for_each_missing_in_two(&g.absent_static, first, last, |b| missing.push(b));
+        let mut written = Vec::new();
+        let mut run: Option<(usize, usize)> = None;
+        let mut any_pinned = false;
+        let mut uncommitted_until = first;
+        let epoch = g.guard_epoch;
+        let hot_on = hot_guard_on();
+        for &block in missing.iter() {
+            let mut open = true;
+            if g.absent.contains(&block) {
+                if block >= uncommitted_until {
+                    uncommitted_until = uncommitted_info(block).0;
+                }
+                open = block >= uncommitted_until;
+                if open {
+                    g.absent.remove(&block);
+                }
             }
-            open = block >= uncommitted_until;
-            if open {
-                g.absent.remove(&block);
+            if !open {
+                if let Some((from, to)) = run.take() {
+                    protect(&mut g, from, to);
+                }
+                continue;
             }
-        }
-        if open {
+            let is_hot = if hot_on {
+                match g.hot_pins.get(&block).copied() {
+                    Some(until) if until > epoch => true,
+                    Some(_) => {
+                        g.hot_pins.remove(&block);
+                        false
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.pinned(block) {
-                // Kernel write may still be in flight: leave writable and bump
-                // `GUARD_REV` so `ask_once`/`ask_ahead` will not freeze this
-                // range in `ahead_guarded` while pinned.
-                GUARD_REV.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if g.pinned(block) || is_hot {
+                any_pinned = true;
+                if is_hot {
+                    HOT_GUARD_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some((from, to)) = run.take() {
+                    protect(&mut g, from, to);
+                }
             } else if g.protected.contains(&block) {
+                if let Some((from, to)) = run.take() {
+                    protect(&mut g, from, to);
+                }
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
             } else {
-                run.get_or_insert(block);
-                continue;
+                match &mut run {
+                    Some((_, to)) if *to == block => *to = block + 1,
+                    Some(_) => {
+                        let (from, to) = run.replace((block, block + 1)).unwrap();
+                        protect(&mut g, from, to);
+                    }
+                    None => run = Some((block, block + 1)),
+                }
             }
         }
-        if let Some(from) = run.take() {
-            protect(&mut g, from, block);
+        if let Some((from, to)) = run.take() {
+            protect(&mut g, from, to);
         }
-    }
-    Some(written)
+        Some((written, any_pinned))
+    })
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -1308,28 +1417,24 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
-    for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
-        let first = (base / BLOCK).max(from);
-        let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
-        for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
-            // One view (nothing else to guard), or the page the title shows
-            // wherever it has nothing (thousands of views): each view of
-            // that one is guarded by itself.
-            if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                continue;
+    let mut last_blk = usize::MAX;
+    crate::inplace::for_each_alias_in_range(
+        from.saturating_mul(BLOCK),
+        to.saturating_mul(BLOCK),
+        MANY_VIEWS,
+        |block_addr, alias| {
+            let block = block_addr / BLOCK;
+            if block != last_blk {
+                last_blk = block;
+                #[cfg(feature = "diagnostics")]
+                ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                g.aliased.insert(block);
             }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
-                let alias = alias / BLOCK;
-                g.aliased.insert(alias);
-                if alias != block {
-                    protect_alias(g, alias);
-                }
-            }
-        }
-    }
+            let alias = alias / BLOCK;
+            g.aliased.insert(alias);
+            protect_alias(g, alias);
+        },
+    );
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -1394,25 +1499,36 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
-        } else if block < uncommitted_end(block) {
-            g.absent.insert(block);
+        } else {
+            let (end_block, is_mapped_reserve) = uncommitted_info(block);
+            if block < end_block {
+                if is_mapped_reserve {
+                    g.absent.insert(block);
+                } else {
+                    g.absent_static.insert(block);
+                }
+            }
         }
     }
 }
 
-/// The end (exclusive) of the whole uncommitted blocks starting at `block`.
-fn uncommitted_end(block: usize) -> usize {
+/// The end (exclusive) of the whole uncommitted blocks starting at `block`,
+/// and whether the range is a `MEM_RESERVE | MEM_MAPPED` view that may commit
+/// without a runtime remapping notification.
+fn uncommitted_info(block: usize) -> (usize, bool) {
     use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_FREE, MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
-        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+        let end_block = (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK;
+        let is_mapped_reserve = info.State == MEM_RESERVE && info.Type == MEM_MAPPED;
+        (end_block, is_mapped_reserve)
     } else {
-        block
+        (block, false)
     }
 }
 
@@ -1489,27 +1605,17 @@ pub fn writing(at: usize, len: usize) {
         g.pins.push((first, last, until));
         let (_, mut aliases) = open_collecting(&mut g, at, end);
         if view_guard() {
-            for (base, bytes) in crate::inplace::views_between(
+            crate::inplace::for_each_alias_in_range(
                 first.saturating_mul(BLOCK),
                 last.saturating_mul(BLOCK),
-            ) {
-                let v_first = (base / BLOCK).max(first);
-                let v_last = base.saturating_add(bytes).div_ceil(BLOCK).min(last);
-                for block in v_first..v_last {
-                    let shown = crate::inplace::pages_of(block * BLOCK);
-                    if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                        continue;
-                    }
-                    for alias in shown {
-                        let alias_block = alias / BLOCK;
-                        if alias_block != block {
-                            g.pins.push((alias_block, alias_block + 1, until));
-                            open_here(&mut g, alias, alias.saturating_add(BLOCK));
-                            aliases.push(alias_block);
-                        }
-                    }
-                }
-            }
+                MANY_VIEWS,
+                |_, alias| {
+                    let alias_block = alias / BLOCK;
+                    g.pins.push((alias_block, alias_block + 1, until));
+                    open_here(&mut g, alias, alias.saturating_add(BLOCK));
+                    aliases.push(alias_block);
+                },
+            );
         }
         GUARD_REV.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         aliases
@@ -1692,7 +1798,23 @@ static MAPPING: Mutex<Mapping> = Mutex::new(Mapping {
 });
 static WRITER: Mutex<()> = Mutex::new(());
 static MAPPING_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+/// Non-zero while any `title_memory_remapping*` guard is active or entering.
+static REMAPPING_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Active lock-free fast-copy / fast-diff readers.
+static FAST_READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// `[0]` fast copy succeeded, `[1]` yielded to active remap, `[2]` faulted on unmapped/guarded page.
+static FAST_COPY_STATS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 const ALL_MEMORY: std::ops::Range<usize> = 0..usize::MAX;
+
+pub(crate) fn fast_copy_stats() -> [u64; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        FAST_COPY_STATS[0].swap(0, Relaxed),
+        FAST_COPY_STATS[1].swap(0, Relaxed),
+        FAST_COPY_STATS[2].swap(0, Relaxed),
+    ]
+}
 
 fn overlaps(a: &std::ops::Range<usize>, b: &std::ops::Range<usize>) -> bool {
     a.start.max(b.start) < a.end.min(b.end)
@@ -1716,7 +1838,9 @@ pub struct Remapping(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
-        MAPPING.lock().unwrap_or_else(|e| e.into_inner()).changing = None;
+        let mut state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+        state.changing = None;
+        REMAPPING_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         MAPPING_CHANGED.notify_all();
     }
 }
@@ -1734,10 +1858,14 @@ pub fn title_memory_remapping() -> Remapping {
 /// until the returned guard is dropped.
 pub fn title_memory_remapping_range(range: std::ops::Range<usize>) -> Remapping {
     let writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    REMAPPING_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
     state.changing = Some(range.clone());
     let state = MAPPING_CHANGED
-        .wait_while(state, |s| s.readers.iter().any(|r| overlaps(r, &range)))
+        .wait_while(state, |s| {
+            FAST_READERS.load(std::sync::atomic::Ordering::SeqCst) > 0
+                || s.readers.iter().any(|r| overlaps(r, &range))
+        })
         .unwrap_or_else(|e| e.into_inner());
     drop(state);
     Remapping(writer)
@@ -1813,19 +1941,48 @@ pub(crate) fn title_memory_reading_now_range(range: std::ops::Range<usize>) -> O
     (!state.changing(&range)).then(|| state.pin(range))
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+enum FastReadGuard {
+    Nested,
+    Fast,
+    Scoped(#[allow(dead_code)] Reading),
+}
+
+impl Drop for FastReadGuard {
+    fn drop(&mut self) {
+        if matches!(self, FastReadGuard::Fast)
+            && FAST_READERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1
+            && REMAPPING_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) != 0
+        {
+            let _m = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+            MAPPING_CHANGED.notify_all();
+        }
+    }
+}
+
 /// Non-blocking read guard against concurrent title-memory remapping, safe
 /// even if this thread already holds an outer [`Reading`] covering `range`.
-#[cfg(target_arch = "x86_64")]
-fn acquire_reading_now(range: std::ops::Range<usize>) -> Option<Option<Reading>> {
+/// Uses lock-free atomic refcounting when no remapping is active.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn acquire_reading_now(range: std::ops::Range<usize>) -> Option<FastReadGuard> {
     if READING_RANGES.with(|r| {
         r.borrow()
             .iter()
             .any(|held| held.start <= range.start && range.end <= held.end)
     }) {
-        Some(None)
-    } else {
-        title_memory_reading_now_range(range).map(Some)
+        return Some(FastReadGuard::Nested);
     }
+    if REMAPPING_ACTIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        FAST_READERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if REMAPPING_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Some(FastReadGuard::Fast);
+        }
+        if FAST_READERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            let _m = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+            MAPPING_CHANGED.notify_all();
+        }
+    }
+    title_memory_reading_now_range(range).map(FastReadGuard::Scoped)
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1846,6 +2003,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         let absent: Vec<usize> = g.absent.range(range.clone()).collect();
         for block in absent {
             g.absent.remove(&block);
+        }
+        let absent_static: Vec<usize> = g.absent_static.range(range.clone()).collect();
+        for block in absent_static {
+            g.absent_static.remove(&block);
         }
         let blocks: Vec<usize> = g.protected.range(range.clone()).collect();
         for block in blocks {
@@ -1868,6 +2029,12 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         let aliased: Vec<usize> = g.aliased.range(range.clone()).copied().collect();
         for block in aliased {
             g.aliased.remove(&block);
+        }
+        if !g.hot_pins.is_empty() {
+            g.hot_pins.retain(|&b, _| !(range.start..range.end).contains(&b));
+        }
+        if !g.fault_counts.is_empty() {
+            g.fault_counts.retain(|&b, _| !(range.start..range.end).contains(&b));
         }
         g.unpin(range.start, range.end);
         if len > 0 {
@@ -1942,6 +2109,26 @@ fn install() {
         if open(&mut g, at, at + 1) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            HOT_GUARD_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if hot_guard_on() {
+                let block = at / BLOCK;
+                let epoch = g.guard_epoch;
+                let entry = g.fault_counts.entry(block).or_insert((epoch, 0));
+                if epoch.saturating_sub(entry.0) <= 8 {
+                    entry.1 = entry.1.saturating_add(1);
+                } else {
+                    entry.1 = 1;
+                }
+                entry.0 = epoch;
+                if entry.1 >= 3 {
+                    entry.1 = 0;
+                    g.hot_pins.insert(block, epoch.saturating_add(64));
+                }
+                if g.fault_counts.len() > 4096 {
+                    g.fault_counts.retain(|_, &mut (e, _)| epoch.saturating_sub(e) <= 64);
+                    g.hot_pins.retain(|_, &mut until| until > epoch);
+                }
+            }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
@@ -2000,6 +2187,7 @@ pub(crate) fn try_copy_fast(dst: *mut u8, src: *const u8, len: usize) -> bool {
     install();
     let start = src as usize;
     let Some(_reading) = acquire_reading_now(start..start + len) else {
+        FAST_COPY_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     };
     let mut remaining = len;
@@ -2030,7 +2218,13 @@ pub(crate) fn try_copy_fast(dst: *mut u8, src: *const u8, len: usize) -> bool {
             );
         }
     });
-    remaining == 0
+    if remaining == 0 {
+        FAST_COPY_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    } else {
+        FAST_COPY_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -3519,6 +3713,166 @@ mod mapping_tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
     }
+
+    #[test]
+    fn block_set_two_set_word_scan_matches_reference() {
+        use super::{BTreeSet, BlockSet};
+        let mut a = BlockSet::new();
+        let mut b = BlockSet::new();
+        let mut ref_a = BTreeSet::new();
+        let mut ref_b = BTreeSet::new();
+        let mut x = 98765u64;
+        for _ in 0..10_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let blk = ((x >> 33) % 15_000) as usize + if x & 1 == 0 { 0 } else { 1 << 29 };
+            if x & 2 == 0 {
+                a.insert(blk);
+                ref_a.insert(blk);
+            } else {
+                b.insert(blk);
+                ref_b.insert(blk);
+            }
+        }
+        a.extend(4000..4200);
+        ref_a.extend(4000..4200);
+        b.extend(4150..8300);
+        ref_b.extend(4150..8300);
+
+        for r in [
+            0..0,
+            4000..8300,
+            3990..4050,
+            8190..8310,
+            0..10_000,
+            (1 << 29)..(1 << 29) + 15_000,
+        ] {
+            let expected_missing: Vec<usize> = r
+                .clone()
+                .filter(|blk| !ref_a.contains(blk) && !ref_b.contains(blk))
+                .collect();
+            let mut got = Vec::new();
+            a.for_each_missing_in_two(&b, r.start, r.end, |blk| got.push(blk));
+            assert_eq!(got, expected_missing, "range {r:?}");
+            assert_eq!(
+                a.all_covered_by_two(&b, r.start, r.end),
+                expected_missing.is_empty(),
+                "all_covered_by_two {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ahead_guarded_keeps_clean_ranges_when_another_range_is_pinned() {
+        use super::{
+            BLOCK, GUARD_REV, PAGE, guard, guard_view_pieces, guards, title_memory_remapped,
+            writing,
+        };
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+        let section = unsafe {
+            CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (4 * BLOCK) as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        let base = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * BLOCK) }.Value as usize;
+        assert_ne!(base, 0);
+
+        let clean_range = (base, base + BLOCK);
+        let pinned_range = (base + 2 * BLOCK, base + 4 * BLOCK);
+        assert!(guard(clean_range.0, clean_range.1).is_some());
+        assert!(guard(pinned_range.0, pinned_range.1).is_some());
+        writing(pinned_range.0, BLOCK);
+
+        let mut view_pieces = vec![
+            (clean_range.0 / PAGE, clean_range.1.div_ceil(PAGE)),
+            (pinned_range.0 / PAGE, pinned_range.1.div_ceil(PAGE)),
+        ];
+        let rev_before;
+        let mut ahead_guarded = Vec::new();
+        let mut dirty = Vec::new();
+        rev_before = guard_view_pieces(&mut view_pieces, &mut ahead_guarded, &mut dirty);
+
+        assert_eq!(
+            GUARD_REV.load(std::sync::atomic::Ordering::SeqCst),
+            rev_before,
+            "pinned block must not bump GUARD_REV during guard_view_pieces"
+        );
+        assert_eq!(
+            ahead_guarded,
+            vec![(clean_range.0 / PAGE, clean_range.1.div_ceil(PAGE))],
+            "clean piece stays in ahead_guarded while pinned piece is excluded"
+        );
+
+        {
+            let mut g = guards();
+            g.pins.retain(|&(from, to, _)| !(from == pinned_range.0 / BLOCK && to == pinned_range.0 / BLOCK + 1));
+        }
+        title_memory_remapped(base, 4 * BLOCK);
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn hot_guard_skips_reprotect_after_repeated_veh_faults_and_expires() {
+        use super::{BLOCK, PAGE, guard, hot_guard_on, title_memory_remapped, writable};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+        if !hot_guard_on() {
+            return;
+        }
+        let section = unsafe {
+            CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        let base = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK) }.Value as usize;
+        assert_ne!(base, 0);
+        let p0 = base / PAGE;
+
+        assert_eq!(guard(base, base + BLOCK), Some(vec![p0]));
+        assert!(!writable(base));
+
+        // Three VEH write faults in consecutive epochs trigger a 64-epoch hot pin.
+        for _ in 0..3 {
+            unsafe { (base as *mut u8).write_volatile(7) };
+            let got = guard(base, base + BLOCK);
+            assert_eq!(got, Some(vec![p0]));
+        }
+        assert!(writable(base), "3rd VEH fault within window must hot-pin block writable");
+        assert_eq!(guard(base, base + BLOCK), Some(vec![p0]));
+        assert!(writable(base), "hot-pinned block stays writable while active");
+
+        // Advance guard_epoch past the 64-epoch hot-pin TTL and verify re-arm.
+        for _ in 0..64 {
+            let _ = guard(base, base + BLOCK);
+        }
+        assert!(!writable(base), "expired hot-pin must re-protect block READONLY");
+        assert_eq!(guard(base, base + BLOCK), Some(Vec::new()));
+
+        title_memory_remapped(base, BLOCK);
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -3740,5 +4094,43 @@ mod fast_copy_tests {
         assert_eq!(dst, src);
         assert_eq!(try_diff_bounds_fast(src.as_ptr(), &dst), Some(None));
         drop(reading);
+    }
+
+    #[test]
+    fn fast_read_guard_blocks_remap_until_dropped_and_allows_concurrent_readers() {
+        let g1 = super::acquire_reading_now(0x1000..0x2000).expect("fast reader 1");
+        let g2 = super::acquire_reading_now(0x3000..0x4000).expect("fast reader 2");
+        assert!(matches!(g1, super::FastReadGuard::Fast));
+        assert!(matches!(g2, super::FastReadGuard::Fast));
+
+        let blocked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let b2 = blocked.clone();
+        let e2 = entered.clone();
+        let d2 = done.clone();
+        let h = std::thread::spawn(move || {
+            b2.store(true, std::sync::atomic::Ordering::Release);
+            let _remap = title_memory_remapping_range(0x5000..0x6000);
+            e2.store(true, std::sync::atomic::Ordering::Release);
+            d2.store(true, std::sync::atomic::Ordering::Release);
+        });
+        while !blocked.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(
+            !entered.load(std::sync::atomic::Ordering::Acquire),
+            "remapping must wait for active fast readers"
+        );
+        drop(g1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            !entered.load(std::sync::atomic::Ordering::Acquire),
+            "remapping must still wait while second fast reader is held"
+        );
+        drop(g2);
+        h.join().unwrap();
+        assert!(done.load(std::sync::atomic::Ordering::Acquire));
     }
 }

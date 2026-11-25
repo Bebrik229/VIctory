@@ -2603,8 +2603,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        let tok = list.profile_begin(|| format!("cs {}", p.name));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        list.profile_end(tok);
         list.count_write();
         list.count_work();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2880,8 +2882,10 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
+                    let tok = list.profile_begin(|| self.profile_label("ms"));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    list.profile_end(tok);
                     self.mesh_scissor(list, false);
                     list.count_work();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -3315,11 +3319,13 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            let tok = list.profile_begin(|| self.profile_label("draw"));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            list.profile_end(tok);
             list.count_work();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -3396,6 +3402,13 @@ impl State {
         true
     }
 
+    fn profile_label(&self, kind: &str) -> String {
+        match crate::pipeline::host_pipeline(self.pipeline as This) {
+            Some(p) => format!("{kind} {}", p.name),
+            None => format!("{kind} {:#x}", self.pipeline),
+        }
+    }
+
     pub(crate) fn draw_indexed(
         &mut self,
         list: &HostList,
@@ -3418,11 +3431,13 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            let tok = list.profile_begin(|| self.profile_label("idx"));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            list.profile_end(tok);
             list.count_work();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -3723,6 +3738,16 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        let tok = list.profile_begin(|| {
+            let k = match kind {
+                0 => "ind_draw",
+                1 => "ind_idx",
+                2 => "ind_cs",
+                10 => "ind_ms",
+                _ => "ind",
+            };
+            self.profile_label(k)
+        });
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -3735,6 +3760,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        list.profile_end(tok);
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

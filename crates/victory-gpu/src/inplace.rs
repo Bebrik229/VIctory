@@ -407,6 +407,57 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
     v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
 }
 
+/// Visits every `(block_addr, alias_addr)` pair across mapped title views
+/// overlapping `[start, end)` whose physical page is shown in `[2, max_views]`
+/// views, acquiring `VIEWS` once for the entire range and allocating nothing.
+pub(crate) fn for_each_alias_in_range(
+    start: usize,
+    end: usize,
+    max_views: usize,
+    mut f: impl FnMut(usize, usize),
+) {
+    if start >= end {
+        return;
+    }
+    let v = views();
+    if v.views.is_empty() {
+        return;
+    }
+    let first_block_bound = start / K64;
+    let last_block_bound = end.div_ceil(K64);
+    let pred = v
+        .views
+        .range(..=start)
+        .next_back()
+        .filter(|&(&base, &(bytes, _, _))| base + bytes > start)
+        .map(|(&base, &val)| (base, val));
+    let tail = v
+        .views
+        .range(start.saturating_add(1)..end)
+        .map(|(&base, &val)| (base, val));
+    for (base, (bytes, section, offset)) in pred.into_iter().chain(tail) {
+        let first_block = (base / K64).max(first_block_bound);
+        let last_block = base.saturating_add(bytes).div_ceil(K64).min(last_block_bound);
+        for block in first_block..last_block {
+            let block_addr = block * K64;
+            let within = block_addr.wrapping_sub(base);
+            if within >= bytes || !within.is_multiple_of(K64) {
+                continue;
+            }
+            if let Some(shown) = v.pages.get(&(section, offset + within as u64))
+                && shown.len() >= 2
+                && shown.len() <= max_views
+            {
+                for &alias in shown {
+                    if alias != block_addr {
+                        f(block_addr, alias);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The title views that show any of the physical bytes `[offset, offset +
 /// len)` of `section`, as `(address, bytes)` ranges in address order; not
 /// those of a page shown in very many views (`MANY_VIEWS`).
@@ -1419,5 +1470,46 @@ mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn for_each_alias_in_range_matches_views_between_and_pages_of() {
+        let s = 0x7_c000_0000usize;
+        let sec = 999usize;
+        // Page 0: 1 view (no aliases); page 1..3: 2 aliases; page 3: 4 views (> max_views=3 skipped).
+        title_memory_view(s, 4 * K64, sec, 0);
+        title_memory_view(s + 10 * K64, 2 * K64, sec, K64 as u64);
+        title_memory_view(s + 20 * K64, K64, sec, 3 * K64 as u64);
+        title_memory_view(s + 21 * K64, K64, sec, 3 * K64 as u64);
+        title_memory_view(s + 22 * K64, K64, sec, 3 * K64 as u64);
+
+        let query_start = s + K64 / 2;
+        let query_end = s + 4 * K64;
+        let mut expected = Vec::new();
+        for (base, bytes) in views_between(query_start, query_end) {
+            let first = (base / K64).max(query_start / K64);
+            let last = base.saturating_add(bytes).div_ceil(K64).min(query_end.div_ceil(K64));
+            for block in first..last {
+                let addr = block * K64;
+                let shown = pages_of(addr);
+                if shown.len() >= 2 && shown.len() <= 3 {
+                    for alias in shown {
+                        if alias != addr {
+                            expected.push((addr, alias));
+                        }
+                    }
+                }
+            }
+        }
+        let mut got = Vec::new();
+        for_each_alias_in_range(query_start, query_end, 3, |blk, alias| got.push((blk, alias)));
+        assert_eq!(got, expected);
+        assert_eq!(got, vec![(s + K64, s + 10 * K64), (s + 2 * K64, s + 11 * K64)]);
+
+        views_gone(s, 4 * K64);
+        views_gone(s + 10 * K64, 2 * K64);
+        views_gone(s + 20 * K64, K64);
+        views_gone(s + 21 * K64, K64);
+        views_gone(s + 22 * K64, K64);
     }
 }
