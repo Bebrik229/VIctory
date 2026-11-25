@@ -427,6 +427,102 @@ fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
 }
+
+/// Number of passes over which [`State::heap_buffers`] sweeps every buffer slot.
+const BUFFER_SWEEP_BUCKETS: u64 = 16;
+
+/// Combines buffer slots written since the last pass with the `1 / 16` slice
+/// of `all_slots` due in `pass`, deduplicating overlaps, and prunes cached
+/// entries in `ranges` belonging to the swept bucket before they are refreshed.
+fn buffer_sweep_slots<V>(
+    pass: u64,
+    changed: Vec<u32>,
+    all_slots: &[u32],
+    ranges: &mut std::collections::HashMap<u32, V>,
+) -> Vec<u32> {
+    let bucket = (pass % BUFFER_SWEEP_BUCKETS) as u32;
+    let buckets = BUFFER_SWEEP_BUCKETS as u32;
+    ranges.retain(|&index, _| index % buckets != bucket);
+    let mut slots = changed;
+    slots.reserve(all_slots.len() / buckets as usize + 1);
+    slots.extend(all_slots.iter().copied().filter(|&index| index % buckets == bucket));
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
+/// Uploaded textures after which [`State::heap_textures`] switches from its
+/// initial loading burst budget to its steady-state gameplay budget.
+const TEXTURE_STEADY_AFTER: u64 = 4096;
+
+/// Parsed environment settings for [`State::heap_textures`] budgets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextureStageConfig {
+    /// Explicit `VICTORY_TEXTURE_STAGE_MS` override, honored strictly when set.
+    stage_ms_override: Option<u64>,
+    /// Explicit `VICTORY_TEXTURE_STAGE_MB` override, honored strictly when set.
+    stage_mb_override: Option<u64>,
+    /// Steady-state gameplay time cap in ms (`VICTORY_TEXTURE_STEADY_MS`, default 16).
+    steady_ms: u64,
+    /// Steady-state gameplay byte cap in MiB (`VICTORY_TEXTURE_STEADY_MB`, default 32).
+    steady_mb: u64,
+    /// Whether `VICTORY_TEXTURE_CATCHUP` allows the 3x loading burst (`!= "0"`).
+    catchup: bool,
+}
+
+impl TextureStageConfig {
+    fn from_env() -> Self {
+        let parse = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        Self {
+            stage_ms_override: parse("VICTORY_TEXTURE_STAGE_MS"),
+            stage_mb_override: parse("VICTORY_TEXTURE_STAGE_MB"),
+            steady_ms: parse("VICTORY_TEXTURE_STEADY_MS").unwrap_or(16),
+            steady_mb: parse("VICTORY_TEXTURE_STEADY_MB").unwrap_or(32),
+            catchup: std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"),
+        }
+    }
+
+    /// True once initial texture loading has completed (`uploaded >= 4096`) and
+    /// neither `VICTORY_TEXTURE_STAGE_MS` nor `VICTORY_TEXTURE_STAGE_MB` was
+    /// explicitly overridden.
+    fn is_steady(&self, uploaded: u64) -> bool {
+        self.stage_ms_override.is_none()
+            && self.stage_mb_override.is_none()
+            && uploaded >= TEXTURE_STEADY_AFTER
+    }
+
+    /// Maximum due slots fetched from `HostHeap::texture_slots_due` for one pass.
+    fn due_limit(&self, uploaded: u64, has_pass_budget: bool) -> usize {
+        if !has_pass_budget && self.is_steady(uploaded) {
+            1024
+        } else {
+            4096
+        }
+    }
+
+    /// Per-pass `(time_ms, bytes)` budget when `PASS_BUDGET` is `None`.
+    fn budget(&self, uploaded: u64, due_len: usize) -> (u64, u64) {
+        if self.is_steady(uploaded) {
+            return (self.steady_ms, self.steady_mb.saturating_mul(1 << 20));
+        }
+        let burst = self.catchup && due_len >= 1024;
+        let ms = match self.stage_ms_override {
+            Some(explicit) => explicit,
+            None if burst => 250 * 3,
+            None => 250,
+        };
+        let mb = match self.stage_mb_override {
+            Some(explicit) => explicit,
+            None if burst => 192 * 3,
+            None => 192,
+        };
+        (ms, mb.saturating_mul(1 << 20))
+    }
+}
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
@@ -1447,10 +1543,12 @@ impl State {
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
+        // last pass are looked at again (83,000+ slots a pass otherwise, 0.1 s
+        // at best), plus one of 16 buckets of all buffer slots each pass so
+        // every slot is rechecked within 16 passes (a view of a released
+        // resource goes stale without a write, and a slot written before its
+        // memory had a host copy is only made then) without dropping and
+        // rescanning the entire heap on a single frame.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
@@ -1460,12 +1558,8 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        let all_slots = host.buffer_slots();
+        let slots = buffer_sweep_slots(*passes, changed, &all_slots, ranges);
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -1509,12 +1603,15 @@ impl State {
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::with_capacity(ranges.len().min(4096));
         for (shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+            if let Some(span) = spans.get_mut(&key) {
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            } else {
+                spans.insert(key, (std::sync::Arc::clone(shadow), *from, *to));
+            }
         }
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
@@ -1737,13 +1834,10 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
-        // textures (a scene's first minutes) then drains in fewer frames.
-        static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
-        }) << 20;
+        static CFG: std::sync::OnceLock<TextureStageConfig> = std::sync::OnceLock::new();
+        let cfg = *CFG.get_or_init(TextureStageConfig::from_env);
+        let uploaded = HEAP_TEXTURES.load(Ordering::Relaxed);
+        let pass_budget = PASS_BUDGET.get();
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1784,7 +1878,8 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let due_limit = cfg.due_limit(uploaded, pass_budget.is_some());
+        let (due, census) = host.texture_slots_due(frame, due_limit);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1814,29 +1909,36 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        // Also within a time per pass: the pass runs on a thread that
-        // records the frame, and making and staging 192 MB of textures took
-        // 1.6-2.2 s of each of the world's first twenty frames (run 20).
-        // The rest waits for the next frames, as it does past the bytes.
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-        }));
-        // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
-        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
-        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
-        static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        // Also within a time and byte budget per pass: initial loading drains
+        // fast (with 3x catchup for backlogs >= 1024 unless disabled via
+        // `VICTORY_TEXTURE_CATCHUP=0`), then once 4,096 textures have been
+        // uploaded steady-state gameplay caps the pass to
+        // `VICTORY_TEXTURE_STEADY_MS` (default 16 ms) and
+        // `VICTORY_TEXTURE_STEADY_MB` (default 32 MiB) unless the user
+        // explicitly overrides `VICTORY_TEXTURE_STAGE_MS` or
+        // `VICTORY_TEXTURE_STAGE_MB`.
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
-        let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes)) => {
-                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
+        let (span, bytes_at_most) = match pass_budget {
+            Some((ms, bytes)) => (
+                std::time::Duration::from_millis(ms),
+                SPENT.load(Ordering::Relaxed).saturating_add(bytes),
+            ),
+            None => {
+                let (ms, bytes) = cfg.budget(uploaded, due.len());
+                (std::time::Duration::from_millis(ms), bytes)
             }
-            None => (span, per_frame),
         };
+        // A texture view the host refuses removes the device: checked every
+        // 64 uploaded textures (matching `heap_buffers`) and once at loop
+        // exit instead of issuing a D3D12 COM call on every texture.
+        static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let alive = !GONE.load(Ordering::Relaxed);
+        let mut checked_in_pass: usize = 0;
+        let mut unchecked_uploads: usize = 0;
+        let mut last_index: u32 = 0;
+        let mut last_view: Option<View> = None;
         let began = std::time::Instant::now();
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
@@ -1982,16 +2084,25 @@ impl State {
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
-            // A texture view the host refuses removes the device: name it.
-            static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !GONE.load(Ordering::Relaxed)
-                && let Some(why) = crate::descriptor::host::device_removed()
-            {
-                GONE.store(true, Ordering::Relaxed);
-                let text: String = format!("{view:?}").chars().take(300).collect();
-                tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
-                crate::host::log_removal_context();
-                return;
+            if alive {
+                last_index = index;
+                last_view = view;
+                unchecked_uploads += 1;
+                if checked_in_pass % 64 == 63 {
+                    unchecked_uploads = 0;
+                    if let Some(why) = crate::descriptor::host::device_removed() {
+                        GONE.store(true, Ordering::Relaxed);
+                        let text: String = format!("{last_view:?}").chars().take(300).collect();
+                        tracing::error!(
+                            why,
+                            slot = last_index,
+                            "the host device went while textures picked by index were made ready; last: {text}"
+                        );
+                        crate::host::log_removal_context();
+                        return;
+                    }
+                }
+                checked_in_pass += 1;
             }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -2041,6 +2152,19 @@ impl State {
                 }
                 None => host.texture_slot_done(index, write, again),
             }
+        }
+        if alive
+            && unchecked_uploads > 0
+            && let Some(why) = crate::descriptor::host::device_removed()
+        {
+            GONE.store(true, Ordering::Relaxed);
+            let text: String = format!("{last_view:?}").chars().take(300).collect();
+            tracing::error!(
+                why,
+                slot = last_index,
+                "the host device went while textures picked by index were made ready; last: {text}"
+            );
+            crate::host::log_removal_context();
         }
     }
 
@@ -3556,5 +3680,113 @@ mod tests {
         drop(state);
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap_obj, 0x10);
         assert_eq!(release(heap_obj), 0);
+    }
+
+    #[test]
+    fn buffer_sweep_covers_all_slots_exactly_once_over_16_passes() {
+        let mut all_slots: Vec<u32> = (0..100).collect();
+        all_slots.extend([256, 257, 271, 272, 1023, 1024, 65_535, 209_492]);
+        let mut ranges: std::collections::HashMap<u32, u64> =
+            all_slots.iter().map(|&s| (s, u64::from(s))).collect();
+        let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+
+        for pass in 0..BUFFER_SWEEP_BUCKETS {
+            let bucket = (pass % BUFFER_SWEEP_BUCKETS) as u32;
+            let swept = buffer_sweep_slots(pass, Vec::new(), &all_slots, &mut ranges);
+            for &slot in &swept {
+                assert_eq!(slot % 16, bucket, "slot {slot} swept in wrong bucket {bucket}");
+                *counts.entry(slot).or_insert(0) += 1;
+                ranges.insert(slot, u64::from(slot));
+            }
+        }
+
+        assert_eq!(counts.len(), all_slots.len());
+        for slot in all_slots {
+            assert_eq!(counts.get(&slot), Some(&1), "slot {slot} should be swept exactly once");
+        }
+    }
+
+    #[test]
+    fn buffer_sweep_dedups_changed_and_prunes_stale_entries_in_bucket() {
+        let all_slots = vec![0, 1, 2, 16, 17, 32];
+        // Include stale keys no longer in `all_slots`: 48 (bucket 0) and 49 (bucket 1).
+        let mut ranges: std::collections::HashMap<u32, &'static str> = [
+            (0, "old0"),
+            (1, "old1"),
+            (2, "old2"),
+            (16, "old16"),
+            (17, "old17"),
+            (32, "old32"),
+            (48, "stale_b0"),
+            (49, "stale_b1"),
+        ]
+        .into_iter()
+        .collect();
+
+        // Pass 0 (bucket 0): `0` and `16` overlap with bucket 0, `2` is in another bucket.
+        let swept0 = buffer_sweep_slots(0, vec![2, 0, 16, 2], &all_slots, &mut ranges);
+        assert_eq!(swept0, vec![0, 2, 16, 32], "changed and bucket 0 merged without duplicates");
+        // Stale bucket-0 key `48` pruned; bucket-0 keys removed before re-insert;
+        // other buckets (including stale bucket-1 key `49`) left intact for their pass.
+        assert!(!ranges.contains_key(&48), "stale key in bucket 0 must be pruned");
+        assert!(!ranges.contains_key(&0));
+        assert!(!ranges.contains_key(&16));
+        assert!(!ranges.contains_key(&32));
+        assert_eq!(ranges.get(&1), Some(&"old1"));
+        assert_eq!(ranges.get(&17), Some(&"old17"));
+        assert_eq!(ranges.get(&49), Some(&"stale_b1"));
+        for &slot in &swept0 {
+            ranges.insert(slot, "fresh0");
+        }
+
+        // Pass 1 (bucket 1): prunes stale key `49` and sweeps live bucket-1 slots `1`, `17`.
+        let swept1 = buffer_sweep_slots(1, Vec::new(), &all_slots, &mut ranges);
+        assert_eq!(swept1, vec![1, 17]);
+        assert!(!ranges.contains_key(&49), "stale key in bucket 1 must be pruned");
+        assert_eq!(ranges.get(&0), Some(&"fresh0"));
+        assert_eq!(ranges.get(&32), Some(&"fresh0"));
+    }
+
+    #[test]
+    fn texture_stage_budget_adapts_from_loading_to_steady_gameplay() {
+        let default = TextureStageConfig {
+            stage_ms_override: None,
+            stage_mb_override: None,
+            steady_ms: 16,
+            steady_mb: 32,
+            catchup: true,
+        };
+        // Initial loading burst (< 4096 uploaded): 3x catchup on large backlog, 4096 due batch.
+        assert!(!default.is_steady(0));
+        assert_eq!(default.due_limit(0, false), 4096);
+        assert_eq!(default.budget(0, 2048), (750, 576 << 20));
+        assert_eq!(default.budget(0, 512), (250, 192 << 20));
+
+        // Steady gameplay (>= 4096 uploaded): capped at (16 ms, 32 MiB), no catchup, 1024 due batch.
+        assert!(default.is_steady(TEXTURE_STEADY_AFTER));
+        assert_eq!(default.due_limit(TEXTURE_STEADY_AFTER, false), 1024);
+        assert_eq!(default.budget(TEXTURE_STEADY_AFTER, 2048), (16, 32 << 20));
+        // Explicit PASS_BUDGET (early_textures / bake draws) keeps full 4096 due batch.
+        assert_eq!(default.due_limit(TEXTURE_STEADY_AFTER, true), 4096);
+
+        // VICTORY_TEXTURE_CATCHUP=0 never multiplies during loading.
+        let no_catchup = TextureStageConfig { catchup: false, ..default };
+        assert_eq!(no_catchup.budget(0, 2048), (250, 192 << 20));
+        assert_eq!(no_catchup.budget(TEXTURE_STEADY_AFTER, 2048), (16, 32 << 20));
+
+        // Explicit VICTORY_TEXTURE_STAGE_MS override is honored strictly (no steady cap, no 3x).
+        let explicit_ms = TextureStageConfig { stage_ms_override: Some(40), ..default };
+        assert!(!explicit_ms.is_steady(TEXTURE_STEADY_AFTER));
+        assert_eq!(explicit_ms.due_limit(TEXTURE_STEADY_AFTER, false), 4096);
+        assert_eq!(explicit_ms.budget(TEXTURE_STEADY_AFTER, 2048), (40, 576 << 20));
+
+        // Explicit VICTORY_TEXTURE_STAGE_MB override is honored strictly (no steady cap, no 3x).
+        let explicit_mb = TextureStageConfig { stage_mb_override: Some(64), ..default };
+        assert!(!explicit_mb.is_steady(TEXTURE_STEADY_AFTER));
+        assert_eq!(explicit_mb.budget(TEXTURE_STEADY_AFTER, 2048), (750, 64 << 20));
+
+        // Custom steady limits are respected once steady state is reached.
+        let custom_steady = TextureStageConfig { steady_ms: 8, steady_mb: 16, ..default };
+        assert_eq!(custom_steady.budget(TEXTURE_STEADY_AFTER, 1024), (8, 16 << 20));
     }
 }
