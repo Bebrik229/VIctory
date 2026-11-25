@@ -2057,7 +2057,7 @@ struct CardPlan {
 
 fn ask_once_textures() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE_TEXTURES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE_TEXTURES").is_none_or(|v| v != "0"))
 }
 
 fn fill_workers() -> usize {
@@ -2889,7 +2889,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize)> {
         std::env::var("VICTORY_MERGE_RUNS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(4096)
+            .unwrap_or(65536)
     });
     for (shadow, mut ranges) in per_shadow {
         let raw = std::mem::take(&mut ranges);

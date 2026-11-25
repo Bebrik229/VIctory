@@ -994,6 +994,7 @@ impl BlockSet {
     }
 
     /// Whether every block in `first..last` is in the set, without allocating.
+    #[cfg(test)]
     fn all_in_range(&self, first: usize, last: usize) -> bool {
         if first >= last {
             return true;
@@ -1161,6 +1162,10 @@ fn hot_guard_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HOT_GUARD").is_none_or(|v| v != "0"))
 }
+
+const HOT_FAULT_WINDOW: u64 = 32;
+const HOT_FAULT_THRESHOLD: u16 = 2;
+const HOT_PIN_EPOCHS: u64 = 512;
 
 static HOT_GUARD_STATS: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -2114,18 +2119,19 @@ fn install() {
                 let block = at / BLOCK;
                 let epoch = g.guard_epoch;
                 let entry = g.fault_counts.entry(block).or_insert((epoch, 0));
-                if epoch.saturating_sub(entry.0) <= 8 {
+                if epoch.saturating_sub(entry.0) <= HOT_FAULT_WINDOW {
                     entry.1 = entry.1.saturating_add(1);
                 } else {
                     entry.1 = 1;
                 }
                 entry.0 = epoch;
-                if entry.1 >= 3 {
+                if entry.1 >= HOT_FAULT_THRESHOLD {
                     entry.1 = 0;
-                    g.hot_pins.insert(block, epoch.saturating_add(64));
+                    g.hot_pins.insert(block, epoch.saturating_add(HOT_PIN_EPOCHS));
                 }
                 if g.fault_counts.len() > 4096 {
-                    g.fault_counts.retain(|_, &mut (e, _)| epoch.saturating_sub(e) <= 64);
+                    g.fault_counts
+                        .retain(|_, &mut (e, _)| epoch.saturating_sub(e) <= HOT_FAULT_WINDOW * 2);
                     g.hot_pins.retain(|_, &mut until| until > epoch);
                 }
             }
@@ -3824,7 +3830,10 @@ mod mapping_tests {
 
     #[test]
     fn hot_guard_skips_reprotect_after_repeated_veh_faults_and_expires() {
-        use super::{BLOCK, PAGE, guard, hot_guard_on, title_memory_remapped, writable};
+        use super::{
+            BLOCK, HOT_FAULT_THRESHOLD, HOT_PIN_EPOCHS, PAGE, guard, hot_guard_on,
+            title_memory_remapped, writable,
+        };
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
             PAGE_READWRITE, UnmapViewOfFile,
@@ -3850,18 +3859,18 @@ mod mapping_tests {
         assert_eq!(guard(base, base + BLOCK), Some(vec![p0]));
         assert!(!writable(base));
 
-        // Three VEH write faults in consecutive epochs trigger a 64-epoch hot pin.
-        for _ in 0..3 {
+        // Repeated VEH write faults within window trigger a hot pin.
+        for _ in 0..HOT_FAULT_THRESHOLD {
             unsafe { (base as *mut u8).write_volatile(7) };
             let got = guard(base, base + BLOCK);
             assert_eq!(got, Some(vec![p0]));
         }
-        assert!(writable(base), "3rd VEH fault within window must hot-pin block writable");
+        assert!(writable(base), "threshold VEH fault within window must hot-pin block writable");
         assert_eq!(guard(base, base + BLOCK), Some(vec![p0]));
         assert!(writable(base), "hot-pinned block stays writable while active");
 
-        // Advance guard_epoch past the 64-epoch hot-pin TTL and verify re-arm.
-        for _ in 0..64 {
+        // Advance guard_epoch past the hot-pin TTL and verify re-arm.
+        for _ in 0..HOT_PIN_EPOCHS {
             let _ = guard(base, base + BLOCK);
         }
         assert!(!writable(base), "expired hot-pin must re-protect block READONLY");

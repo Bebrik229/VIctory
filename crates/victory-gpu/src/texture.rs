@@ -966,9 +966,15 @@ impl Staging {
                 crate::watch::writes_unchanged_since(start, end, last.asked, true)
             }) {
                 Some((now, unwritten)) => {
-                    const HASH_EVERY: u64 = 8;
+                    static HASH_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                    let hash_every = *HASH_EVERY.get_or_init(|| {
+                        std::env::var("VICTORY_TEXTURE_HASH_EVERY")
+                            .ok()
+                            .and_then(|v| v.trim().parse::<u64>().ok())
+                            .map_or(64, |v| v.max(1))
+                    });
                     last.asked = now;
-                    let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+                    let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(hash_every);
                     if unwritten && !turn {
                         return 0;
                     }

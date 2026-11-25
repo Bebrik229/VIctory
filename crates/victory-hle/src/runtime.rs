@@ -182,21 +182,13 @@ pub fn title() -> Title {
 /// and Windows 11 drops that request while the window is hidden unless the
 /// process opts out. Process-wide, for the whole run.
 #[cfg(windows)]
-pub fn use_console_timers() {
-    use windows_sys::Win32::Media::timeBeginPeriod;
+fn apply_priority_and_throttling(execution: u32, target: Option<u32>) {
     use windows_sys::Win32::System::Threading::{
         ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess,
         GetPriorityClass, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
-        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION,
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
         ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
-    };
-    // Also opt out of Windows efficiency mode (reduced clocks / slow cores when
-    // unfocused); `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
-    let execution = if std::env::var_os("VICTORY_EFFICIENCY_MODE").is_some_and(|v| v == "1") {
-        0
-    } else {
-        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
     };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
@@ -211,17 +203,8 @@ pub fn use_console_timers() {
             (&raw const keep).cast(),
             size_of_val(&keep) as u32,
         );
-        timeBeginPeriod(1);
     }
-    // Raise CPU scheduling priority so background tasks do not preempt the
-    // title's frame pacing or audio mixer; `VICTORY_LOW_PRIORITY=1` skips it,
-    // `VICTORY_HIGH_PRIORITY=1` bumps to `HIGH_PRIORITY_CLASS`.
-    if !std::env::var_os("VICTORY_LOW_PRIORITY").is_some_and(|v| v == "1") {
-        let target = if std::env::var_os("VICTORY_HIGH_PRIORITY").is_some_and(|v| v == "1") {
-            HIGH_PRIORITY_CLASS
-        } else {
-            ABOVE_NORMAL_PRIORITY_CLASS
-        };
+    if let Some(target) = target {
         // SAFETY: `GetCurrentProcess()` is a valid pseudo-handle and `target` is a
         // valid priority class constant.
         unsafe {
@@ -236,6 +219,44 @@ pub fn use_console_timers() {
             }
         }
     }
+}
+
+#[cfg(windows)]
+pub fn use_console_timers() {
+    use windows_sys::Win32::Media::timeBeginPeriod;
+    use windows_sys::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    };
+    // Also opt out of Windows efficiency mode (reduced clocks / slow cores when
+    // unfocused); `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
+    let execution = if std::env::var_os("VICTORY_EFFICIENCY_MODE").is_some_and(|v| v == "1") {
+        0
+    } else {
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    };
+    // Raise CPU scheduling priority so background tasks do not preempt the
+    // title's frame pacing or audio mixer; `VICTORY_LOW_PRIORITY=1` skips it,
+    // `VICTORY_HIGH_PRIORITY=1` bumps to `HIGH_PRIORITY_CLASS`.
+    let target = if std::env::var_os("VICTORY_LOW_PRIORITY").is_some_and(|v| v == "1") {
+        None
+    } else if std::env::var_os("VICTORY_HIGH_PRIORITY").is_some_and(|v| v == "1") {
+        Some(HIGH_PRIORITY_CLASS)
+    } else {
+        Some(ABOVE_NORMAL_PRIORITY_CLASS)
+    };
+    // SAFETY: valid process-wide timer resolution request.
+    unsafe { timeBeginPeriod(1) };
+    apply_priority_and_throttling(execution, target);
+
+    static GUARD: std::sync::Once = std::sync::Once::new();
+    GUARD.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("victory-prio-guard".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                apply_priority_and_throttling(execution, target);
+            });
+    });
 }
 
 #[cfg(test)]

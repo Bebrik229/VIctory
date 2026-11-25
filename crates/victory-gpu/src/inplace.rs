@@ -354,6 +354,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
 }
 
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.
+#[cfg(test)]
 pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     if start >= end {
         return Vec::new();
