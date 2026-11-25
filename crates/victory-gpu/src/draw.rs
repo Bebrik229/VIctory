@@ -2495,10 +2495,9 @@ impl State {
         };
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u.kind, &view);
-            // Up to date by this draw: not the texture pass's to make.
-            if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
-            }
+            // Up to date by this draw: not the texture pass's or byte-copy
+            // descriptor sync's to mirror again.
+            host.texture_slot_tabled(index, crate::descriptor::host::is_texture_view(&view));
         }
     }
 
@@ -2648,8 +2647,10 @@ impl State {
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
-            // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // them it brings up to date here, in the dynamic slots. Covers
+            // slots past the identity window too (with a heap map), so
+            // `sync_heaps` leaves per-draw table slots to their draws.
+            let title_first = heap.index(table).filter(|first| first + n <= host.mirrored_count());
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -2657,6 +2658,9 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if let Some(title) = title_first {
+                            host.texture_slot_tabled(title + k, false);
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -2674,19 +2678,21 @@ impl State {
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
-                        // (its texture is up to date now), and made in
-                        // place as the texture pass would have made it,
-                        // for a shader that picks it by index all the same.
-                        if let Some(title) = title_first
-                            && crate::descriptor::host::is_texture_view(&view)
-                        {
-                            host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() {
+                        // (its texture is up to date now), skipped by
+                        // `sync_heaps`, and for identity-window textures
+                        // made in place for shaders that pick by index.
+                        if let Some(title) = title_first {
+                            let is_tex = crate::descriptor::host::is_texture_view(&view);
+                            host.texture_slot_tabled(title + k, is_tex && kind.is_some());
+                            if is_tex && kind.is_some() && title + k < host.count() {
                                 host.mirror(title + k, table + u64::from(k) * 32, true);
                             }
                         }
                     }
                     None => {
+                        if let Some(title) = title_first {
+                            host.texture_slot_tabled(title + k, false);
+                        }
                         host.make_null(index);
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
