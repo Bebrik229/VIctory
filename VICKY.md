@@ -1,12 +1,16 @@
-# VIcky: branch `fx-heapmap-4e`
+# VIcky: branch `fx-heapmap-8d`
 
-This branch is the base that renders the world **lit and textured** on NVIDIA: [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (formerly `victory-gta6`) at `4e17478`, plus VIcky's commits on top: a **heap map** for NVIDIA's view-heap cap and a **per-program switch** for one wave64 form. (Branch `fx-heapmap` is the same work on the fork's older `7b0f736`. It has been run in the title: see the measurements below.)
+This branch is the base that renders the world **lit and textured** on NVIDIA: [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (formerly `victory-gta6`) at `8dd30ab`, plus VIcky's commits on top: a **heap map** for NVIDIA's view-heap cap and a **per-program switch** for one wave64 form. (Branches `fx-heapmap-4e` and `fx-heapmap` are the same work on the fork's older `4e17478` and `7b0f736`; the measurements below were made on those.)
+
+The fork's own `VICTORY_VIEW_GUARD` (on by default) is expected to fix the random missing cell shell, as reported on [fxceless/victory-fork#62](https://github.com/fxceless/victory-fork/issues/62). This branch has not been run in the title yet.
+
+Since `4e17478` the base also clamps view indices on every host (a 2^21-view heap where the host takes one, else the capped 1,000,000), probing the full 2^21 range itself, so VIcky's own full-heap probe was dropped; the heap map is set where that probe finds the cap. Its faster defaults (`c96b4f2`) are on: the stage-2 copy-back thread (`VICTORY_RELAY=0` turns it off), wide copy-back (`VICTORY_WIDE_BACK=0`), card copies from 1 MiB up to 1,024 MB (`VICTORY_CARD_BUFFERS_MIN_MB=16 VICTORY_CARD_BUFFERS_MB=512` restore the old values) and 256 lists in flight (`VICTORY_LATE_WAIT_LISTS=128`). The shader cache is now keyed on the translator's source and switches, not on the executable (`VICTORY_SHADER_CACHE_KEY=exe`: the old key); the heap map is in that key, the per-program lists are not (each program's decision is in its own key). For `victory translate --warm` on a capped host, set `VICTORY_VIEW_LIMIT=999999`: the warm-up then translates with the heap map too.
 
 **All of the rendering work below the `VIcky:` commits is fxceless's, under GPL-3.0.** Their README is kept unchanged and describes it. Please report rendering issues of the base to them (our findings so far: [fxceless/victory-fork#62](https://github.com/fxceless/victory-fork/issues/62)).
 
 ## What this branch adds: a heap map for NVIDIA's view-heap cap
 
-The title requests **1,245,184** shader-visible views. On an 8 GB RTX 4060 Laptop with driver 617.14, D3D12 accepted 1,000,001 views and refused the full title heap. VIcky probes the translator's full 2,097,152-slot range before compiling shaders and uses its **1,000,000**-slot layout if that allocation fails. On a capped host the base keeps the first ~737,855 title slots at their own index and lets every view past them read the null slot.
+The title requests **1,245,184** shader-visible views. On an 8 GB RTX 4060 Laptop with driver 617.14, D3D12 accepted 1,000,001 views and refused the full title heap. The base probes the translator's full 2,097,152-slot range before compiling shaders and uses its **1,000,000**-slot layout if that allocation fails; VIcky's heap map is set there. On a capped host the base keeps the first ~737,855 title slots at their own index and lets every view past them read the null slot.
 
 Measured on an RTX 4080 (diagnostics scan of the title's heap, every 30 s in the world):
 - 650k–700k title slots hold a view, up to slot 1,245,182.
@@ -31,7 +35,7 @@ The base's exact wave64 form "without skips, scalars followed" (`6a2d9f9`) is on
 
 A program's decision is in its own shader cache key, so a new list translates again only the programs whose decision it changes. To find the programs offline: `VICTORY_HOST_WAVE=32 VICTORY_WAVE_WHY=1 victory translate --list`; a program in that form prints `WAVE64-RETRY #<hash> without skips, scalars followed: wave Some(32)` last.
 
-Tests: `victory-gpu` 129 passed (117 on the base), `victory-shader` 206 passed (198 on the base).
+Tests: see the end of this file.
 
 ## Measured on an RTX 4080 (driver 621.01, Windows 11, Series X profile)
 
@@ -48,7 +52,7 @@ Tests: `victory-gpu` 129 passed (117 on the base), `victory-shader` 206 passed (
 | `7b0f736` + heap map, no loop limit, all 22 programs out of the deep-skips form | 12 | 7,182 | none in 7 min |
 | `7b0f736` + heap map, no loop limit, **the 14 cascade-shadow programs** out of the deep-skips form | 12 | ~6,900 | none |
 
-**On this branch (`4e17478`): also set `VICTORY_SHADER_OPT=0`.** The base's new shader clean-up passes (`1684989`, on by default) leave the room's walls, roof and floor out of the picture on an RTX 4080 (A/B on the same save: with them, sky shows where the walls are; with `VICTORY_SHADER_OPT=0` the walls are there), and on an AMD RX 7800 XT the same happens with them on (UNYTIX's run).
+**On `4e17478` (and likely here: the clean-up passes did not change up to `8dd30ab`), also set `VICTORY_SHADER_OPT=0`.** The base's new shader clean-up passes (`1684989`, on by default) leave the room's walls, roof and floor out of the picture on an RTX 4080 (A/B on the same save: with them, sky shows where the walls are; with `VICTORY_SHADER_OPT=0` the walls are there), and on an AMD RX 7800 XT the same happens with them on (UNYTIX's run).
 
 **UNYTIX's fix (VIcky PR #9) is in:** D3D12 refused the mesh pipeline `[mesh f5e50eb2108c425b, pixel ce3f0432a08f1d35]` because the title enables blending on an `R8_UINT` target; blending is now turned off on integer targets. Measured on the RTX 4080 (same save, `VICTORY_SHADER_OPT=0`, the 14 programs out, no loop limit): the pipeline is now made. **Correction:** a first run with the fix showed the walls at the window present and lit, but two exact repeats did not (sky/horizon where the walls are), so that picture was chance, not the fix. Runs of one build and one save differ a lot here; the G-buffer and depth do hold the walls (target dumps), so what varies is a lighting or composition pass (fog/volumetrics or the clustered local lights, both translated in approximate wave64 forms on 32-lane hosts; being tested).
 
@@ -69,7 +73,7 @@ The heap map: in this base few views past the window are actually read (its pool
 ## Known problems (seen here, one machine)
 
 - With the base's defaults, missing ceilings/walls and dark surfaces: see the best settings above.
-- One mesh pipeline is refused by the driver (`f5e50eb2108c425b` + pixel `ce3f0432a08f1d35`, E_INVALIDARG).
+- One mesh pipeline was refused by the driver (`f5e50eb2108c425b` + pixel `ce3f0432a08f1d35`, E_INVALIDARG); UNYTIX's integer-blend fix above makes it.
 - 2–3 fps; ~360 draws per frame are dropped because the base's ray-tracing structure builder is off by default.
 
 ## Build and run
@@ -83,3 +87,7 @@ target\diag\victory.exe run <game dir>\<the title's exe> --execute
 You need your own copy of the game; no game files are in this repository. The first run translates every shader and is slow and glitchy until the pipelines are built.
 
 The older VIcky research (the integration-tree base, the #1269 measurements, the diagnostics) stays on `main`.
+
+## Tests (this branch at `8dd30ab`, RTX 4080 and WARP)
+
+`victory-gpu` (with `diagnostics`) 157 passed, 3 ignored; `victory-shader` 222 passed, 3 ignored; `victory-hle` 99 passed; `cargo xtask policy`: 175 files ok.
