@@ -702,10 +702,17 @@ impl State {
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
+    /// Invalidates any cached indirect-argument window (called when a buffer
+    /// copy, query resolve, or memory write may mutate argument buffers).
+    pub(crate) fn clear_window(&mut self) {
+        self.window = None;
+    }
+
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.window = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -2973,7 +2980,7 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
+            .map(|w| (w.scratch.clone(), ((offset - w.base) / u64::from(w.step)) * u64::from(w.stride)));
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -2981,6 +2988,7 @@ impl State {
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
                 // after it are clamped with it.
+                let chained = self.window.as_ref().is_some_and(|w| windowed && same(w));
                 let (step, records) = match &self.window {
                     Some(w) if windowed && same(w) => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
@@ -2990,15 +2998,33 @@ impl State {
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            let left = args.left(arguments);
+                            // Exact byte span for `k` records at `step` where the
+                            // last record only reads `stride` bytes (`copy_bytes`):
+                            // `(k - 1) * step + stride <= left`.
+                            let fit = if left >= u64::from(stride) {
+                                (((left - u64::from(stride)) / step) + 1).min(WINDOW_MOST) as u32
+                            } else {
+                                0
+                            };
+                            if fit >= 2 {
+                                let target = if w.records == 1 { 16 } else { w.records * 2 };
+                                (step as u32, target.min(fit))
+                            } else {
+                                (stride, max)
+                            }
                         } else {
                             (stride, max)
                         }
                     }
                     _ => (stride, max),
                 };
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                let needed = if records == 0 {
+                    0
+                } else {
+                    u64::from(records - 1) * u64::from(step) + u64::from(stride)
+                };
+                args.refresh(list, arguments, len.max(needed));
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
@@ -3009,13 +3035,18 @@ impl State {
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    crate::indirect::bound_ahead(
+                        list,
+                        (&args.buffer, offset),
+                        (kind, stride, step, records),
+                        chained,
+                    )
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, stride, records))
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    why("not bounded (no clamp, alignment or buffer bounds)");
                     return false;
                 };
                 self.host_pipeline = 0;
@@ -3039,7 +3070,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
             why("prepare failed");
             return false;
         }
@@ -3065,7 +3095,6 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

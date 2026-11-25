@@ -789,11 +789,16 @@ pub(crate) struct HostList {
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
-    /// shader-writable word, zeroed when the list is submitted.
+    /// device-local UAV buffer (`data == 0`, zeroed on GPU) or, with
+    /// `VICTORY_INDIRECT_STATS=1`, a shared L0 buffer read back on CPU.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Whether `budget` was explicitly transitioned to `UNORDERED_ACCESS`
+    /// in the current recording and must return to `COMMON` at `close()`.
+    budget_in_uav: std::sync::atomic::AtomicBool,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// grown to the largest indirect execution recorded on the list, plus
+    /// whether it is currently in `INDIRECT_ARGUMENT` state.
+    indirect_args: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -3216,6 +3221,7 @@ impl Host {
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                budget_in_uav: std::sync::atomic::AtomicBool::new(false),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -5095,6 +5101,39 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        // Return indirect scratch and device-local budget buffers to COMMON
+        // once per list close (keeps [L, L] double-submission & pool reuse legal).
+        let mut close_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+        let mut ind_hold: Option<ID3D12Resource> = None;
+        {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((buf, _, in_indirect)) = slot.as_mut()
+                && *in_indirect
+            {
+                *in_indirect = false;
+                ind_hold = Some(buf.clone());
+            }
+        }
+        if let Some(buf) = &ind_hold {
+            close_barriers.push(transition(
+                buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COMMON,
+            ));
+        }
+        if self.budget_in_uav.swap(false, Ordering::Relaxed)
+            && let Some(Some((buf, _))) = self.budget.get()
+        {
+            close_barriers.push(transition(
+                buf,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            ));
+        }
+        if !close_barriers.is_empty() {
+            // SAFETY: an open list and live buffers held for the call.
+            unsafe { self.list.ResourceBarrier(&close_barriers) };
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -5122,6 +5161,10 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.budget_in_uav.store(false, Ordering::Relaxed);
+        if let Some((_, _, in_indirect)) = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            *in_indirect = false;
+        }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -5668,68 +5711,144 @@ impl HostList {
         scratch.chunks.iter().map(|c| c.1).sum()
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
+    /// Whether indirect clamp diagnostic counters (`budget[1..5]`) are
+    /// recorded in L0 shared RAM (`VICTORY_INDIRECT_STATS=1`; off by default
+    /// so `budget` lives in device-local L1 VRAM with zero PCIe atomics).
+    pub(crate) fn indirect_stats() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_STATS").is_some_and(|v| v == "1"))
+    }
+
+    /// A shared 256-byte zeroed upload buffer for GPU-side zeroing of
+    /// device-local `HostList::budget` buffers.
+    fn zero_256() -> Option<&'static ID3D12Resource> {
+        static ZERO: OnceLock<Option<ID3D12Resource>> = OnceLock::new();
+        ZERO.get_or_init(|| {
+            let (buf, ptr) = host()?.upload_buffer(256)?;
+            // SAFETY: mapped 256-byte upload buffer.
+            unsafe { std::ptr::write_bytes(ptr, 0, 256) };
+            name(&buf, || "indirect budget zero".to_owned());
+            Some(buf)
+        })
+        .as_ref()
+    }
+
+    /// The resource and GPU VA of the list's indirect-work budget, zeroed at
+    /// each execution of the list from the first use after a reset on.
+    pub(crate) fn budget(&self) -> Option<(ID3D12Resource, u64)> {
+        let stats = Self::indirect_stats();
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
+                if stats {
+                    let (b, d) = host()?.shared_buffer(256)?;
+                    Some((b, d as usize))
+                } else {
+                    let b = host()?.uav_buffer(256)?;
+                    name(&b, || "indirect budget (VRAM)".to_owned());
+                    Some((b, 0usize))
+                }
             })
             .as_ref()?;
-        let mut deferred = self.deferred();
-        if !deferred.budget_zeroed {
-            deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped words, written before it runs.
-            // The words after the budget hold what the clamp noted about the
-            // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all): taken, then zeroed.
-            deferred.copies.push(Step::Host(Box::new(move || unsafe {
-                let words = at as *mut u32;
-                let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
-                MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
-                MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                // And of its indirect compute records: the largest x asked
-                // for, and how many asked for more than a dispatch runs.
-                let (widest, cut) = (words.add(3).read_volatile(), words.add(4).read_volatile());
-                COMPUTE_GROUPS[0].fetch_max(u64::from(widest), Ordering::Relaxed);
-                COMPUTE_GROUPS[1].fetch_add(u64::from(cut), Ordering::Relaxed);
-                for k in 0..5 {
-                    words.add(k).write_volatile(0);
+        if *data != 0 {
+            let mut deferred = self.deferred();
+            if !deferred.budget_zeroed {
+                deferred.budget_zeroed = true;
+                let at = *data;
+                // SAFETY: the list's own mapped words, written before it runs.
+                deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                    let words = at as *mut u32;
+                    let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
+                    MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                    MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+                    let (widest, cut) = (words.add(3).read_volatile(), words.add(4).read_volatile());
+                    COMPUTE_GROUPS[0].fetch_max(u64::from(widest), Ordering::Relaxed);
+                    COMPUTE_GROUPS[1].fetch_add(u64::from(cut), Ordering::Relaxed);
+                    for k in 0..5 {
+                        words.add(k).write_volatile(0);
+                    }
+                })));
+            }
+        } else {
+            const BUDGET_INIT: usize = usize::MAX - 0x78;
+            if self.first_use(BUDGET_INIT) {
+                let zero = Self::zero_256()?;
+                // SAFETY: an open list; `buffer` starts in COMMON and
+                // promotes implicitly to COPY_DEST, then transitions to UAV
+                // (returned to COMMON once in `HostList::close`).
+                unsafe {
+                    self.list.CopyBufferRegion(buffer, 0, zero, 0, 20);
+                    self.list.ResourceBarrier(&[transition(
+                        buffer,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
                 }
-            })));
+                self.budget_in_uav.store(true, Ordering::Relaxed);
+            }
         }
         // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some((buffer.clone(), unsafe { buffer.GetGPUVirtualAddress() }))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
     /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
-    /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+    /// list, plus whether it is currently in `INDIRECT_ARGUMENT` state.
+    /// Smaller buffers replaced mid-list are transitioned back to `COMMON`
+    /// and stay alive until [`HostList::reset`].
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<(ID3D12Resource, bool)> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
+        if let Some((buffer, cap, in_indirect)) = &*slot
             && *cap >= needed
         {
-            return Some(buffer.clone());
+            return Some((buffer.clone(), *in_indirect));
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.as_ref().map_or(0, |(_, cap, _)| *cap);
         let alloc = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
+        let old = slot.replace((buffer.clone(), alloc, false));
         drop(slot);
-        if let Some((old_buf, _)) = old {
+        if let Some((old_buf, _, was_in_indirect)) = old {
+            if was_in_indirect {
+                // SAFETY: an open list; return retired scratch to COMMON.
+                unsafe {
+                    self.list.ResourceBarrier(&[transition(
+                        &old_buf,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+            }
             self.keep(&old_buf);
         }
-        Some(buffer)
+        Some((buffer, false))
+    }
+
+    /// Records that the current indirect scratch buffer is now in
+    /// `INDIRECT_ARGUMENT` state (returned to `COMMON` at `close()` or
+    /// transitioned back to `UNORDERED_ACCESS` on the next clamp).
+    pub(crate) fn mark_indirect_ready(&self) {
+        if let Some((_, _, in_indirect)) = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            *in_indirect = true;
+        }
+    }
+
+    /// Clears `in_indirect` on the current indirect scratch buffer if set,
+    /// returning whether a transition to `COMMON` is needed.
+    #[cfg(test)]
+    pub(crate) fn take_indirect_ready(&self) -> bool {
+        if let Some((_, _, in_indirect)) = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            let was = *in_indirect;
+            *in_indirect = false;
+            was
+        } else {
+            false
+        }
     }
 
     /// Keeps `object` alive until the list is reset.

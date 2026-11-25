@@ -820,6 +820,7 @@ extern "system" fn copy_buffer_region(
         && let Some(from) = buffer_range(src, src_offset, len)
     {
         list.defer_copy(to, from, len as usize);
+        with_state(this, |_, s| s.clear_window());
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -876,6 +877,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(src),
         ) {
             list.defer_copy(to, from, a.min(b) as usize);
+            with_state(this, |_, s| s.clear_window());
         }
     }
     #[cfg(not(windows))]
@@ -1313,6 +1315,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
                 unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
             }
         });
+        with_state(this, |_, s| s.clear_window());
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
@@ -1372,6 +1375,8 @@ extern "system" fn resolve_queries(
     if offset + u64::from(count) * bytes > size {
         return;
     }
+    #[cfg(windows)]
+    with_state(this, |_, s| s.clear_window());
     for i in 0..u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
@@ -1922,6 +1927,8 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         cut(this, wait);
         return;
     }
+    #[cfg(windows)]
+    with_state(this, |_, s| s.clear_window());
     VALUE_WAITS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1966,10 +1973,14 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    #[cfg(windows)]
+    with_state(this, |_, s| s.clear_window());
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+    #[cfg(windows)]
+    with_state(this, |_, s| s.clear_window());
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
