@@ -63,22 +63,46 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
-    (0x1B, MENU), // Esc
-    (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
-    (0x08, B),    // Backspace
+/// Native mouse look (F2/MMB toggle, Esc unlock, F3/F4 sensitivity) overlays
+/// the right stick plus RMB (LT) and LMB (RT).
+const FALLBACK_BUTTONS: [(u8, u32); 16] = [
+    (0x1B, MENU),       // Esc
+    (0x09, VIEW),       // Tab
+    (0x0D, A),          // Enter
+    (0x20, A),          // Space
+    (0x08, B),          // Backspace
     (b'X', X),
     (b'Y', Y),
-    (0x26, UP), // arrows
+    (0x26, UP),         // arrows
     (0x28, DOWN),
     (0x25, LEFT),
     (0x27, RIGHT),
     (b'Q', LEFT_SHOULDER),
     (b'E', RIGHT_SHOULDER),
     (b'F', LEFT_STICK),
+    (0xA0, LEFT_STICK), // Left Shift
     (b'H', RIGHT_STICK),
 ];
+
+/// Mouse-look tuning for turning 8 ms screen deltas into Xbox right-stick deflection.
+#[cfg_attr(not(windows), allow(dead_code))]
+const MOUSE_SENS_MIN: f32 = 0.2;
+#[cfg_attr(not(windows), allow(dead_code))]
+const MOUSE_SENS_MAX: f32 = 5.0;
+#[cfg_attr(not(windows), allow(dead_code))]
+const MOUSE_SENS_DEFAULT: f32 = 1.0;
+#[cfg_attr(not(windows), allow(dead_code))]
+const MOUSE_DEADZONE_BREAKOUT: f32 = 0.18;
+#[cfg_attr(not(windows), allow(dead_code))]
+const MOUSE_FULL_DEFLECTION_PX: f32 = 32.0;
+#[cfg_attr(not(windows), allow(dead_code))]
+const MOUSE_RESPONSE_GAMMA: f32 = 0.78;
+#[cfg_attr(not(windows), allow(dead_code))]
+const MOUSE_ACTIVE_BLEND: f32 = 0.70;
+#[cfg_attr(not(windows), allow(dead_code))]
+const MOUSE_STOP_DECAY: f32 = 0.45;
+#[cfg_attr(not(windows), allow(dead_code))]
+const MOUSE_STOP_EPSILON: f32 = 0.01;
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
@@ -111,6 +135,10 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Smooth analog mouse-look overlay merged into the keyboard stand-in pad.
+    fn mouse_pad(&mut self) -> PadState {
+        PadState::default()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -135,6 +163,89 @@ fn fallback(keys: &[KeyState]) -> PadState {
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
     }
+}
+
+/// Merges a mouse-look overlay onto the keyboard stand-in pad state so digital
+/// keys (`I/J/K/L`, `Z`, `C`) keep working alongside mouse input.
+fn merge_pad(base: PadState, overlay: PadState) -> PadState {
+    PadState {
+        buttons: base.buttons | overlay.buttons,
+        left_trigger: base.left_trigger.max(overlay.left_trigger),
+        right_trigger: base.right_trigger.max(overlay.right_trigger),
+        left_x: (base.left_x + overlay.left_x).clamp(-1.0, 1.0),
+        left_y: (base.left_y + overlay.left_y).clamp(-1.0, 1.0),
+        right_x: (base.right_x + overlay.right_x).clamp(-1.0, 1.0),
+        right_y: (base.right_y + overlay.right_y).clamp(-1.0, 1.0),
+    }
+}
+
+/// Converts an 8 ms screen-space mouse delta `(dx, dy)` into smoothed analog
+/// Xbox right-stick deflection `(rx, ry)` in `[-1.0, 1.0]`.
+///
+/// `+X` is right and `+Y` is up (`dy < 0` yields positive `ry`). Non-zero
+/// movement applies a radial deadzone-breakout curve so micro-aim clears the
+/// game's ~0.15 inner deadzone cleanly; zero deltas decay rapidly to zero.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn mouse_delta_to_stick(dx: i32, dy: i32, sens: f32, prev_x: f32, prev_y: f32) -> (f32, f32) {
+    let prev_x = if prev_x.is_finite() { prev_x } else { 0.0 };
+    let prev_y = if prev_y.is_finite() { prev_y } else { 0.0 };
+
+    if dx == 0 && dy == 0 {
+        let nx = (prev_x * MOUSE_STOP_DECAY).clamp(-1.0, 1.0);
+        let ny = (prev_y * MOUSE_STOP_DECAY).clamp(-1.0, 1.0);
+        if nx.hypot(ny) < MOUSE_STOP_EPSILON {
+            return (0.0, 0.0);
+        }
+        return (
+            if nx == 0.0 { 0.0 } else { nx },
+            if ny == 0.0 { 0.0 } else { ny },
+        );
+    }
+
+    if !sens.is_finite() || sens <= 0.0 {
+        return (0.0, 0.0);
+    }
+
+    let vx = dx as f32 * sens;
+    let vy = -(dy as f32) * sens;
+    let mag = vx.hypot(vy);
+    if mag == 0.0 {
+        return (0.0, 0.0);
+    }
+
+    let norm = (mag / MOUSE_FULL_DEFLECTION_PX).min(1.0);
+    let target_mag =
+        MOUSE_DEADZONE_BREAKOUT + (1.0 - MOUSE_DEADZONE_BREAKOUT) * norm.powf(MOUSE_RESPONSE_GAMMA);
+    let target_x = (vx / mag) * target_mag;
+    let target_y = (vy / mag) * target_mag;
+
+    let rx = (prev_x * (1.0 - MOUSE_ACTIVE_BLEND) + target_x * MOUSE_ACTIVE_BLEND).clamp(-1.0, 1.0);
+    let ry = (prev_y * (1.0 - MOUSE_ACTIVE_BLEND) + target_y * MOUSE_ACTIVE_BLEND).clamp(-1.0, 1.0);
+    (
+        if rx == 0.0 { 0.0 } else { rx },
+        if ry == 0.0 { 0.0 } else { ry },
+    )
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_mouse_enabled(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(str::trim),
+        Some(v)
+            if v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no")
+    )
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_mouse_sens(raw: Option<&str>) -> f32 {
+    raw.and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .map_or(MOUSE_SENS_DEFAULT, |v| {
+            v.clamp(MOUSE_SENS_MIN, MOUSE_SENS_MAX)
+        })
 }
 
 #[repr(C)]
@@ -401,12 +512,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let keys = source.keys();
+            let mouse = source.mouse_pad();
+            (pads, keys, mouse)
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -451,6 +564,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -458,7 +572,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(merge_pad(fallback(&keys), mouse)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1067,11 +1181,12 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// Host input: XInput pads, the keyboard while our process has focus.
+/// Host input: XInput pads, the keyboard and smooth mouse look while our process has focus.
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1085,13 +1200,30 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        ClipCursor, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
+        SetCursorPos, ShowCursor,
     };
 
     use super::*;
 
+    // `ClientToScreen` is exported by `user32.dll` (already linked via `windows-sys`)
+    // under the `Win32_Graphics_Gdi` feature, which `victory-hle` does not enable.
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn ClientToScreen(hwnd: HWND, lppoint: *mut POINT) -> i32;
+    }
+
     /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
+
+    const VK_LBUTTON: i32 = 0x01;
+    const VK_RBUTTON: i32 = 0x02;
+    const VK_MBUTTON: i32 = 0x04;
+    const VK_ESCAPE: i32 = 0x1B;
+    const VK_F2: i32 = 0x71;
+    const VK_F3: i32 = 0x72;
+    const VK_F4: i32 = 0x73;
+    const MOUSE_SENS_STEP: f32 = 1.25;
 
     const BUTTONS: [(u16, u32); 14] = [
         (XINPUT_GAMEPAD_START, MENU),
@@ -1127,9 +1259,248 @@ mod host {
         }
     }
 
-    #[derive(Default)]
+    struct MouseLook {
+        enabled: bool,
+        locked: bool,
+        sens: f32,
+        smooth_x: f32,
+        smooth_y: f32,
+        prev_f2: bool,
+        prev_mb: bool,
+        prev_f3: bool,
+        prev_f4: bool,
+        cursor_hidden: bool,
+        cursor_clipped: bool,
+        clip_rect: Option<RECT>,
+        last_center: Option<(i32, i32)>,
+    }
+
+    impl MouseLook {
+        fn from_env() -> Self {
+            let enabled = parse_mouse_enabled(std::env::var("VICTORY_MOUSE_LOOK").ok().as_deref());
+            let sens = parse_mouse_sens(std::env::var("VICTORY_MOUSE_SENS").ok().as_deref());
+            tracing::info!(
+                enabled,
+                sens = format_args!("{sens:.2}"),
+                "mouse look ready (F2/MMB toggle, Esc unlock, F3/F4 sensitivity)"
+            );
+            Self {
+                enabled,
+                locked: false,
+                sens,
+                smooth_x: 0.0,
+                smooth_y: 0.0,
+                prev_f2: false,
+                prev_mb: false,
+                prev_f3: false,
+                prev_f4: false,
+                cursor_hidden: false,
+                cursor_clipped: false,
+                clip_rect: None,
+                last_center: None,
+            }
+        }
+
+        fn set_cursor_hidden(&mut self, hide: bool) {
+            if self.cursor_hidden == hide {
+                return;
+            }
+            // SAFETY: strictly paired so every `ShowCursor(0)` is matched by one `ShowCursor(1)`.
+            unsafe {
+                ShowCursor(i32::from(!hide));
+            }
+            self.cursor_hidden = hide;
+        }
+
+        fn set_cursor_clip(&mut self, rect: Option<RECT>) {
+            match rect {
+                Some(r) => {
+                    let same = self.clip_rect.is_some_and(|c| {
+                        c.left == r.left
+                            && c.top == r.top
+                            && c.right == r.right
+                            && c.bottom == r.bottom
+                    });
+                    if !self.cursor_clipped || !same {
+                        // SAFETY: valid screen bounds of our foreground client area.
+                        if unsafe { ClipCursor(&r) } != 0 {
+                            self.cursor_clipped = true;
+                            self.clip_rect = Some(r);
+                        }
+                    }
+                }
+                None => {
+                    if self.cursor_clipped {
+                        // SAFETY: null releases the cursor clip rectangle.
+                        unsafe {
+                            ClipCursor(std::ptr::null());
+                        }
+                        self.cursor_clipped = false;
+                        self.clip_rect = None;
+                    }
+                }
+            }
+        }
+
+        fn unlock(&mut self) {
+            let was_locked = self.locked;
+            self.locked = false;
+            self.smooth_x = 0.0;
+            self.smooth_y = 0.0;
+            self.last_center = None;
+            self.set_cursor_clip(None);
+            self.set_cursor_hidden(false);
+            if was_locked {
+                tracing::info!("mouse look unlocked");
+            }
+        }
+
+        fn poll(&mut self) -> PadState {
+            if !self.enabled {
+                return PadState::default();
+            }
+
+            let Some(hwnd) = foreground_ours() else {
+                self.unlock();
+                self.prev_f2 = false;
+                self.prev_mb = false;
+                self.prev_f3 = false;
+                self.prev_f4 = false;
+                return PadState::default();
+            };
+
+            let key_down = |vk: i32| {
+                // SAFETY: plain async key state query.
+                unsafe { GetAsyncKeyState(vk) < 0 }
+            };
+
+            let f2 = key_down(VK_F2);
+            let mb = key_down(VK_MBUTTON);
+            let f3 = key_down(VK_F3);
+            let f4 = key_down(VK_F4);
+            let esc = key_down(VK_ESCAPE);
+
+            let toggle = (f2 && !self.prev_f2) || (mb && !self.prev_mb);
+            let dec_sens = f3 && !self.prev_f3;
+            let inc_sens = f4 && !self.prev_f4;
+
+            self.prev_f2 = f2;
+            self.prev_mb = mb;
+            self.prev_f3 = f3;
+            self.prev_f4 = f4;
+
+            if dec_sens || inc_sens {
+                let mut next = self.sens;
+                if dec_sens {
+                    next /= MOUSE_SENS_STEP;
+                }
+                if inc_sens {
+                    next *= MOUSE_SENS_STEP;
+                }
+                self.sens = next.clamp(MOUSE_SENS_MIN, MOUSE_SENS_MAX);
+                tracing::info!(
+                    sens = format_args!("{:.2}", self.sens),
+                    "mouse look sensitivity"
+                );
+            }
+
+            if self.locked && esc {
+                self.unlock();
+                return PadState::default();
+            }
+
+            if toggle {
+                if self.locked {
+                    self.unlock();
+                    return PadState::default();
+                }
+                if let Some((screen, cx, cy)) = client_rect_screen(hwnd) {
+                    self.locked = true;
+                    self.smooth_x = 0.0;
+                    self.smooth_y = 0.0;
+                    self.set_cursor_hidden(true);
+                    self.set_cursor_clip(Some(screen));
+                    // SAFETY: centering cursor inside our foreground window on lock.
+                    unsafe {
+                        SetCursorPos(cx, cy);
+                    }
+                    self.last_center = Some((cx, cy));
+                    tracing::info!(
+                        sens = format_args!("{:.2}", self.sens),
+                        "mouse look locked"
+                    );
+                }
+                return PadState::default();
+            }
+
+            if !self.locked {
+                return PadState::default();
+            }
+
+            let Some((screen, cx, cy)) = client_rect_screen(hwnd) else {
+                self.unlock();
+                return PadState::default();
+            };
+            self.set_cursor_clip(Some(screen));
+
+            let (dx, dy) = if self.last_center == Some((cx, cy)) {
+                let mut pos = POINT::default();
+                // SAFETY: `pos` receives the current screen cursor position.
+                if unsafe { GetCursorPos(&mut pos) } != 0 {
+                    let dx = pos.x - cx;
+                    let dy = pos.y - cy;
+                    if dx != 0 || dy != 0 {
+                        // SAFETY: recentering cursor for next relative delta.
+                        unsafe {
+                            SetCursorPos(cx, cy);
+                        }
+                    }
+                    (dx, dy)
+                } else {
+                    (0, 0)
+                }
+            } else {
+                // Window moved or resized; recenter cleanly without a delta spike.
+                // SAFETY: centering cursor to the updated client center.
+                unsafe {
+                    SetCursorPos(cx, cy);
+                }
+                self.last_center = Some((cx, cy));
+                (0, 0)
+            };
+
+            let (rx, ry) = mouse_delta_to_stick(dx, dy, self.sens, self.smooth_x, self.smooth_y);
+            self.smooth_x = rx;
+            self.smooth_y = ry;
+
+            PadState {
+                left_trigger: if key_down(VK_RBUTTON) { 1.0 } else { 0.0 },
+                right_trigger: if key_down(VK_LBUTTON) { 1.0 } else { 0.0 },
+                right_x: rx,
+                right_y: ry,
+                ..Default::default()
+            }
+        }
+    }
+
+    impl Drop for MouseLook {
+        fn drop(&mut self) {
+            self.unlock();
+        }
+    }
+
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        mouse: MouseLook,
+    }
+
+    impl Default for Host {
+        fn default() -> Self {
+            Self {
+                empty_until: Default::default(),
+                mouse: MouseLook::from_env(),
+            }
+        }
     }
 
     impl Source for Host {
@@ -1153,7 +1524,9 @@ mod host {
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                    if let Some(&(_, button)) =
+                        super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
+                    {
                         pad.buttons |= button;
                     }
                 }
@@ -1186,6 +1559,10 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn mouse_pad(&mut self) -> PadState {
+            self.mouse.poll()
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1237,14 +1614,60 @@ mod host {
             .collect()
     }
 
-    /// The foreground window is one of ours (the title's or our fallback).
-    fn focused() -> bool {
-        let mut process = 0;
+    /// Screen-space client rectangle and its center for `hwnd`, if non-degenerate.
+    fn client_rect_screen(hwnd: HWND) -> Option<(RECT, i32, i32)> {
+        let mut rect = RECT::default();
+        // SAFETY: `hwnd` is a window of our process; `rect` receives client bounds.
+        if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
+            return None;
+        }
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        if w < 4 || h < 4 {
+            return None;
+        }
+        let mut tl = POINT {
+            x: rect.left,
+            y: rect.top,
+        };
+        let mut br = POINT {
+            x: rect.right,
+            y: rect.bottom,
+        };
+        // SAFETY: converting client corners of `hwnd` to screen coordinates.
+        if unsafe { ClientToScreen(hwnd, &mut tl) } == 0
+            || unsafe { ClientToScreen(hwnd, &mut br) } == 0
+        {
+            return None;
+        }
+        let screen = RECT {
+            left: tl.x.min(br.x),
+            top: tl.y.min(br.y),
+            right: tl.x.max(br.x),
+            bottom: tl.y.max(br.y),
+        };
+        let cx = screen.left + (screen.right - screen.left) / 2;
+        let cy = screen.top + (screen.bottom - screen.top) / 2;
+        Some((screen, cx, cy))
+    }
+
+    /// The foreground window when it belongs to our process.
+    fn foreground_ours() -> Option<HWND> {
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
-            process == GetCurrentProcessId()
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() {
+                return None;
+            }
+            let mut process = 0;
+            GetWindowThreadProcessId(hwnd, &mut process);
+            (process == GetCurrentProcessId()).then_some(hwnd)
         }
+    }
+
+    /// The foreground window is one of ours (the title's or our fallback).
+    fn focused() -> bool {
+        foreground_ours().is_some()
     }
 
     #[test]
@@ -1284,6 +1707,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: PadState,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1295,6 +1719,9 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
+        }
+        fn mouse_pad(&mut self) -> PadState {
+            self.0.lock().unwrap().mouse
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1625,5 +2052,160 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn mouse_delta_decays_to_zero_when_still() {
+        let (mut x, mut y) = (0.8, -0.6);
+        let (x1, y1) = mouse_delta_to_stick(0, 0, 1.0, x, y);
+        assert!((x1 - 0.8 * MOUSE_STOP_DECAY).abs() < 1e-5);
+        assert!((y1 - (-0.6 * MOUSE_STOP_DECAY)).abs() < 1e-5);
+        x = x1;
+        y = y1;
+        for _ in 0..8 {
+            (x, y) = mouse_delta_to_stick(0, 0, 1.0, x, y);
+        }
+        assert_eq!((x, y), (0.0, 0.0));
+        assert_eq!(mouse_delta_to_stick(0, 0, 1.0, 0.0, 0.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn mouse_delta_sign_convention_right_and_up_positive() {
+        let (rx, ry) = mouse_delta_to_stick(10, 0, 1.0, 0.0, 0.0);
+        assert!(rx > 0.0 && ry == 0.0);
+
+        let (lx, ly) = mouse_delta_to_stick(-10, 0, 1.0, 0.0, 0.0);
+        assert!(lx < 0.0 && ly == 0.0);
+        assert!((rx + lx).abs() < 1e-5);
+
+        // Screen Y grows downward; Xbox right stick +Y is up.
+        let (ux, uy) = mouse_delta_to_stick(0, -10, 1.0, 0.0, 0.0);
+        assert!(ux == 0.0 && uy > 0.0);
+
+        let (dx, dy) = mouse_delta_to_stick(0, 10, 1.0, 0.0, 0.0);
+        assert!(dx == 0.0 && dy < 0.0);
+        assert!((uy + dy).abs() < 1e-5);
+
+        // Radial curve preserves exact 45-degree symmetry without axial snap.
+        let (diag_x, diag_y) = mouse_delta_to_stick(10, -10, 1.0, 0.0, 0.0);
+        assert!(diag_x > 0.0 && diag_y > 0.0);
+        assert!((diag_x - diag_y).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mouse_delta_clamps_to_unit_range() {
+        let (rx, ry) = mouse_delta_to_stick(5000, 0, 5.0, 1.0, 0.0);
+        assert_eq!((rx, ry), (1.0, 0.0));
+
+        let (lx, dy) = mouse_delta_to_stick(-5000, 5000, 5.0, -1.0, -1.0);
+        assert!((-1.0..=0.0).contains(&lx) && (-1.0..=0.0).contains(&dy));
+        assert!(lx < -0.5 && dy < -0.5);
+
+        // Out-of-bounds previous state and invalid sensitivity stay bounded.
+        let (cx, cy) = mouse_delta_to_stick(0, 0, 1.0, 4.0, -4.0);
+        assert!((-1.0..=1.0).contains(&cx) && (-1.0..=1.0).contains(&cy));
+        assert_eq!(mouse_delta_to_stick(10, -10, 0.0, 0.5, 0.5), (0.0, 0.0));
+        assert_eq!(mouse_delta_to_stick(10, -10, f32::NAN, 0.5, 0.5), (0.0, 0.0));
+    }
+
+    #[test]
+    fn mouse_delta_deadzone_breakout_on_micro_aim() {
+        let (small_x, small_y) = mouse_delta_to_stick(1, 0, 1.0, 0.0, 0.0);
+        assert!(
+            small_x > 0.15 && small_x < 0.35,
+            "1px micro-aim should clear ~0.15 inner deadzone gently, got {small_x}"
+        );
+        assert_eq!(small_y, 0.0);
+
+        let (up_x, up_y) = mouse_delta_to_stick(0, -1, 1.0, 0.0, 0.0);
+        assert_eq!(up_x, 0.0);
+        assert!(up_y > 0.15 && up_y < 0.35);
+
+        let (med_x, _) = mouse_delta_to_stick(8, 0, 1.0, 0.0, 0.0);
+        assert!(med_x > small_x);
+
+        let (low_sens, _) = mouse_delta_to_stick(8, 0, 0.5, 0.0, 0.0);
+        let (high_sens, _) = mouse_delta_to_stick(8, 0, 2.0, 0.0, 0.0);
+        assert!(high_sens > med_x && med_x > low_sens);
+    }
+
+    #[test]
+    fn mouse_pad_merges_with_keyboard_fallback_and_pc_aliases() {
+        let (hub, host) = fake();
+
+        // New PC convenience aliases: Space -> A, Left Shift -> LEFT_STICK.
+        host.lock().unwrap().keys = vec![key(0x20), key(0xA0), key(b'W'), key(b'Z'), key(b'L')];
+        host.lock().unwrap().mouse = PadState {
+            left_trigger: 0.0,
+            right_trigger: 1.0,
+            right_x: 0.5,
+            right_y: 0.4,
+            ..Default::default()
+        };
+        hub.poll();
+
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: A | LEFT_STICK,
+                left_trigger: 1.0,
+                right_trigger: 1.0,
+                left_y: 1.0,
+                right_x: 1.0, // (1.0 from L + 0.5 from mouse).clamp(-1.0, 1.0)
+                right_y: 0.4,
+                ..Default::default()
+            }
+        );
+        release(r);
+
+        // Opposing keyboard J (-1.0) + mouse (+0.3) blends smoothly; legacy Enter/F still work.
+        host.lock().unwrap().keys = vec![key(0x0D), key(b'F'), key(b'J')];
+        host.lock().unwrap().mouse = PadState {
+            left_trigger: 1.0,
+            right_x: 0.3,
+            right_y: -0.6,
+            ..Default::default()
+        };
+        hub.poll();
+
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let state = pad(r);
+        release(r);
+        assert_eq!(state.buttons, A | LEFT_STICK);
+        assert_eq!(state.left_trigger, 1.0);
+        assert_eq!(state.right_trigger, 0.0);
+        assert!((state.right_x - (-0.7)).abs() < 1e-5);
+        assert!((state.right_y - (-0.6)).abs() < 1e-5);
+
+        // Default `Source::mouse_pad` compiles cleanly without overriding.
+        struct Minimal;
+        impl Source for Minimal {
+            fn pad(&mut self, _: usize) -> Option<PadState> {
+                None
+            }
+            fn keys(&mut self) -> Vec<KeyState> {
+                Vec::new()
+            }
+            fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        }
+        assert_eq!(Minimal.mouse_pad(), PadState::default());
+    }
+
+    #[test]
+    fn mouse_env_parsing_handles_defaults_and_bounds() {
+        assert!(parse_mouse_enabled(None));
+        assert!(parse_mouse_enabled(Some("1")));
+        assert!(parse_mouse_enabled(Some("true")));
+        assert!(!parse_mouse_enabled(Some("0")));
+        assert!(!parse_mouse_enabled(Some(" false ")));
+        assert!(!parse_mouse_enabled(Some("OFF")));
+
+        assert_eq!(parse_mouse_sens(None), 1.0);
+        assert_eq!(parse_mouse_sens(Some("2.5")), 2.5);
+        assert_eq!(parse_mouse_sens(Some("0.01")), MOUSE_SENS_MIN);
+        assert_eq!(parse_mouse_sens(Some("99.0")), MOUSE_SENS_MAX);
+        assert_eq!(parse_mouse_sens(Some("not-a-number")), 1.0);
+        assert_eq!(parse_mouse_sens(Some("NaN")), 1.0);
     }
 }
