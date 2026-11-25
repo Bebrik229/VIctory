@@ -87,6 +87,7 @@ fn compute_pipeline(used: &[UsedResource]) -> HostPipeline {
             },
             used: used.to_vec(),
             stores: false,
+            address_stores: false,
         })
         .into(),
     };

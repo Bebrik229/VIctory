@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -1430,16 +1430,20 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
-    std::thread::scope(|s| {
-        for i in 0..threads {
-            let at = (i * each).min(len);
-            let n = each.min(len - at);
-            s.spawn(move || {
-                // SAFETY: a part of the caller's ranges.
-                unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
-            });
+    let mut jobs: Vec<Job> = Vec::with_capacity(threads);
+    for i in 0..threads {
+        let at = (i * each).min(len);
+        let n = each.min(len - at);
+        if n == 0 {
+            continue;
         }
-    });
+        jobs.push(Box::new(move || {
+            // SAFETY: a part of the caller's ranges; `wide` does not return
+            // until every job finishes.
+            unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+        }));
+    }
+    wide(jobs);
 }
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
@@ -1486,7 +1490,11 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 16))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 8)));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1508,6 +1516,12 @@ fn workers() -> &'static Workers {
     workers
 }
 
+struct Done {
+    left: AtomicUsize,
+    lock: Mutex<()>,
+    more: std::sync::Condvar,
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
@@ -1518,17 +1532,20 @@ fn wide(jobs: Vec<Job>) {
         return;
     }
     let workers = workers();
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let done = Arc::new(Done {
+        left: AtomicUsize::new(jobs.len()),
+        lock: Mutex::new(()),
+        more: std::sync::Condvar::new(),
+    });
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
-            let left = left.clone();
+            let done = done.clone();
             queue.push_back(Box::new(move || {
                 job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
+                if done.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    let _held = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+                    done.more.notify_all();
                 }
             }));
         }
@@ -1541,9 +1558,11 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    if done.left.load(Ordering::Acquire) > 0 {
+        let mut held = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while done.left.load(Ordering::Acquire) > 0 {
+            held = done.more.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 
@@ -1744,7 +1763,7 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, WIDE_JOB, copy_jobs, copy_wide, find_pieces, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1822,6 +1841,63 @@ mod wide_tests {
         scans.push((0, 0, 0, 0, 0));
         wanted.push(Vec::new());
         assert_eq!(find_pieces(scans), wanted);
+    }
+
+    /// Atomic completion handles repeated batches and nested `wide` calls
+    /// without lost wakeups or deadlocks.
+    #[test]
+    fn wide_atomic_completion_and_nested_calls_finish_cleanly() {
+        for _ in 0..100 {
+            let ran = Arc::new(AtomicUsize::new(0));
+            let jobs: Vec<Job> = (0..16)
+                .map(|_| {
+                    let ran = ran.clone();
+                    Box::new(move || {
+                        ran.fetch_add(1, Ordering::Relaxed);
+                    }) as Job
+                })
+                .collect();
+            wide(jobs);
+            assert_eq!(ran.load(Ordering::Acquire), 16);
+        }
+
+        let outer_ran = Arc::new(AtomicUsize::new(0));
+        let inner_ran = Arc::new(AtomicUsize::new(0));
+        let outer: Vec<Job> = (0..12)
+            .map(|_| {
+                let outer_ran = outer_ran.clone();
+                let inner_ran = inner_ran.clone();
+                Box::new(move || {
+                    let inner: Vec<Job> = (0..8)
+                        .map(|_| {
+                            let inner_ran = inner_ran.clone();
+                            Box::new(move || {
+                                inner_ran.fetch_add(1, Ordering::Relaxed);
+                            }) as Job
+                        })
+                        .collect();
+                    wide(inner);
+                    outer_ran.fetch_add(1, Ordering::Relaxed);
+                }) as Job
+            })
+            .collect();
+        wide(outer);
+        assert_eq!(outer_ran.load(Ordering::Acquire), 12);
+        assert_eq!(inner_ran.load(Ordering::Acquire), 12 * 8);
+    }
+
+    /// `copy_wide` dispatches multi-thread copies (>= 32 MiB) onto `wide`
+    /// and completes every byte before returning.
+    #[test]
+    fn copy_wide_copies_multi_thread_range_exact() {
+        let len: usize = 34 << 20;
+        let src: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) ^ (i >> 9)) as u8).collect();
+        let mut dst = vec![0u8; len];
+        // SAFETY: `src` and `dst` are disjoint 34 MiB allocations.
+        unsafe { copy_wide(src.as_ptr(), dst.as_mut_ptr(), len) };
+        assert!(src == dst);
+        drop(src);
+        drop(dst);
     }
 }
 
@@ -2824,15 +2900,22 @@ impl Shadow {
     /// when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
         let (start, data) = (self.start as usize, self.data as usize);
-        let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
+        let before_ptr = before.as_ptr() as usize;
+        let scan = move |a: usize, b: usize| -> Vec<(usize, usize)> {
             let mut found = Vec::new();
             let mut at = a;
             while at < b {
                 let n = (PIECE - (start + at) % PIECE).min(b - at);
                 // SAFETY: inside the mapping, which nothing writes while a
-                // submission's results are compared.
-                let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
-                if host != &before[at - from..at - from + n] {
+                // submission's results are compared, and `before` stays valid
+                // until `differing` returns (`wide` finishes every job first).
+                let (host, prev) = unsafe {
+                    (
+                        std::slice::from_raw_parts((data + at) as *const u8, n),
+                        std::slice::from_raw_parts((before_ptr + (at - from)) as *const u8, n),
+                    )
+                };
+                if host != prev {
                     found.push((at, n));
                 }
                 at += n;
@@ -2852,22 +2935,28 @@ impl Shadow {
             let at = from + (to - from) / threads * i;
             (at - (start + at) % PIECE).max(from)
         };
-        let scan = &scan;
-        std::thread::scope(|s| {
-            let parts: Vec<_> = (0..threads)
-                .map(|i| {
-                    let (a, b) = (cut(i), cut(i + 1));
-                    s.spawn(move || scan(a, b))
-                })
-                .collect();
-            parts
-                .into_iter()
-                .flat_map(|part| match part.join() {
-                    Ok(found) => found,
-                    Err(panic) => std::panic::resume_unwind(panic),
-                })
-                .collect()
-        })
+        let parts: Arc<Vec<Mutex<Vec<(usize, usize)>>>> =
+            Arc::new((0..threads).map(|_| Mutex::new(Vec::new())).collect());
+        let mut jobs: Vec<Job> = Vec::with_capacity(threads);
+        for i in 0..threads {
+            let (a, b) = (cut(i), cut(i + 1));
+            if a >= b {
+                continue;
+            }
+            let parts = parts.clone();
+            jobs.push(Box::new(move || {
+                let found = scan(a, b);
+                if !found.is_empty() {
+                    *parts[i].lock().unwrap_or_else(|e| e.into_inner()) = found;
+                }
+            }));
+        }
+        wide(jobs);
+        let mut out = Vec::new();
+        for part in parts.iter() {
+            out.extend(std::mem::take(&mut *part.lock().unwrap_or_else(|e| e.into_inner())));
+        }
+        out
     }
 
     /// After [`Shadow::copy_back`] of a submission's ranges: every submitted

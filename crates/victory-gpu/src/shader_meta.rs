@@ -1,6 +1,6 @@
 //! Persistent per-shader metadata cache (`shader-meta.bin`).
 //!
-//! Stores `(used, stores)` keyed by the 32-byte BLAKE3 hash of the console
+//! Stores `(used, stores, address_stores)` keyed by the 32-byte BLAKE3 hash of the console
 //! shader container so warm pipeline-cache loads skip `Container::parse`, zlib
 //! decompression (`native_programs`), and RDNA2 instruction scanning.
 
@@ -13,9 +13,9 @@ use victory_shader::{ResourceType, RootType, UsedResource};
 
 const FILE_NAME: &str = "shader-meta.bin";
 const MAGIC: &[u8; 4] = b"VSM1";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
-type MetaEntry = (Vec<UsedResource>, bool);
+type MetaEntry = (Vec<UsedResource>, bool, bool);
 type MetaMap = HashMap<[u8; 32], MetaEntry>;
 
 struct MetaStore {
@@ -57,13 +57,13 @@ pub(crate) fn init(dir: &Path) {
     }
 }
 
-/// Returns cached `(used, stores)` for `hash`, or computes and inserts it on miss.
+/// Returns cached `(used, stores, address_stores)` for `hash`, or computes and inserts it on miss.
 pub(crate) fn get_or_compute<F>(
     hash: &[u8; 32],
     compute: F,
-) -> Result<(Vec<UsedResource>, bool), String>
+) -> Result<(Vec<UsedResource>, bool, bool), String>
 where
-    F: FnOnce() -> Result<(Vec<UsedResource>, bool), String>,
+    F: FnOnce() -> Result<(Vec<UsedResource>, bool, bool), String>,
 {
     get_or_compute_in(global_store(), hash, compute)
 }
@@ -180,9 +180,10 @@ fn encode(map: &MetaMap) -> Vec<u8> {
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&(map.len() as u32).to_le_bytes());
-    for (hash, (used, stores)) in map {
+    for (hash, (used, stores, address_stores)) in map {
         out.extend_from_slice(hash);
         out.push(u8::from(*stores));
+        out.push(u8::from(*address_stores));
         out.extend_from_slice(&(used.len() as u32).to_le_bytes());
         for res in used {
             encode_resource_type(&mut out, res.kind);
@@ -245,7 +246,7 @@ impl<'a> Reader<'a> {
 }
 
 fn decode(bytes: &[u8]) -> Option<MetaMap> {
-    const MIN_ENTRY_BYTES: usize = 32 + 1 + 4;
+    const MIN_ENTRY_BYTES: usize = 32 + 1 + 1 + 4;
     const MIN_RESOURCE_BYTES: usize = 1 + 1 + 4 + 4 + 4 + 1 + 1 + 1;
 
     let mut r = Reader(bytes);
@@ -269,6 +270,11 @@ fn decode(bytes: &[u8]) -> Option<MetaMap> {
             1 => true,
             _ => return None,
         };
+        let address_stores = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
         let used_len = r.u32()? as usize;
         if used_len.checked_mul(MIN_RESOURCE_BYTES)? > r.0.len() {
             return None;
@@ -286,7 +292,7 @@ fn decode(bytes: &[u8]) -> Option<MetaMap> {
                 slot: r.u8()?,
             });
         }
-        map.insert(hash, (used, stores));
+        map.insert(hash, (used, stores, address_stores));
     }
 
     r.0.is_empty().then_some(map)
@@ -336,20 +342,20 @@ mod tests {
         let mut map = HashMap::new();
         let h1 = [0x11u8; 32];
         let h2 = [0x22u8; 32];
-        map.insert(h1, (sample_resources(), true));
-        map.insert(h2, (Vec::new(), false));
+        map.insert(h1, (sample_resources(), true, false));
+        map.insert(h2, (Vec::new(), false, false));
 
         let bytes = encode(&map);
         let decoded = decode(&bytes).expect("valid encoded map must decode");
         assert_eq!(decoded, map);
 
-        // Wrong magic and version.
+        // Wrong magic and version (including v1).
         let mut bad_magic = bytes.clone();
         bad_magic[3] = b'0';
         assert_eq!(decode(&bad_magic), None);
 
         let mut bad_ver = bytes.clone();
-        bad_ver[4..8].copy_from_slice(&2u32.to_le_bytes());
+        bad_ver[4..8].copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(decode(&bad_ver), None);
 
         // Truncated at any point and trailing garbage.
@@ -360,12 +366,16 @@ mod tests {
         trailing.push(0);
         assert_eq!(decode(&trailing), None);
 
-        // Invalid stores byte on a single-entry payload.
+        // Invalid stores or address_stores byte on a single-entry payload.
         let mut single = HashMap::new();
-        single.insert(h2, (Vec::new(), true));
+        single.insert(h2, (Vec::new(), true, false));
         let mut bad_stores = encode(&single);
         bad_stores[12 + 32] = 2;
         assert_eq!(decode(&bad_stores), None);
+
+        let mut bad_address_stores = encode(&single);
+        bad_address_stores[12 + 32 + 1] = 2;
+        assert_eq!(decode(&bad_address_stores), None);
     }
 
     #[test]
@@ -375,7 +385,7 @@ mod tests {
         assert!(!store.read().unwrap().dirty);
 
         let hash = [0xABu8; 32];
-        let expected = (sample_resources(), true);
+        let expected = (sample_resources(), true, false);
         let runs = AtomicU64::new(0);
 
         // Miss computes once and marks store dirty.
@@ -391,7 +401,7 @@ mod tests {
         // Second lookup on the same store hits without recomputing.
         let got2 = get_or_compute_in(&store, &hash, || {
             runs.fetch_add(1, Ordering::Relaxed);
-            Ok((Vec::new(), false))
+            Ok((Vec::new(), false, false))
         })
         .unwrap();
         assert_eq!(got2, expected);
@@ -415,7 +425,7 @@ mod tests {
         assert!(!reloaded.read().unwrap().dirty);
         let got3 = get_or_compute_in(&reloaded, &hash, || {
             runs.fetch_add(1, Ordering::Relaxed);
-            Ok((Vec::new(), false))
+            Ok((Vec::new(), false, false))
         })
         .unwrap();
         assert_eq!(got3, expected);

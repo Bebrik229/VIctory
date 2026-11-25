@@ -890,6 +890,174 @@ impl Tracked {
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+/// Block numbers as bits, in chunks of 4096 blocks (256 MiB of address
+/// space). The guards' checks look at every block of a range under the
+/// guards' lock, which every copy's check waits for: a bit is several times
+/// quicker to look at than a tree's node.
+struct BlockSet {
+    chunks: std::collections::HashMap<usize, Box<[u64; 64]>, std::hash::BuildHasherDefault<ChunkHash>>,
+}
+
+/// Chunk numbers are spread enough by a multiplication.
+#[derive(Default)]
+struct ChunkHash(u64);
+
+impl std::hash::Hasher for ChunkHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+impl BlockSet {
+    const SHIFT: usize = 12;
+
+    const fn new() -> Self {
+        Self { chunks: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
+    }
+
+    fn at(block: usize) -> (usize, usize, u64) {
+        let bit = block & ((1 << Self::SHIFT) - 1);
+        (block >> Self::SHIFT, bit / 64, 1u64 << (bit % 64))
+    }
+
+    fn contains(&self, block: &usize) -> bool {
+        let (chunk, word, bit) = Self::at(*block);
+        self.chunks.get(&chunk).is_some_and(|c| c[word] & bit != 0)
+    }
+
+    /// Whether it was not in the set.
+    fn insert(&mut self, block: usize) -> bool {
+        let (chunk, word, bit) = Self::at(block);
+        let c = self.chunks.entry(chunk).or_insert_with(|| Box::new([0; 64]));
+        let new = c[word] & bit == 0;
+        c[word] |= bit;
+        new
+    }
+
+    /// Whether it was in the set.
+    fn remove(&mut self, block: &usize) -> bool {
+        let (chunk, word, bit) = Self::at(*block);
+        let Some(c) = self.chunks.get_mut(&chunk) else { return false };
+        let had = c[word] & bit != 0;
+        c[word] &= !bit;
+        had
+    }
+
+    /// Calls `f` for each `(word_index, mask)` of `chunk` overlapping `first..last`.
+    fn chunk_words<F: FnMut(usize, u64) -> bool>(chunk: usize, first: usize, last: usize, mut f: F) -> bool {
+        let base = chunk << Self::SHIFT;
+        let c_start = first.saturating_sub(base);
+        let c_end = (last - base).min(1 << Self::SHIFT);
+        let w_first = c_start / 64;
+        let w_last = (c_end - 1) / 64;
+        for w in w_first..=w_last {
+            let lo = if w == w_first { !0u64 << (c_start % 64) } else { !0u64 };
+            let hi = if w == w_last && c_end % 64 != 0 {
+                !0u64 >> (64 - (c_end % 64))
+            } else {
+                !0u64
+            };
+            if !f(w, lo & hi) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether every block in `first..last` is in the set, without allocating.
+    fn all_in_range(&self, first: usize, last: usize) -> bool {
+        if first >= last {
+            return true;
+        }
+        let (first_chunk, last_chunk) = (first >> Self::SHIFT, (last - 1) >> Self::SHIFT);
+        for chunk in first_chunk..=last_chunk {
+            let Some(bits) = self.chunks.get(&chunk) else {
+                return false;
+            };
+            if !Self::chunk_words(chunk, first, last, |w, mask| (bits[w] & mask) == mask) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Number of blocks of `range` in the set, without allocating.
+    fn count_range(&self, range: std::ops::Range<usize>) -> usize {
+        if range.start >= range.end {
+            return 0;
+        }
+        let (first_chunk, last_chunk) = (range.start >> Self::SHIFT, (range.end - 1) >> Self::SHIFT);
+        let mut count = 0;
+        let mut count_chunk = |chunk: usize, bits: &[u64; 64]| {
+            Self::chunk_words(chunk, range.start, range.end, |w, mask| {
+                count += (bits[w] & mask).count_ones() as usize;
+                true
+            });
+        };
+        if last_chunk - first_chunk < self.chunks.len() {
+            for chunk in first_chunk..=last_chunk {
+                if let Some(bits) = self.chunks.get(&chunk) {
+                    count_chunk(chunk, bits);
+                }
+            }
+        } else {
+            for (&chunk, bits) in &self.chunks {
+                if (first_chunk..=last_chunk).contains(&chunk) {
+                    count_chunk(chunk, bits);
+                }
+            }
+        }
+        count
+    }
+
+    /// The blocks of `range` in the set, in order.
+    fn range(&self, range: std::ops::Range<usize>) -> std::vec::IntoIter<usize> {
+        let mut found = Vec::new();
+        if range.start < range.end {
+            let (first, last) = (range.start >> Self::SHIFT, (range.end - 1) >> Self::SHIFT);
+            let mut chunks: Vec<usize> = if last - first < self.chunks.len() {
+                (first..=last).filter(|c| self.chunks.contains_key(c)).collect()
+            } else {
+                let mut all: Vec<usize> =
+                    self.chunks.keys().copied().filter(|c| (first..=last).contains(c)).collect();
+                all.sort_unstable();
+                all
+            };
+            chunks.dedup();
+            for chunk in chunks {
+                let bits = &self.chunks[&chunk];
+                for (w, &word) in bits.iter().enumerate() {
+                    let mut word = word;
+                    while word != 0 {
+                        let block = (chunk << Self::SHIFT) + w * 64 + word.trailing_zeros() as usize;
+                        word &= word - 1;
+                        if range.contains(&block) {
+                            found.push(block);
+                        }
+                    }
+                }
+            }
+        }
+        found.into_iter()
+    }
+}
+
+impl Extend<usize> for BlockSet {
+    fn extend<I: IntoIterator<Item = usize>>(&mut self, blocks: I) {
+        for block in blocks {
+            self.insert(block);
+        }
+    }
+}
+
 /// Whether env vars force asking the kernel even for blocks already held by
 /// the guards (`VICTORY_VIEW_ASK=1` or `VICTORY_GUARD_ASK=1`).
 fn force_view_ask() -> bool {
@@ -919,12 +1087,12 @@ fn known_view(start: usize) -> bool {
 
 struct Guards {
     /// Blocks we made read-only.
-    protected: BTreeSet<usize>,
+    protected: BlockSet,
     /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
+    clean: BlockSet,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
-    absent: BTreeSet<usize>,
+    absent: BlockSet,
     /// Blocks whose physical page was guarded together with its other views
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
@@ -971,9 +1139,9 @@ impl Guards {
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
-    protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
-    absent: BTreeSet::new(),
+    protected: BlockSet::new(),
+    clean: BlockSet::new(),
+    absent: BlockSet::new(),
     aliased: BTreeSet::new(),
     pins: Vec::new(),
 });
@@ -1016,11 +1184,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
+    if g.clean.all_in_range(first, last) {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
     }
+    let clean: Vec<usize> = g.clean.range(first..last).collect();
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
@@ -1264,7 +1432,6 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
         .collect();
     for &block in &blocks {
         g.protected.remove(&block);
@@ -1393,7 +1560,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     let opened = {
         let mut g = guards();
-        let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
+        let guarded = g.protected.count_range(at / BLOCK..end.div_ceil(BLOCK)) as u64;
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
         }
@@ -1570,11 +1737,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     {
         let mut g = guards();
         let range = at / BLOCK..end.div_ceil(BLOCK);
-        let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
+        let absent: Vec<usize> = g.absent.range(range.clone()).collect();
         for block in absent {
             g.absent.remove(&block);
         }
-        let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
+        let blocks: Vec<usize> = g.protected.range(range.clone()).collect();
         for block in blocks {
             g.protected.remove(&block);
             g.clean.remove(&block);
@@ -1934,6 +2101,141 @@ fn writable(at: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bit set answers as a tree does, ranges across chunks included.
+    #[test]
+    fn block_set_matches_a_tree() {
+        let mut set = BlockSet::new();
+        let mut tree = BTreeSet::new();
+        let mut x = 12345u64;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let block = ((x >> 33) % 30_000) as usize + if x & 1 == 0 { 0 } else { 1 << 30 };
+            if x & 6 == 0 {
+                assert_eq!(set.remove(&block), tree.remove(&block));
+            } else {
+                assert_eq!(set.insert(block), tree.insert(block));
+            }
+            assert_eq!(set.contains(&block), tree.contains(&block));
+        }
+        set.extend(5000..9000);
+        tree.extend(5000..9000);
+        for r in [0..30_000, 4095..4097, 8191..12_289, (1 << 30)..(1 << 30) + 30_000, 0..usize::MAX / 2] {
+            let ours: Vec<usize> = set.range(r.clone()).collect();
+            let theirs: Vec<usize> = tree.range(r).copied().collect();
+            assert_eq!(ours, theirs);
+        }
+    }
+
+    /// `all_in_range` and `count_range` match `BTreeSet` across empty,
+    /// single-bit, sub-word, multi-word, cross-chunk, and large sparse ranges.
+    #[test]
+    fn block_set_all_in_range_and_count_range_match_tree() {
+        let check_against_tree = |set: &BlockSet, tree: &BTreeSet<usize>, ranges: &[std::ops::Range<usize>]| {
+            for r in ranges {
+                let expected_count = if r.start < r.end {
+                    tree.range(r.clone()).count()
+                } else {
+                    0
+                };
+                let expected_all = r.start >= r.end || expected_count == (r.end - r.start);
+                assert_eq!(set.count_range(r.clone()), expected_count, "count_range mismatch for {r:?}");
+                assert_eq!(
+                    set.all_in_range(r.start, r.end),
+                    expected_all,
+                    "all_in_range mismatch for {r:?}"
+                );
+            }
+        };
+
+        // 1. Contiguous filled ranges: full and with 1 bit removed at start, middle, or end.
+        let filled_ranges = [
+            0..1,
+            63..64,
+            64..65,
+            4095..4096,
+            4096..4097,
+            1..62,
+            65..127,
+            4097..4150,
+            0..130,
+            60..200,
+            4000..4096,
+            4095..4097,
+            8191..12_289,
+            (1 << 30) - 5..(1 << 30) + 130,
+        ];
+        #[allow(clippy::reversed_empty_ranges)]
+        let empty_and_edge_probes = [
+            0..0,
+            10..10,
+            5000..4000,
+            0..1,
+            63..64,
+            64..65,
+            4095..4096,
+            4096..4097,
+            1..62,
+            65..127,
+            4097..4150,
+            0..130,
+            60..200,
+            4000..4096,
+            4095..4097,
+            8191..12_289,
+            (1 << 30) - 5..(1 << 30) + 130,
+            0..usize::MAX / 2,
+        ];
+
+        // Empty set check.
+        check_against_tree(&BlockSet::new(), &BTreeSet::new(), &empty_and_edge_probes);
+
+        for target in filled_ranges {
+            let mut set = BlockSet::new();
+            let mut tree = BTreeSet::new();
+            set.extend(target.clone());
+            tree.extend(target.clone());
+            assert!(set.all_in_range(target.start, target.end));
+            assert_eq!(set.count_range(target.clone()), target.end - target.start);
+            check_against_tree(&set, &tree, &empty_and_edge_probes);
+
+            let gaps = [
+                target.start,
+                target.start + (target.end - target.start) / 2,
+                target.end - 1,
+            ];
+            for gap in gaps {
+                let mut g_set = BlockSet::new();
+                let mut g_tree = BTreeSet::new();
+                g_set.extend(target.clone());
+                g_tree.extend(target.clone());
+                assert!(g_set.remove(&gap));
+                assert!(g_tree.remove(&gap));
+                assert!(!g_set.all_in_range(target.start, target.end));
+                assert_eq!(g_set.count_range(target.clone()), target.end - target.start - 1);
+                check_against_tree(&g_set, &g_tree, &empty_and_edge_probes);
+            }
+        }
+
+        // 2. Mixed random + dense chunks against BTreeSet.
+        let mut set = BlockSet::new();
+        let mut tree = BTreeSet::new();
+        let mut x = 67890u64;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let block = ((x >> 33) % 30_000) as usize + if x & 1 == 0 { 0 } else { 1 << 30 };
+            if x & 6 == 0 {
+                set.remove(&block);
+                tree.remove(&block);
+            } else {
+                set.insert(block);
+                tree.insert(block);
+            }
+        }
+        set.extend(4090..12_300);
+        tree.extend(4090..12_300);
+        check_against_tree(&set, &tree, &empty_and_edge_probes);
+    }
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
