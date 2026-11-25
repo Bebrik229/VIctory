@@ -1156,7 +1156,29 @@ fn pooled(n: usize) -> Vec<u8> {
         .map(|(i, _)| i);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+        None => {
+            let mut fresh = Vec::new();
+            if fresh.try_reserve_exact(n).is_ok() {
+                fresh
+            } else if let Some(i) = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.capacity() >= n)
+                .min_by_key(|(_, b)| b.capacity())
+                .map(|(i, _)| i)
+            {
+                // Under commit pressure, reuse an oversized pooled buffer
+                // rather than failing allocation while idle memory sits here.
+                tracing::warn!(bytes = n, "snapshot pool pressure: reusing oversized pooled buffer");
+                pool.swap_remove(i)
+            } else {
+                // Drop all idle snapshot buffers to free commit before retry.
+                let freed: usize = pool.iter().map(Vec::capacity).sum();
+                pool.clear();
+                tracing::warn!(bytes = n, freed, "snapshot pool pressure: cleared idle buffers before retry");
+                Vec::with_capacity(n)
+            }
+        }
     };
     v.clear();
     v
