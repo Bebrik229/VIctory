@@ -896,6 +896,45 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// Blocks the kernel is about to write for the runtime ([`writing`]),
+    /// from, to, and until when they are left writable: an asynchronous read
+    /// can land after the call returns, and the kernel fails rather than
+    /// faulting into our handler. Until expiry they stay writable and every
+    /// check reports them dirty.
+    pins: Vec<(usize, usize, std::time::Instant)>,
+}
+
+/// How long blocks stay writable after [`writing`].
+const PIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl Guards {
+    /// Whether `block` is left writable for an in-flight kernel write.
+    fn pinned(&self, block: usize) -> bool {
+        self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
+    }
+
+    /// Removes `[first, last)` from `pins`, splitting any pin that extends
+    /// beyond it (called on remap/unmap so reused virtual addresses never
+    /// inherit stale pins).
+    fn unpin(&mut self, first: usize, last: usize) {
+        if first >= last || self.pins.is_empty() {
+            return;
+        }
+        let mut next = Vec::with_capacity(self.pins.len());
+        for &(from, to, until) in &self.pins {
+            if to <= first || from >= last {
+                next.push((from, to, until));
+            } else {
+                if from < first {
+                    next.push((from, first, until));
+                }
+                if to > last {
+                    next.push((last, to, until));
+                }
+            }
+        }
+        self.pins = next;
+    }
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -903,6 +942,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    pins: Vec::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -931,6 +971,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     install();
     let mut g = guards();
+    if !g.pins.is_empty() {
+        let now = std::time::Instant::now();
+        g.pins.retain(|&(_, _, until)| until > now);
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -965,7 +1009,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
+            if g.pinned(block) {
+                // Kernel write may still be in flight: leave writable and bump
+                // `GUARD_REV` so `ask_once`/`ask_ahead` will not freeze this
+                // range in `ahead_guarded` while pinned.
+                GUARD_REV.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            } else if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
             } else {
@@ -1085,7 +1134,7 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(&block) {
+    if g.protected.contains(&block) || g.pinned(block) {
         return;
     }
     let mut old = 0;
@@ -1195,33 +1244,54 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
-/// kernel (which does not fault into our handler): opens its guarded blocks.
+/// kernel (which does not fault into our handler): opens its guarded blocks
+/// and pins them writable for [`PIN`] (including other views of the same
+/// physical pages) so asynchronous kernel reads cannot fail against a guard.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     // The length is the title's (`fread`'s size times count, saturated).
     let end = at.saturating_add(len);
-    let (any, mut aliases) = {
+    let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+    let until = std::time::Instant::now() + PIN;
+    let aliases = {
         let mut g = guards();
-        let res = open_collecting(&mut g, at, end);
-        if res.0 || !res.1.is_empty() {
-            GUARD_REV.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !g.pins.is_empty() {
+            let now = std::time::Instant::now();
+            g.pins.retain(|&(_, _, t)| t > now);
         }
-        res
-    };
-    if len > 0 {
-        let (first, last) = (at / PAGE, end.div_ceil(PAGE));
-        let opened = any || !aliases.is_empty();
-        if opened || overlaps_ahead_guarded(first, last) {
-            if !opened {
-                // Blocks may already have been opened by `on_write`; bump
-                // `GUARD_REV` and gather view aliases before evicting.
-                GUARD_REV.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                aliases = alias_pages_of_range(first, last);
+        g.pins.push((first, last, until));
+        let (_, mut aliases) = open_collecting(&mut g, at, end);
+        if view_guard() {
+            for (base, bytes) in crate::inplace::views_between(
+                first.saturating_mul(BLOCK),
+                last.saturating_mul(BLOCK),
+            ) {
+                let v_first = (base / BLOCK).max(first);
+                let v_last = base.saturating_add(bytes).div_ceil(BLOCK).min(last);
+                for block in v_first..v_last {
+                    let shown = crate::inplace::pages_of(block * BLOCK);
+                    if shown.len() < 2 || shown.len() > MANY_VIEWS {
+                        continue;
+                    }
+                    for alias in shown {
+                        let alias_block = alias / BLOCK;
+                        if alias_block != block {
+                            g.pins.push((alias_block, alias_block + 1, until));
+                            open_here(&mut g, alias, alias.saturating_add(BLOCK));
+                            aliases.push(alias_block);
+                        }
+                    }
+                }
             }
-            evict_ahead_guarded(first, last, &aliases);
         }
-    }
+        GUARD_REV.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        aliases
+    };
+    evict_ahead_guarded(first, last, &aliases);
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -1475,11 +1545,25 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         for block in blocks {
             g.protected.remove(&block);
             g.clean.remove(&block);
+            // A view mapped moments ago may have already been protected as an
+            // alias of a guarded page between `views_mapped` and this call:
+            // give write access back (fails harmlessly on unmapped memory).
+            let mut old = 0;
+            // SAFETY: only the protection of title view memory changes.
+            unsafe {
+                windows_sys::Win32::System::Memory::VirtualProtect(
+                    (block * BLOCK) as *const _,
+                    BLOCK,
+                    windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                    &mut old,
+                )
+            };
         }
-        let aliased: Vec<usize> = g.aliased.range(range).copied().collect();
+        let aliased: Vec<usize> = g.aliased.range(range.clone()).copied().collect();
         for block in aliased {
             g.aliased.remove(&block);
         }
+        g.unpin(range.start, range.end);
         if len > 0 {
             GUARD_REV.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -1555,10 +1639,29 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // Read-only, in a physical-page view we know of, and not noted
+        // guarded: only we make title views read-only, so restore write access.
+        if view_guard() && !crate::inplace::pages_of(at - at % BLOCK).is_empty() {
+            let block = at - at % BLOCK;
+            let mut old = 0;
+            // SAFETY: only the protection of title view memory changes.
+            let opened = unsafe {
+                windows_sys::Win32::System::Memory::VirtualProtect(
+                    block as *const _,
+                    BLOCK,
+                    windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                    &mut old,
+                )
+            } != 0;
+            if opened {
+                GUARD_REV.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                UNTRACKED_VIEW_FAULTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        EXCEPTION_CONTINUE_SEARCH
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state, TLS recovery slot, and
@@ -1567,6 +1670,10 @@ fn install() {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
 }
+
+/// Count of write faults on read-only title view blocks not tracked in
+/// `Guards::protected` that the vectored handler restored to read-write.
+static UNTRACKED_VIEW_FAULTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Copies `len` bytes from title memory `src` into writable host memory `dst`
 /// without a kernel syscall, using [`install`]'s vectored handler to recover
@@ -2220,6 +2327,11 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
         writing(other + BLOCK, BLOCK);
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
+        // Block 1 stays pinned writable & dirty across views until the kernel
+        // write pin expires or is released.
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
+        guards().unpin(guarded / BLOCK + 1, guarded / BLOCK + 2);
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         // Half a page and the next: both blocks, not just the first's.
         writing(other + BLOCK / 2, BLOCK);
@@ -2755,6 +2867,52 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn writing_pins_guarded_view_writable_and_dirty_without_reprotecting() {
+        use super::{BLOCK, PAGE, guard, guards, title_memory_remapped, writable, writing};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+        let (section, base) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let base = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            assert_ne!(base, 0);
+            (section, base)
+        };
+        let p0 = base / PAGE;
+        let p1 = (base + BLOCK) / PAGE;
+        assert_eq!(guard(base, base + 2 * BLOCK), Some(vec![p0, p1]));
+        assert_eq!(guard(base, base + 2 * BLOCK), Some(Vec::new()));
+
+        // Pin block 0 for a kernel write: block 0 stays writable and dirty on repeated checks,
+        // while block 1 stays clean and guarded.
+        writing(base, BLOCK);
+        assert!(writable(base));
+        assert_eq!(guard(base, base + 2 * BLOCK), Some(vec![p0]));
+        assert!(writable(base), "pinned block must stay writable after guard()");
+        assert_eq!(guard(base, base + 2 * BLOCK), Some(vec![p0]));
+
+        // Clean up pin and view.
+        {
+            let mut g = guards();
+            g.pins.retain(|&(from, to, _)| !(from == base / BLOCK && to == base / BLOCK + 1));
+        }
+        title_memory_remapped(base, 2 * BLOCK);
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
     }
 }
 

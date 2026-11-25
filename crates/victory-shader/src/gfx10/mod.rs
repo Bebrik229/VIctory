@@ -475,6 +475,43 @@ mod tests {
         );
     }
 
+    /// `340A66F9 05860606`: `v_lshlrev_b32 v5, s6, v51 src1_sel:WORD_1` of
+    /// `ShallowWaterSim`'s `CS_ApplyDisturb`. Bit 23 of the SDWA word keeps
+    /// src0 scalar (`s6`); `src_sel` decodes as `[DWORD, WORD_1]`.
+    #[test]
+    fn sdwa_scalar_src0_and_word1_src1() {
+        let code = [0x340A_66F9, 0x0586_0606, S_ENDPGM];
+        let list = decode(&bytes(&code)).unwrap();
+        assert_eq!(list[0].name(), Some("v_lshlrev_b32"));
+        let Fields::Valu(v) = list[0].fields(false) else {
+            panic!("not VALU");
+        };
+        assert_eq!(
+            v.dst,
+            Some(Operand::Vector { reg: 5, dwords: 1 }),
+            "dst"
+        );
+        assert_eq!(
+            v.src.as_slice(),
+            [
+                Operand::Scalar { code: 6, dwords: 1 },
+                Operand::Vector { reg: 51, dwords: 1 },
+            ],
+            "sources"
+        );
+        assert_eq!(
+            v.sdwa,
+            Some(Sdwa {
+                dst_sel: 6,
+                dst_unused: 0,
+                src_sel: [6, 5],
+                sext: 0,
+            }),
+            "sdwa"
+        );
+        assert_eq!((v.neg, v.abs, v.clamp, v.omod), (0, 0, false, 0));
+    }
+
     #[test]
     fn rejects_bad_code() {
         assert!(decode(&[0; 3]).is_err(), "size not a multiple of 4");

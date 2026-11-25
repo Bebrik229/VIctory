@@ -3100,7 +3100,17 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+        // Diagnostics (`VICTORY_ALWAYS_COPY`): 1 bypasses write-watch/guards
+        // on every free buffer copy; 3 bypasses guarded view copies only.
+        static ALWAYS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let always = *ALWAYS.get_or_init(|| {
+            std::env::var("VICTORY_ALWAYS_COPY")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        });
+        let forced = always == 1 || (always == 3 && self.watched.load(Ordering::Relaxed) == 1);
+        if !forced && self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);

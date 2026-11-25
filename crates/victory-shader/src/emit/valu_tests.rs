@@ -100,6 +100,12 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+    build_cs_vgprs(body, threads, lds_bytes, 8)
+}
+
+/// [`build_cs`] with `vgprs` architected VGPRs (the bytes under test may
+/// name registers past the default 8).
+fn build_cs_vgprs(body: &[u32], threads: u32, lds_bytes: u32, vgprs: u16) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -117,7 +123,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 8,
+        vgprs,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
@@ -1807,4 +1813,25 @@ fn a_heap_index_past_the_window_reads_the_slot_the_heap_map_gives() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// The exact bytes of `ShallowWaterSim`'s `CS_ApplyDisturb` disturber-index
+/// shift (`340A66F9 05860606`): SDWA `src1_sel:WORD_1` takes the high 16-bit
+/// word of v51 (the disturber id) shifted left by s6. v51 = 0x0003_3C00 with
+/// s6 = 4 must give (0x33C00 >> 16) << 4 = 48; a zero makes every disturber
+/// read LDS slot 0 and collapses the simulated water depth to its clamp.
+#[test]
+fn sdwa_word1_source_is_the_high_half() {
+    let body = [
+        vop1(0x001, 51, 255),
+        0x0003_3C00, // v_mov_b32 v51, lit(0x00033C00)
+        s_mov_b32(6, 132), // s_mov_b32 s6, 4
+        0x340A_66F9,
+        0x0586_0606, // v_lshlrev_b32 v5, s6, v51 src1_sel:WORD_1
+        vop1(0x001, 0, vgpr(5)), // v_mov_b32 v0, v5
+    ];
+    let shader = build_cs_vgprs(&body, 1, 0, 64);
+    run_cases(&shader, &[[0, 0, 0, 0]], |label, _, _, got| {
+        assert_eq!(got, 48, "{label}: (0x33C00 >> 16) << 4 = 48, got {got:#x}");
+    });
 }

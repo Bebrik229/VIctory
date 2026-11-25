@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -738,4 +738,112 @@ fn single_wave32_shared_lds_syncs_write_to_read() {
         assert_eq!(out[0][t as usize], expected, "lane {t}");
     }
     eprintln!("ran on the hardware device: single-wave Wave32 LDS cross-lane sync across all 32 lanes");
+}
+
+/// The real `ShallowWaterSim:CS_GenerateDisturbOverlappingPairs` container
+/// (#25328ea424d08c00) end to end: two overlapping disturbers, one tile. The console
+/// shader compacts the overlapping indices through wave scans and an atomic base and writes
+/// the pairs buffer, a per-tile record, and the global counter. Any mistranslation of the
+/// scan primitives corrupts the pairs list the disturber pass reads.
+#[test]
+fn generate_pairs_real_container_compacts_two_disturbers() {
+    let bin = std::fs::read(
+        r"C:\Users\Admen\.gemini\antigravity\brain\88a63322-5dbd-45fa-a99f-6948f2bcb3be\scratch\water_shaders\ShallowWaterSim_CS_GenerateDisturbOverlappingPairs_9b8019bf_Wrapped__0xd4b2119.bin",
+    ).expect("the extracted shader container");
+    let c = crate::dxbc::Container::parse(&bin).expect("container");
+    let dxil = c.part(crate::dxbc::FourCC::DXIL).expect("DXIL part");
+    let native = crate::native_programs(dxil.data)
+        .expect("native programs")
+        .into_iter()
+        .find(|p| p.stage == HwStage::Cs)
+        .expect("a compute program");
+    eprintln!("wave64={} vgprs={} layout={} params", native.wave64, native.vgprs, native.layout.len());
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    for u in &shader.user_data {
+        eprintln!("user_data index={} slot={} root={:?} dword={}", u.index, u.slot, u.root, u.dword);
+    }
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    // table order in the heap: bbox SRV, pairs UAV, tile-record UAV, counter UAV, count CBV
+    let f = |x: f32| x.to_bits();
+    // every entry overlaps everything: whatever the self index register holds, the overlap
+    // test passes for every i != self
+    let bboxes: Vec<u32> = (0..4096)
+        .flat_map(|_| [f(0.0), f(0.0), f(10.0), f(10.0)])
+        .collect();
+    let count_cbv: Vec<u32> = vec![8, 0, 0, 0];
+    let views = [
+        View::Buffer { data: &bboxes, stride: Stride::Raw },
+        View::RawUav(160), // pairs
+        View::RawUav(8),   // tile records
+        View::RawUav(4),   // counter
+        View::Cbv(&count_cbv),
+    ];
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if u.root == RootType::Table {
+            ud[u.index as usize] = 0; // the table starts at heap index 0 (value = byte offset)
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    eprintln!("counter: {:08x?}", &out[2][..4]);
+    eprintln!("tile record: {:08x?}", &out[1][..8]);
+    eprintln!("pairs[0..16]: {:08x?}", &out[0][..16]);
+    // self is disturber 0, all of 1..7 overlap it: the wave compacts seven ids in order
+    for k in 0..7u32 {
+        assert_eq!(out[0][k as usize], k + 1, "pairs[{k}]");
+    }
+    assert_eq!(out[2][0], 7, "the counter after the wave adds its total");
+    assert_eq!(out[1][0], 1, "the record's overlap flag");
+    assert_eq!(out[1][2], 7, "the record's pair count");
+}
+
+/// Input-layout probe for `ShallowWaterSim:CS_ApplyDisturb` (#128424b3011dae43):
+/// parses the real container, lowers it, and prints the whole user_data wiring so the
+/// end-to-end harness can fill the root constants correctly.
+#[test]
+fn apply_disturb_input_layout_probe() {
+    let bin = std::fs::read(
+        r"C:\Users\Admen\.gemini\antigravity\brain\88a63322-5dbd-45fa-a99f-6948f2bcb3be\scratch\water_shaders\ShallowWaterSim_CS_ApplyDisturb_1cb9a44e_Wrapped__0xd4b8637.bin",
+    ).expect("the extracted shader container");
+    let c = crate::dxbc::Container::parse(&bin).expect("container");
+    let dxil = c.part(crate::dxbc::FourCC::DXIL).expect("DXIL part");
+    let native = crate::native_programs(dxil.data)
+        .expect("native programs")
+        .into_iter()
+        .find(|p| p.stage == HwStage::Cs)
+        .expect("a compute program");
+    eprintln!("wave64={} vgprs={} layout_len={}", native.wave64, native.vgprs, native.layout.len());
+    for e in &native.layout {
+        eprintln!("layout: {:?}", e);
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    eprintln!("user_data_dwords={}", shader.user_data_dwords());
+    for u in &shader.user_data {
+        eprintln!("user_data index={} slot={} root={:?} dword={}", u.index, u.slot, u.root, u.dword);
+    }
 }

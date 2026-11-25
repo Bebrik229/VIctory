@@ -27,6 +27,9 @@ use super::host::{GraphicsState, HostPipeline};
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
+    /// Pass over the screen (no vertex inputs, no depth/stencil): fills
+    /// lighting/LUT tables once, so it jumps the queue and gets its own budget.
+    screen: bool,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
@@ -49,9 +52,11 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let screen = graphics.as_ref().is_some_and(|g| g.screen_pass());
         Pending {
             shaders,
             graphics,
+            screen,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -159,18 +164,28 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waiting allowed per title frame for screen passes (below the title's
+/// 30 s watchdog), so one-off lighting-table bakes do not drop behind world
+/// pipeline compilation.
+const SCREEN_BUDGET: Duration = Duration::from_secs(20);
+
+/// Waits for `p` while frame `frame` has budget of its kind left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
-    if budget.is_zero() {
+    let base = wait_budget();
+    if base.is_zero() {
         return;
     }
+    let kind = usize::from(p.screen);
+    let budget = if p.screen { SCREEN_BUDGET } else { base };
     // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    // taken by a thread waiting now), separated for ordinary vs screen passes.
+    static SPENT: [Mutex<(u64, Duration)>; 2] = [
+        Mutex::new((u64::MAX, Duration::ZERO)),
+        Mutex::new((u64::MAX, Duration::ZERO)),
+    ];
     let shared = shared_budget();
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = SPENT[kind].lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -196,7 +211,7 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = SPENT[kind].lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
@@ -221,6 +236,7 @@ const MAKING: u8 = 3;
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    screen: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -228,6 +244,7 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            screen: VecDeque::new(),
         }
     }
 
@@ -240,7 +257,11 @@ impl Queue {
         }
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED {
-            self.requested.push_back(p.clone());
+            if p.screen {
+                self.screen.push_back(p.clone());
+            } else {
+                self.requested.push_back(p.clone());
+            }
         } else {
             self.early.push_back(p.clone());
         }
@@ -248,11 +269,15 @@ impl Queue {
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+        let p = self
+            .screen
+            .pop_front()
+            .or_else(|| self.requested.pop_front())
+            .or_else(|| {
+                // An early entry can have been promoted and claimed already.
+                std::iter::from_fn(|| self.early.pop_front())
+                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+            })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }

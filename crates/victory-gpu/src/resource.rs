@@ -2612,7 +2612,7 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14], unordered: bool) -> Option<This> {
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in
@@ -2626,6 +2626,12 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         key[1] = 0;
         key[13] = 0;
     }
+    // Word 12 is the flags: the unordered-access bit differs between a
+    // shader view and an unordered view of one texture. It is not part of
+    // what a texture is: without this a texture first read and then written
+    // got two mirrors, and the writes never showed in the reads.
+    const UNORDERED: u32 = 4;
+    key[12] &= !UNORDERED;
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
@@ -2645,12 +2651,25 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         }
     }
     if let Some(&r) = map.get(&(address, *desc)) {
-        return Some(r as This);
+        // A mirror made for shader views alone serves a later unordered
+        // view no more than a null would: make one with the permission
+        // instead (it replaces the entry; unordered access textures made
+        // first serve shader views as they are).
+        if !unordered || resource(r as This).desc.flags & UNORDERED != 0 {
+            return Some(r as This);
+        }
     }
     // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let mut d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
+    }
+    const DEPTH: u32 = 2;
+    if unordered && d.flags & DEPTH == 0 {
+        // Unordered access only where it is asked for: host textures of
+        // compressed formats refuse the permission, and a flag word of
+        // nothing else is what the upload of a title-filled texture asks.
+        d.flags |= UNORDERED;
     }
     let mut out = std::ptr::null();
     let made = create_at_address(
