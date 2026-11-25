@@ -6649,6 +6649,13 @@ impl<'a> Lower<'a> {
     /// predecessor's tail for a phi. The map's handle is uniform, made once
     /// in the entry block; only the offset is per lane.
     fn heap_remap(&mut self, index: V, window: u32, slot: u32) -> V {
+        // Compile-time constant index inside the identity window needs no
+        // heap-map VRAM load or select.
+        if let Some((_, k)) = self.s.m.int_k(index)
+            && (k as u32) < window
+        {
+            return index;
+        }
         let map = match self.heap_map {
             Some(map) => map,
             None => {

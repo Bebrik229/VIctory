@@ -73,6 +73,10 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// A 64-bit floating-point type (`double`), as a result or operand.
+    pub doubles: bool,
+    /// Pull-model / `attributeAtVertex` barycentric interpolation.
+    pub barycentrics: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -199,7 +203,9 @@ pub(super) fn effect(f: &Func) -> Effect {
         Some(Attr::ReadNone) => Effect::Pure,
         // A shader cannot write a constant buffer or resize a resource.
         Some(Attr::ReadOnly)
-            if name.starts_with("cbufferLoadLegacy") || name.starts_with("getDimensions") =>
+            if name.starts_with("cbufferLoadLegacy")
+                || name.starts_with("getDimensions")
+                || name == "waveGetLaneIndex" =>
         {
             Effect::Pure
         }
@@ -388,7 +394,7 @@ impl Module {
     }
 
     /// An integer constant's width and value (the bits of that width).
-    fn int_k(&self, v: V) -> Option<(u32, u64)> {
+    pub(crate) fn int_k(&self, v: V) -> Option<(u32, u64)> {
         let V::Const(i) = v else { return None };
         let (ty, Const::Int(x)) = &self.consts[i as usize] else {
             return None;
@@ -653,7 +659,30 @@ impl Module {
             Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
-            Op::Call(f, args) => Key::Call(*f, args.clone()),
+            Op::Call(f, args) => {
+                let name = self.funcs[*f as usize].name.as_str();
+                if name == "dx.op.createHandleFromHeap" || name == "dx.op.createHandleFromBinding" {
+                    // Never merge raw unannotated handles standalone: two uses
+                    // of the same bindless slot can carry contradictory
+                    // `annotateHandle` classes (e.g. SRV vs UAV, Raw vs CBV).
+                    // Instead key `annotateHandle` on `(createHandle, props)`.
+                    return None;
+                }
+                if name == "dx.op.annotateHandle"
+                    && let Some(&V::Inst(h)) = args.get(1)
+                    && let Op::Call(hf, hargs) = &self.insts[h as usize].op
+                {
+                    let hname = self.funcs[*hf as usize].name.as_str();
+                    if hname == "dx.op.createHandleFromHeap" || hname == "dx.op.createHandleFromBinding" {
+                        let mut combined = Vec::with_capacity(1 + hargs.len() + args.len());
+                        combined.push(V::Global(*hf));
+                        combined.extend_from_slice(hargs);
+                        combined.extend_from_slice(&args[2..]);
+                        return Some(Key::Call(*f, combined));
+                    }
+                }
+                Key::Call(*f, args.clone())
+            }
             Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),
             Op::Load(p) => Key::Load(*p),
             _ => return None,
@@ -739,7 +768,9 @@ impl Module {
             // condition is that side's, here and in every block below.
             let mut learned = Learned::default();
             if passes & FACTS != 0
+                && b != 0
                 && let [p] = tree.preds[b][..]
+                && p != b
                 && let Some(Term::CondBr(c, t, f)) = self.blocks[p].term
                 && t != f
             {
@@ -837,8 +868,11 @@ impl Module {
             }
             self.blocks[b].body = kept;
             if let Some(Term::CondBr(c, t, f)) = self.blocks[b].term {
-                let c = known_bit(&facts, resolve(&repl, c));
-                self.blocks[b].term = Some(Term::CondBr(c, t, f));
+                let next_c = known_bit(&facts, resolve(&repl, c));
+                if next_c != c {
+                    changed = true;
+                }
+                self.blocks[b].term = Some(Term::CondBr(next_c, t, f));
             }
             steps.push(Step::Leave(added, learned));
             for &c in tree.children[b].iter().rev() {
@@ -968,6 +1002,7 @@ impl Module {
         let mut u = Usage::default();
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
+        let is_double = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Double;
         // The first field of a handle's annotation: its kind, with the UAV
         // bit; the second: the component type and count.
         let annotation = |h: V| -> Option<(i64, i64)> {
@@ -996,7 +1031,12 @@ impl Module {
             for &i in blk.phis.iter().chain(&blk.body) {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
+                u.doubles |= is_double(inst.ty);
+                for_each_operand(&inst.op, |v| {
+                    let ty = self.type_of(v);
+                    u.int64 |= wide(ty);
+                    u.doubles |= is_double(ty);
+                });
                 let Op::Call(f, args) = &inst.op else {
                     continue;
                 };
@@ -1004,6 +1044,8 @@ impl Module {
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
                 if name.starts_with("wave") || name.starts_with("quad") {
                     u.wave_ops = true;
+                } else if name.starts_with("attributeAtVertex") {
+                    u.barycentrics = true;
                 } else if name == "createHandleFromHeap" {
                     match args.get(2).and_then(|&s| self.int_k(s)) {
                         Some((_, 0)) => u.heap_views = true,
@@ -2132,5 +2174,76 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    /// Bug #2 regression: `REUSE` must NOT merge `createHandleFromHeap` across
+    /// contradictory `annotateHandle` `ResourceProperties` (e.g. SRV vs UAV on
+    /// the same bindless slot), while identical-properties handles still CSE
+    /// cleanly and `DEAD` drops the redundant `createHandleFromHeap`.
+    #[test]
+    fn reuse_keeps_contradictory_annotated_handles_distinct_and_merges_identical() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let i1t = m.int(1);
+        let handle = m.named_struct("dx.types.Handle", vec![i32t]);
+        let props = m.named_struct("dx.types.ResourceProperties", vec![i32t, i32t]);
+        let void = m.void();
+        let entry_ty = m.func_ty(void, vec![]);
+        m.ptr(entry_ty);
+        let create_ty = m.func_ty(handle, vec![i32t, i32t, i1t, i1t]);
+        m.ptr(create_ty);
+        let ann_ty = m.func_ty(handle, vec![i32t, handle, props]);
+        m.ptr(ann_ty);
+        let sink_ty = m.func_ty(void, vec![handle]);
+        m.ptr(sink_ty);
+        let _main = m.function("main", entry_ty, None, true);
+        let f_create = m.function("dx.op.createHandleFromHeap", create_ty, Some(Attr::ReadNone), false);
+        let f_ann = m.function("dx.op.annotateHandle", ann_ty, Some(Attr::ReadNone), false);
+        let f_sink = m.function("dx.op.rawBufferStore.i32", sink_ty, Some(Attr::NoUnwind), false);
+        let b = m.new_block();
+        let op_create = m.i32(218);
+        let op_ann = m.i32(216);
+        let idx = m.i32(7);
+        let no = m.bool(false);
+        let (c11, cuav, c0) = (m.i32(11), m.i32(11 | 0x1000), m.i32(0));
+        let p_srv = m.aggregate(props, &[c11, c0]);
+        let p_uav = m.aggregate(props, &[cuav, c0]);
+
+        // Pair 1: SRV on slot 7
+        let h1 = m.call(b, f_create, vec![op_create, idx, no, no]);
+        let a1 = m.call(b, f_ann, vec![op_ann, h1, p_srv]);
+        // Pair 2: identical SRV on slot 7 -> SHOULD merge into a1 (h2 becomes dead)
+        let h2 = m.call(b, f_create, vec![op_create, idx, no, no]);
+        let a2 = m.call(b, f_ann, vec![op_ann, h2, p_srv]);
+        // Pair 3: contradictory UAV on slot 7 -> MUST keep distinct h3 + a3!
+        let h3 = m.call(b, f_create, vec![op_create, idx, no, no]);
+        let a3 = m.call(b, f_ann, vec![op_ann, h3, p_uav]);
+
+        m.call(b, f_sink, vec![a1]);
+        m.call(b, f_sink, vec![a2]);
+        m.call(b, f_sink, vec![a3]);
+        m.terminate(b, Term::Ret);
+
+        m.optimise(ALL);
+
+        let creates: Vec<u32> = m.blocks[b]
+            .body
+            .iter()
+            .copied()
+            .filter(|&i| matches!(m.insts[i as usize].op, Op::Call(f, _) if V::Func(f) == f_create))
+            .collect();
+        let anns: Vec<(u32, V)> = m.blocks[b]
+            .body
+            .iter()
+            .copied()
+            .filter_map(|i| match &m.insts[i as usize].op {
+                Op::Call(f, args) if V::Func(*f) == f_ann => Some((i, args[1])),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates.len(), 2, "SRV duplicate dropped, UAV createHandle kept separate");
+        assert_eq!(anns.len(), 2, "identical SRV merged, UAV kept separate");
+        assert_ne!(anns[0].1, anns[1].1, "contradictory SRV and UAV annotations must not share one createHandle");
+        m.write();
     }
 }

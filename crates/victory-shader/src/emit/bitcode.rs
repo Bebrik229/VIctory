@@ -723,6 +723,7 @@ impl Module {
             }
         }
         let mut fold = vec![None; self.blocks.len()];
+        let mut folded_edges = std::collections::HashSet::new();
         for &b in &post {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
@@ -730,7 +731,10 @@ impl Module {
                 blk.phis.is_empty() && blk.body.is_empty(),
                 &preds[b][..],
             ) && pos[h] < pos[b]
+                && fold[*p].is_none()
+                && fold[h].is_none()
                 && !succs(*p).contains(&h)
+                && folded_edges.insert((*p, h))
             {
                 fold[b] = Some((*p, h));
             }
