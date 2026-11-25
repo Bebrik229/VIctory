@@ -2017,6 +2017,11 @@ struct CardPlan {
     inflight_landed: u32,
 }
 
+fn ask_once_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE_TEXTURES").is_some_and(|v| v == "1"))
+}
+
 fn fill_workers() -> usize {
     static COUNT: OnceLock<usize> = OnceLock::new();
     *COUNT.get_or_init(|| {
@@ -2045,7 +2050,7 @@ impl Fill {
 static FILL_BATCHES: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-const FILLS_PER_JOB: usize = 128;
+const FILLS_PER_JOB: usize = 32;
 
 /// Whether every fill in `fills` writes a disjoint destination that does not
 /// alias any fill's source, so all fills in the batch can run in parallel.
@@ -5126,7 +5131,7 @@ impl Host {
                                     .or_insert((*address, *address + *len));
                                 *span = (span.0.min(*address), span.1.max(*address + *len));
                             }
-                            Step::Texture(staging) => {
+                            Step::Texture(staging) if ask_once_textures() => {
                                 let (at, len) = staging.memory();
                                 if len > 0
                                     && let Some(end) = at.checked_add(len)

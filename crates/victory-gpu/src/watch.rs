@@ -289,7 +289,8 @@ fn alias_pages_of_range(first: usize, last: usize) -> Vec<usize> {
 }
 
 /// Splits valid `(start, end)` byte ranges into write-watched candidates and
-/// already-known physical-page views in a single `GUARDS` lock acquisition.
+/// already-known physical-page views in a single `GUARDS` lock acquisition
+/// followed by one `inplace` views lookup for any unguarded view ranges.
 fn partition_pieces(ranges: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
     let mut ww = Vec::new();
     let mut views = Vec::new();
@@ -301,16 +302,30 @@ fn partition_pieces(ranges: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usi
         }
         return (ww, views);
     }
-    let g = guards();
-    for &(start, end) in ranges {
-        if start < end {
-            let piece = (start / PAGE, end.div_ceil(PAGE));
-            if known_view_in(&g, piece.0 * PAGE) {
-                views.push(piece);
-            } else {
-                ww.push(piece);
+    let mut unknown = Vec::new();
+    {
+        let g = guards();
+        for &(start, end) in ranges {
+            if start < end {
+                let piece = (start / PAGE, end.div_ceil(PAGE));
+                if known_view_in(&g, piece.0 * PAGE) {
+                    views.push(piece);
+                } else {
+                    unknown.push(piece);
+                }
             }
         }
+    }
+    if !unknown.is_empty() {
+        crate::inplace::with_view_lookup(|in_view| {
+            for piece in unknown {
+                if in_view(piece.0 * PAGE) {
+                    views.push(piece);
+                } else {
+                    ww.push(piece);
+                }
+            }
+        });
     }
     (ww, views)
 }
@@ -1083,14 +1098,14 @@ fn known_view_in(g: &Guards, start: usize) -> bool {
 }
 
 /// Whether the block holding `start` is view memory the guards already
-/// hold (read-only by our hand, or noted absent): asking the kernel's write
-/// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
-/// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
+/// hold (read-only by our hand, or noted absent), or a registered runtime
+/// physical-page view: asking the kernel's write watch about it can only fail.
+/// `VICTORY_VIEW_ASK=1` (or `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
 fn known_view(start: usize) -> bool {
     if force_view_ask() {
         return false;
     }
-    known_view_in(&guards(), start)
+    known_view_in(&guards(), start) || crate::inplace::is_view_at(start)
 }
 
 struct Guards {
@@ -1175,7 +1190,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first)
     };
-    if !known && !is_view(start, end) {
+    if !known && !crate::inplace::is_view_at(start) && !is_view(start, end) {
         return None;
     }
     install();
@@ -3081,6 +3096,26 @@ mod tests {
         // SAFETY: our allocation.
         unsafe { VirtualFree(ww as *mut _, 0, MEM_RELEASE) };
         forget_written(ww, 4 * PAGE);
+    }
+
+    #[test]
+    fn unguarded_inplace_view_skips_kernel_asks_in_partition_and_known_view() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const VIEW_SIZE: usize = 2 * BLOCK;
+        let (section, view) = one_view(VIEW_SIZE);
+        crate::inplace::title_memory_section(section, VIEW_SIZE as u64, false);
+        crate::inplace::title_memory_view(view, VIEW_SIZE, section, 0);
+        // Fresh `view` is NOT yet in `GUARDS`, only registered in `inplace::VIEWS`.
+        assert!(known_view(view));
+        let (ww, views) = partition_pieces(&[(view, view + VIEW_SIZE)]);
+        assert!(ww.is_empty());
+        assert_eq!(views.len(), 1);
+        let k0 = KERNEL_ASKS.load(Relaxed);
+        ask_once(&[(view, view + VIEW_SIZE)]);
+        assert_eq!(KERNEL_ASKS.load(Relaxed) - k0, 0);
+        ask_once_end();
+        drop_views(section, &[view], VIEW_SIZE);
+        forget_written(view, VIEW_SIZE);
     }
 
     /// `asked()` and `writes()` ahead-hits acquire only `JOURNAL.read()`, so

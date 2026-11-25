@@ -371,6 +371,28 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// Whether `at` lies inside any currently mapped title physical-page view.
+pub(crate) fn is_view_at(at: usize) -> bool {
+    let v = views();
+    v.views
+        .range(..=at)
+        .next_back()
+        .is_some_and(|(&base, &(bytes, _, _))| at < base.saturating_add(bytes))
+}
+
+/// Runs `f` with a lookup over all currently mapped title physical-page views,
+/// acquiring `VIEWS` once for the batch.
+pub(crate) fn with_view_lookup<R>(f: impl FnOnce(&dyn Fn(usize) -> bool) -> R) -> R {
+    let v = views();
+    let check = |at: usize| {
+        v.views
+            .range(..=at)
+            .next_back()
+            .is_some_and(|(&base, &(bytes, _, _))| at < base.saturating_add(bytes))
+    };
+    f(&check)
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
