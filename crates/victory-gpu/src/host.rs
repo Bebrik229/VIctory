@@ -836,6 +836,20 @@ pub(crate) struct HostList {
     profile_stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
     /// Recorded `(start_query_idx, pipeline_label)` spans on this list.
     profile_spans: Mutex<Vec<(u32, String)>>,
+    /// Set once a compute dispatch, copy, or storing draw runs so later
+    /// scattered indirect records are not gathered into the prelude.
+    gather_closed: std::sync::atomic::AtomicBool,
+    /// Scattered indirect records gathered for one-pass prelude clamping.
+    gather: Mutex<Gather>,
+}
+
+const GATHER_SETS: usize = 8;
+
+#[derive(Default)]
+struct Gather {
+    sets: Vec<crate::indirect::GatherSet>,
+    budget: Option<ID3D12Resource>,
+    spare: Vec<ID3D12Resource>,
 }
 
 /// A list's buffers for hoisted clamped indirect arguments with their
@@ -894,6 +908,8 @@ struct PlannedPrelude {
         bool,
     )>,
     barriers: Vec<PreludeTransition>,
+    gathers: Vec<crate::indirect::GatherPlan>,
+    gather_budget: Option<ID3D12Resource>,
 }
 
 impl PlannedPrelude {
@@ -909,6 +925,15 @@ impl PlannedPrelude {
                     record_twin_copy(&list, &depth.texture, twin, *colour);
                 }
                 record_transitions(&list, &self.barriers);
+                if !self.gathers.is_empty() {
+                    let budget = self
+                        .gather_budget
+                        .as_ref()
+                        .expect("gather prelude missing budget buffer");
+                    if !crate::indirect::record_gathers(&list, &self.gathers, budget) {
+                        fail(format_args!("gathered indirect clamps did not record into prelude"));
+                    }
+                }
                 list.Close()
             })
         };
@@ -920,7 +945,7 @@ impl PlannedPrelude {
 
 fn record_preludes(plans: Vec<PlannedPrelude>) {
     let barrier_count: usize = plans.iter().map(|p| p.to_copy.len() + p.barriers.len()).sum();
-    let includes_copies = plans.iter().any(|p| !p.syncs.is_empty());
+    let includes_copies = plans.iter().any(|p| !p.syncs.is_empty() || !p.gathers.is_empty());
     if plans.len() < 4 || (barrier_count < 256 && !includes_copies) {
         for plan in plans {
             plan.record();
@@ -3743,6 +3768,8 @@ impl Host {
                 stamps: OnceLock::new(),
                 profile_stamps: OnceLock::new(),
                 profile_spans: Mutex::default(),
+                gather_closed: std::sync::atomic::AtomicBool::new(false),
+                gather: Mutex::default(),
             })
         }
     }
@@ -5903,6 +5930,16 @@ impl HostList {
                 D3D12_RESOURCE_STATE_COMMON,
             ));
         }
+        {
+            let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            for set in gather.sets.iter().filter(|s| s.records() > 0) {
+                close_barriers.push(transition(
+                    &set.scratch,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ));
+            }
+        }
         if !close_barriers.is_empty() {
             // SAFETY: an open list and live buffers held for the call.
             unsafe { self.list.ResourceBarrier(&close_barriers) };
@@ -5959,6 +5996,16 @@ impl HostList {
         }
         self.work.store(0, Ordering::Relaxed);
         self.writes.store(0, Ordering::Relaxed);
+        self.gather_closed.store(false, Ordering::Relaxed);
+        {
+            let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            let Gather { sets, spare, .. } = &mut *gather;
+            for set in sets.drain(..) {
+                if spare.len() < GATHER_SETS {
+                    spare.push(set.into_scratch());
+                }
+            }
+        }
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
             // Buffers decay to COMMON after ExecuteCommandLists (and remain
@@ -6301,7 +6348,22 @@ impl HostList {
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first).then(|| PreludeTransition(copy.texture.clone(), real, *first))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        let (gathers, gather_budget) = {
+            let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            let plans: Vec<crate::indirect::GatherPlan> = gather
+                .sets
+                .iter()
+                .filter(|s| s.records() > 0)
+                .map(crate::indirect::GatherSet::plan)
+                .collect();
+            let budget = if plans.is_empty() {
+                None
+            } else {
+                gather.budget.clone()
+            };
+            (plans, budget)
+        };
+        if barriers.is_empty() && syncs.is_empty() && gathers.is_empty() {
             return None;
         }
         let Some(commands) = self
@@ -6317,6 +6379,8 @@ impl HostList {
             to_copy,
             syncs,
             barriers,
+            gathers,
+            gather_budget,
         })
     }
 
@@ -6408,6 +6472,65 @@ impl HostList {
     /// Counts a dispatch or a buffer copy: what may write indirect arguments.
     pub(crate) fn count_write(&self) {
         self.writes.fetch_add(1, Ordering::Relaxed);
+        self.close_gather();
+    }
+
+    /// Stops gathering scattered indirect records on this list after a shader write or copy.
+    pub(crate) fn close_gather(&self) {
+        self.gather_closed.store(true, Ordering::Relaxed);
+    }
+
+    /// Reserves or reuses a slot in a per-argument-buffer scratch table so the
+    /// list's prelude can clamp scattered indirect records in a single pass.
+    pub(crate) fn gather_record(
+        &self,
+        src: &ID3D12Resource,
+        src_id: u64,
+        offset: u64,
+        spec: (u32, u32),
+    ) -> Option<(ID3D12Resource, u64)> {
+        if self.gather_closed.load(Ordering::Relaxed) {
+            return None;
+        }
+        // SAFETY: live D3D12 buffer resource.
+        let src_gpu = unsafe { src.GetGPUVirtualAddress() };
+        let off = crate::indirect::gatherable(src_gpu, offset, spec)?;
+        let h = host()?;
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        if gather.budget.is_none() {
+            gather.budget = Some(h.uav_buffer(20)?);
+        }
+        let pos = match gather
+            .sets
+            .iter()
+            .position(|s| s.src_id == src_id && (s.kind, s.stride) == spec)
+        {
+            Some(i) => i,
+            None => {
+                if gather.sets.len() >= GATHER_SETS {
+                    return None;
+                }
+                let scratch = match gather.spare.pop() {
+                    Some(s) => s,
+                    None => h.uav_buffer(
+                        u64::from(crate::indirect::GATHER_MOST)
+                            * u64::from(crate::indirect::GATHER_STRIDE),
+                    )?,
+                };
+                let table = self.scratch(u64::from(crate::indirect::GATHER_MOST) * 4)?;
+                gather.sets.push(crate::indirect::GatherSet::new(
+                    src.clone(),
+                    src_id,
+                    spec,
+                    scratch,
+                    table,
+                ));
+                gather.sets.len() - 1
+            }
+        };
+        let set = &mut gather.sets[pos];
+        let slot = set.slot(off)?;
+        Some((set.scratch.clone(), u64::from(slot) * u64::from(spec.1)))
     }
 
     /// Dispatches and buffer copies since the reset.
@@ -7491,8 +7614,9 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let gathered = crate::draw::take_gathered() as f64 / frames;
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame, {gathered:.0} scattered records gathered"
         );
         let compute_widest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
         let compute_cut = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;

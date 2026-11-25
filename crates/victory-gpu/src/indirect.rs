@@ -38,6 +38,8 @@ cbuffer Record : register(b0) {
     // Bit 1: the records are a window clamped ahead of their draws: one that
     //        asks for more than can run is left empty and costs nothing.
     // Bit 2: record diagnostic group stats into budget[1..5].
+    // Bit 3: gathered records; record i reads its source byte offset from
+    //        count_buf[count_offset + i * 4].
     uint has_count;
     uint count_offset;
     uint copy_bytes;
@@ -66,6 +68,11 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gtid : SV
     if (gid.x * 64u >= eff_count) return;
     bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * src_stride;
+    // Branch avoids reading count_buf when not gathering (it may hold src itself).
+    [branch]
+    if ((has_count & 8u) != 0) {
+        src_at = count_buf.Load(count_offset + id.x * 4u);
+    }
     uint dst_at = id.x * copy_bytes;
     uint cost = 0u;
     uint2 draw_counts = uint2(0, 0);
@@ -546,6 +553,222 @@ fn record_clamp_full(
         l.ResourceBarrier(&second);
     }
     true
+}
+
+/// Maximum scattered records gathered per argument buffer in one list (multiple of 64).
+pub(crate) const GATHER_MOST: u32 = 4096;
+/// Maximum byte stride supported for gathered indirect records.
+pub(crate) const GATHER_STRIDE: u32 = 32;
+
+/// Immutable snapshot of one [`GatherSet`] handed to `PlannedPrelude::record`.
+#[derive(Clone)]
+pub(crate) struct GatherPlan {
+    pub(crate) src: ID3D12Resource,
+    pub(crate) scratch: ID3D12Resource,
+    pub(crate) table_gpu: u64,
+    pub(crate) kind: u32,
+    pub(crate) stride: u32,
+    pub(crate) records: u32,
+}
+
+// SAFETY: D3D12 resources and immutable scalars are safe to send to a prelude worker.
+unsafe impl Send for GatherPlan {}
+
+/// Scattered indirect records of one `(src_id, kind, stride)` collected during list recording
+/// and clamped together in a single compute dispatch inside the list's prelude.
+pub(crate) struct GatherSet {
+    pub(crate) src: ID3D12Resource,
+    pub(crate) src_id: u64,
+    pub(crate) kind: u32,
+    pub(crate) stride: u32,
+    pub(crate) scratch: ID3D12Resource,
+    pub(crate) table_gpu: u64,
+    table: usize,
+    slots: std::collections::HashMap<u32, u32>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; `table` points into the owning list's upload scratch.
+unsafe impl Send for GatherSet {}
+
+impl GatherSet {
+    pub(crate) fn new(
+        src: ID3D12Resource,
+        src_id: u64,
+        (kind, stride): (u32, u32),
+        scratch: ID3D12Resource,
+        (table_gpu, table): (u64, *mut u8),
+    ) -> Self {
+        Self {
+            src,
+            src_id,
+            kind,
+            stride,
+            scratch,
+            table_gpu,
+            table: table as usize,
+            slots: std::collections::HashMap::new(),
+        }
+    }
+
+    pub(crate) fn records(&self) -> u32 {
+        self.slots.len() as u32
+    }
+
+    pub(crate) fn slot(&mut self, offset: u32) -> Option<u32> {
+        if let Some(&slot) = self.slots.get(&offset) {
+            return Some(slot);
+        }
+        let slot = self.slots.len() as u32;
+        if slot >= GATHER_MOST {
+            return None;
+        }
+        // SAFETY: `table` points to `GATHER_MOST` mapped `u32` entries in list upload memory.
+        unsafe { (self.table as *mut u32).add(slot as usize).write_volatile(offset) };
+        self.slots.insert(offset, slot);
+        Some(slot)
+    }
+
+    pub(crate) fn into_scratch(self) -> ID3D12Resource {
+        self.scratch
+    }
+
+    pub(crate) fn plan(&self) -> GatherPlan {
+        GatherPlan {
+            src: self.src.clone(),
+            scratch: self.scratch.clone(),
+            table_gpu: self.table_gpu,
+            kind: self.kind,
+            stride: self.stride,
+            records: self.records(),
+        }
+    }
+}
+
+/// Validates whether a record of `(kind, stride)` at `offset` in a buffer at `src_gpu`
+/// fits the scattered-gather clamp constraints.
+pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) -> Option<u32> {
+    let min = min_stride(kind)?;
+    if stride < min
+        || stride > GATHER_STRIDE
+        || !stride.is_multiple_of(4)
+        || !offset.is_multiple_of(4)
+        || !src_gpu.is_multiple_of(4)
+    {
+        return None;
+    }
+    u32::try_from(offset).ok().filter(|o| o.checked_add(stride).is_some())
+}
+
+/// Records batched gather-clamp dispatches into a prelude list `l`, charging `budget`
+/// and leaving every populated `GatherPlan::scratch` in `INDIRECT_ARGUMENT` state.
+pub(crate) fn record_gathers(
+    l: &ID3D12GraphicsCommandList,
+    plans: &[GatherPlan],
+    budget: &ID3D12Resource,
+) -> bool {
+    use windows::core::Interface;
+    let (Some(c), Ok(l2)) = (clamp(), l.cast::<ID3D12GraphicsCommandList2>()) else {
+        return false;
+    };
+    record_gathers_with(c, l, &l2, plans, budget)
+}
+
+fn record_gathers_with(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    l2: &ID3D12GraphicsCommandList2,
+    plans: &[GatherPlan],
+    budget: &ID3D12Resource,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_WRITEBUFFERIMMEDIATE_PARAMETER,
+    };
+    // SAFETY: live D3D12 buffer resource.
+    let budget_gpu = unsafe { budget.GetGPUVirtualAddress() };
+    if !budget_gpu.is_multiple_of(4) {
+        return false;
+    }
+    let zeros = [0u64, 4, 8, 12, 16].map(|off| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        Dest: budget_gpu + off,
+        Value: 0,
+    });
+    // SAFETY: open command list; `budget` is `COMMON` between list runs.
+    unsafe {
+        l.ResourceBarrier(&[transition(
+            budget,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
+        l2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(
+                budget,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+        ]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRootUnorderedAccessView(4, budget_gpu);
+    }
+    let mut all = true;
+    let mut ran_any = false;
+    for plan in plans.iter().filter(|p| p.records > 0) {
+        // SAFETY: live D3D12 buffer resources.
+        let (src_gpu, dst_gpu) = unsafe {
+            (plan.src.GetGPUVirtualAddress(), plan.scratch.GetGPUVirtualAddress())
+        };
+        if gatherable(src_gpu, 0, (plan.kind, plan.stride)).is_none()
+            || plan.records > GATHER_MOST
+            || !dst_gpu.is_multiple_of(4)
+            || !plan.table_gpu.is_multiple_of(4)
+        {
+            all = false;
+            continue;
+        }
+        let constants = [plan.kind, plan.stride, plan.records, 0u32, 8u32, 0u32, plan.stride];
+        let pre = [
+            if ran_any {
+                uav_barrier_for(Some(budget))
+            } else {
+                uav_barrier_for(None)
+            },
+            transition(
+                &plan.scratch,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+        ];
+        let post = [transition(
+            &plan.scratch,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )];
+        // SAFETY: open command list; validated root SRVs/UAVs and constants.
+        unsafe {
+            let start = usize::from(!ran_any);
+            l.ResourceBarrier(&pre[start..]);
+            l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, src_gpu);
+            l.SetComputeRootShaderResourceView(2, plan.table_gpu);
+            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            l.Dispatch(plan.records.div_ceil(64), 1, 1);
+            l.ResourceBarrier(&post);
+        }
+        ran_any = true;
+    }
+    // SAFETY: return `budget` to `COMMON` before the main list starts.
+    unsafe {
+        l.ResourceBarrier(&[transition(
+            budget,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        )]);
+    }
+    all
 }
 
 /// Parses `VICTORY_HOIST_CLAMPS` (`0..=7`), defaulting to mode `7`.
@@ -2020,6 +2243,89 @@ void main() {
         // Draw C at offset 128 (dword 32): deterministically zeroed past BUDGET.
         assert_eq!(&words[32..37], &[0, 0, 301, 302, 303]);
         assert_eq!(spent, BUDGET_CAP, "budget saturated cleanly without wraparound");
+    }
+
+    #[test]
+    fn gathered_records_must_fit_the_clamp() {
+        assert_eq!(gatherable(0x1000, 0x6d71550, (10, 12)), Some(0x6d71550));
+        assert_eq!(gatherable(0x1000, 0, (1, 20)), Some(0));
+        assert_eq!(gatherable(0x1000, 0x6d71552, (10, 12)), None);
+        assert_eq!(gatherable(0x1002, 0x40, (10, 12)), None);
+        assert_eq!(gatherable(0x1000, 0x40, (10, 8)), None);
+        assert_eq!(gatherable(0x1000, 0x40, (10, GATHER_STRIDE + 4)), None);
+        assert_eq!(gatherable(0x1000, 0x40, (7, 12)), None);
+        assert_eq!(gatherable(0x1000, 1 << 32, (10, 12)), None);
+        assert_eq!(gatherable(0x1000, u64::from(u32::MAX) - 3, (10, 12)), None);
+    }
+
+    #[test]
+    fn warp_gathered_records_match_single_clamps() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 12;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(4096);
+        let (table_buf, table_ptr, table_gpu) = warp.shared_buffer(u64::from(GATHER_MOST) * 4);
+        let (budget_buf, budget_ptr, _) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(512);
+        let scratch = warp.default_uav(64 << 10);
+
+        let write_u32 = |ptr: *mut u8, byte_off: usize, vals: &[u32]| unsafe {
+            for (i, &v) in vals.iter().enumerate() {
+                (ptr.add(byte_off) as *mut u32).add(i).write_volatile(v);
+            }
+        };
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0, 4096);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0, 512);
+        }
+        // Scattered records in `src_buf`: offsets 64, 512, 1024.
+        write_u32(src_ptr, 64, &[9, 1, 1]);
+        write_u32(src_ptr, 512, &[70000, 4, 2]); // clamped to 65535 x 1 x 1
+        write_u32(src_ptr, 1024, &[0xffffffff, 1, 1]); // garbage 0xffffffff clamped to 65535 x 1 x 1
+
+        let mut set = GatherSet::new(
+            src_buf.clone(),
+            1,
+            (KIND_MESH, STRIDE),
+            scratch.clone(),
+            (table_gpu, table_ptr),
+        );
+        assert_eq!(set.slot(64), Some(0));
+        assert_eq!(set.slot(512), Some(1));
+        assert_eq!(set.slot(64), Some(0), "duplicate offset reuses existing slot");
+        assert_eq!(set.slot(1024), Some(2));
+        let _keep_table = table_buf;
+
+        let l2 = warp.list.cast::<ID3D12GraphicsCommandList2>().unwrap();
+        assert!(record_gathers_with(
+            &warp.clamp,
+            &warp.list,
+            &l2,
+            &[set.plan()],
+            &budget_buf,
+        ));
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &scratch,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &scratch, 0, 3 * u64::from(STRIDE));
+            warp.list.ResourceBarrier(&[transition(
+                &scratch,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        warp.submit_and_wait();
+
+        let words = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), 9).to_vec() };
+        assert_eq!(&words[0..3], &[9, 1, 1]);
+        assert_eq!(&words[3..6], &[65535, 1, 1]);
+        assert_eq!(&words[6..9], &[65535, 1, 1]);
     }
 }
 

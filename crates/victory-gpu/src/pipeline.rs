@@ -504,8 +504,65 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 }
 
 #[cfg(windows)]
+fn parse_rate_hashes(value: &str) -> Vec<(String, u64)> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let (hash, div) = match entry.split_once(':') {
+                Some((h, d)) => {
+                    let Ok(parsed) = d.trim().parse::<u64>() else {
+                        tracing::warn!(entry, "VICTORY_HALF_RATE_PIPELINES invalid divisor");
+                        return None;
+                    };
+                    (h.trim(), parsed.max(2))
+                }
+                None => (entry, 2),
+            };
+            if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                Some((hash.to_ascii_lowercase(), div))
+            } else {
+                tracing::warn!(
+                    entry,
+                    "VICTORY_HALF_RATE_PIPELINES expects 16-digit shader hashes[:divisor]"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn rate_throttled(p: &Pipeline) -> bool {
+    static RATES: OnceLock<Vec<(String, u64)>> = OnceLock::new();
+    let rates = RATES.get_or_init(|| {
+        let value = std::env::var("VICTORY_HALF_RATE_PIPELINES").unwrap_or_default();
+        let parsed = parse_rate_hashes(&value);
+        if !parsed.is_empty() {
+            tracing::info!(?parsed, "VICTORY_HALF_RATE_PIPELINES active");
+        }
+        parsed
+    });
+    if rates.is_empty() {
+        return false;
+    }
+    let frame = crate::frame::current();
+    p.shaders.iter().any(|shader| {
+        rates
+            .iter()
+            .find(|(h, _)| *h == shader.hash)
+            .is_some_and(|&(_, div)| !frame.is_multiple_of(div))
+    })
+}
+
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    if this.is_null() {
+        return false;
+    }
+    let p = pipeline(this);
+    skipped_shader(p).is_some() || rate_throttled(p)
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -1008,5 +1065,19 @@ mod tests {
             assert!(Arc::ptr_eq(&results[0], r));
         }
         assert_eq!(results[0].hash, blake3::hash(c).to_hex()[..16]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_rate_hashes_accepts_default_and_explicit_divisors() {
+        let parsed = parse_rate_hashes("AABBCCDDEEFF0011, 0011223344556677:4, bad, 1122334455667788:1");
+        assert_eq!(
+            parsed,
+            vec![
+                ("aabbccddeeff0011".to_owned(), 2),
+                ("0011223344556677".to_owned(), 4),
+                ("1122334455667788".to_owned(), 2),
+            ]
+        );
     }
 }
