@@ -1021,14 +1021,39 @@ pub(crate) fn probe_view_limit() {
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
-        if views == PORTABLE_VIEWS && heap_map_on() {
-            let window = window();
-            victory_shader::emit::set_view_heap_map(Some((window, MAP_SLOT)));
-            tracing::info!(
-                window,
-                map_slot = MAP_SLOT,
-                "heap map: bindless views past the identity window are looked up (VICTORY_HEAP_MAP=0: off)"
-            );
+        if views == PORTABLE_VIEWS {
+            set_capped_heap_map();
+        }
+    });
+}
+
+/// Sets the translator's heap map for a host view heap capped at
+/// [`PORTABLE_VIEWS`], unless `VICTORY_HEAP_MAP=0`.
+fn set_capped_heap_map() {
+    if !heap_map_on() {
+        return;
+    }
+    let window = window();
+    victory_shader::emit::set_view_heap_map(Some((window, MAP_SLOT)));
+    tracing::info!(
+        window,
+        map_slot = MAP_SLOT,
+        "heap map: bindless views past the identity window are looked up (VICTORY_HEAP_MAP=0: off)"
+    );
+}
+
+/// The offline warm-up (`victory translate --warm`, no device): translated
+/// with the clamp of a capped host (`VICTORY_VIEW_LIMIT=999999`, which the
+/// run's log gives), shaders get the heap map a run on that host has too,
+/// so that the run finds them under its own cache key. Does nothing for
+/// any other limit, or once a map is set.
+pub(crate) fn offline_heap_map() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if victory_shader::emit::view_heap_limit() == PORTABLE_VIEWS - 1
+            && victory_shader::emit::view_heap_map().is_none()
+        {
+            set_capped_heap_map();
         }
     });
 }

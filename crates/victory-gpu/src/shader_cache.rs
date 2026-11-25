@@ -84,6 +84,8 @@ fn build() -> [u8; 32] {
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     use victory_shader::emit;
     let cache = CACHE.get().ok_or("no shader cache")?;
+    // The heap map of a capped host, as its run translates with it.
+    crate::descriptor::host::offline_heap_map();
     let ran = AtomicBool::new(false);
     // By its hash and under its own key, as at run time ([`host_shader`]):
     // the per-program switches.
