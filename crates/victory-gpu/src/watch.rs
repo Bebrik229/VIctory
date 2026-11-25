@@ -1306,12 +1306,37 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     };
     if mode & 1 != 0 {
         let (first, last) = (at / PAGE, end.div_ceil(PAGE));
-        if let Some(aliases) = opened {
-            evict_ahead_guarded(first, last, &aliases);
+        let aliases = if let Some(aliases) = opened {
+            aliases
         } else if overlaps_ahead_guarded(first, last) {
             GUARD_REV.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let aliases = alias_pages_of_range(first, last);
-            evict_ahead_guarded(first, last, &aliases);
+            alias_pages_of_range(first, last)
+        } else {
+            Vec::new()
+        };
+        // The runtime writes through a view of its own, which neither the
+        // kernel's write watch nor our guards may see (for example, pages in
+        // write-watched memory or views not yet guarded): note the pages
+        // written in the journal here, or host copies made before the file
+        // arrived keep stale bytes for good. Acquires `JOURNAL.write()` only
+        // after `GUARDS` is released (maintaining lock order).
+        let mut j = journal_write();
+        j.asked += 1;
+        let now = j.asked;
+        if !j.ahead.is_empty() || !j.ahead_guarded.is_empty() {
+            j.ahead_asked = now;
+        }
+        for page in first..last {
+            j.written.insert(page, now);
+        }
+        for &page in &aliases {
+            j.written.insert(page, now);
+        }
+        if !j.ahead_guarded.is_empty() {
+            evict_range(&mut j.ahead_guarded, first, last);
+            for &page in &aliases {
+                evict_range(&mut j.ahead_guarded, page, page + 1);
+            }
         }
     }
     // A placed texture there changed with no descriptor written.
@@ -2611,6 +2636,75 @@ mod tests {
         // SAFETY: our allocation.
         unsafe { VirtualFree(ww as *mut _, 0, MEM_RELEASE) };
         forget_written(ww, 4 * PAGE);
+    }
+
+    /// Disk-filled writes delivered through a separate runtime view are
+    /// invisible to both `GetWriteWatch` and page guards: `title_memory_written`
+    /// must record those pages in `JOURNAL`, advance `ahead_asked` when an
+    /// ahead snapshot stands, and evict `ahead_guarded` cleanly.
+    #[test]
+    fn title_memory_written_marks_journal_pages_without_guards_or_write_watch() {
+        // SAFETY: fresh 4-page write-watched allocation, released below.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 4 * PAGE);
+        let (baseline, before) = writes(start, end, false).expect("watched");
+        assert!(before.is_empty());
+
+        // Simulate runtime writing pages 1 and 2 via a separate view without
+        // touching `p` directly (so `GetWriteWatch` sees nothing).
+        title_memory_written(p + PAGE + 128, PAGE, true);
+        let (now, dirty) = writes(start, end, false).expect("watched");
+        assert!(now > baseline);
+        let p1 = p / PAGE + 1;
+        let p2 = p / PAGE + 2;
+        assert_eq!(dirty.len(), 2, "only pages 1 and 2 must be marked: {dirty:?}");
+        assert_eq!(dirty[0].0, p1);
+        assert_eq!(dirty[1].0, p2);
+        assert_eq!(dirty[0].1, dirty[1].1);
+        assert!(dirty[0].1 > baseline && dirty[0].1 < now);
+
+        // Under active `ask_once` (both write-watched `ahead` and guarded
+        // `ahead_guarded`): `title_memory_written` marks page 0 written,
+        // advances `ahead_asked` so `written <= ahead_asked`, and evicts the
+        // written block from `ahead_guarded`.
+        const VIEW_SIZE: usize = 2 * BLOCK;
+        let (section, view) = one_view(VIEW_SIZE);
+        assert!(writes(view, view + VIEW_SIZE, true).is_some());
+        ask_once(&[(start, end), (view, view + VIEW_SIZE)]);
+        let snap = journal_read().ahead_asked;
+        title_memory_written(p, 64, true);
+        let (after_ww, pages_ww) = asked(start, end).expect("still covered by ahead");
+        assert!(after_ww > snap);
+        assert!(
+            pages_ww.iter().any(|&(pg, w)| pg == p / PAGE && w == after_ww),
+            "page 0 must be marked at updated ahead_asked={after_ww}: {pages_ww:?}"
+        );
+        title_memory_written(view, BLOCK, true);
+        {
+            let j = journal_read();
+            assert!(!covers(&j.ahead_guarded, view / PAGE, view / PAGE + 1));
+            assert!(covers(&j.ahead_guarded, view / PAGE + 1, view / PAGE + 2));
+            assert!(j.written.get(&(view / PAGE)).is_some_and(|&w| w > after_ww));
+        }
+        ask_once_end();
+
+        // Overflow near the top of the address space must saturate cleanly.
+        title_memory_written(usize::MAX - 16, PAGE, true);
+
+        drop_views(section, &[view], VIEW_SIZE);
+        forget_written(view, VIEW_SIZE);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        forget_written(p, 4 * PAGE);
+        forget_written(usize::MAX - 16, PAGE);
     }
 }
 

@@ -236,10 +236,7 @@ fn submit_split(this: This, lists: &[This]) {
         )
     });
     if cut > 0 {
-        let now: Vec<_> = lists[..cut]
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
+        let now = crate::list::host_lists(&lists[..cut]);
         host.execute(&now);
     }
     if cut < lists.len() {
@@ -567,10 +564,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         if kept {
             return;
         }
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
+        let host_lists = crate::list::host_lists(lists);
         host.execute(&host_lists);
         crate::list::tables_done(lists);
         // What the lists wrote at the bottom of the pipe may be a fence

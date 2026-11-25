@@ -807,6 +807,14 @@ pub(crate) struct HostList {
     /// grown to the largest indirect execution recorded on the list, plus
     /// whether it is currently in `INDIRECT_ARGUMENT` state.
     indirect_args: Mutex<Option<(ID3D12Resource, u64, bool)>>,
+    /// Draws, dispatches, clears and copies recorded since the reset.
+    work: std::sync::atomic::AtomicU64,
+    /// Dispatches and buffer copies recorded since the reset: what may have
+    /// written indirect arguments (`crate::indirect` clamps hoisted before).
+    writes: std::sync::atomic::AtomicU64,
+    /// Buffers for clamped indirect arguments when this list holds the
+    /// clamps of the list after it (`clamp_room`).
+    clamp_chunks: Mutex<ClampChunks>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -817,6 +825,17 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+/// A list's buffers for hoisted clamped indirect arguments with their
+/// states, how many are in use since the reset, the bytes taken of the last
+/// of those, and whether the list has the barrier that precedes the clamps.
+#[derive(Default)]
+struct ClampChunks {
+    all: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
+    used: usize,
+    at: u64,
+    barrier: bool,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -835,7 +854,7 @@ fn lazy_prelude() -> bool {
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
-const STAMPS: u32 = 4096;
+const STAMPS: u32 = 16384;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -3416,6 +3435,9 @@ impl Host {
                 budget: OnceLock::new(),
                 budget_in_uav: std::sync::atomic::AtomicBool::new(false),
                 indirect_args: Mutex::default(),
+                work: std::sync::atomic::AtomicU64::new(0),
+                writes: std::sync::atomic::AtomicU64::new(0),
+                clamp_chunks: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -5291,6 +5313,9 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        // If this list holds hoisted clamps not yet transitioned to
+        // INDIRECT_ARGUMENT, transition them once before closing.
+        self.clamp_end();
         // Return indirect scratch and device-local budget buffers to COMMON
         // once per list close (keeps [L, L] double-submission & pool reuse legal).
         let mut close_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
@@ -5354,6 +5379,19 @@ impl HostList {
         self.budget_in_uav.store(false, Ordering::Relaxed);
         if let Some((_, _, in_indirect)) = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             *in_indirect = false;
+        }
+        self.work.store(0, Ordering::Relaxed);
+        self.writes.store(0, Ordering::Relaxed);
+        {
+            let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+            // Buffers decay to COMMON after ExecuteCommandLists (and remain
+            // COMMON if the list was never submitted).
+            for (_, state) in &mut chunks.all {
+                *state = D3D12_RESOURCE_STATE_COMMON;
+            }
+            chunks.used = 0;
+            chunks.at = 0;
+            chunks.barrier = false;
         }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5744,8 +5782,15 @@ impl HostList {
     /// Whether nothing recorded since the list was opened does any work:
     /// no draw or dispatch (the first keeps its pipeline), no copy, clear,
     /// upload or resolve (they defer a step or move a texture's state), no
-    /// bottom-of-pipe write. State set on the list does not count.
+    /// bottom-of-pipe write, no hoisted clamps. State set on the list does
+    /// not count.
     pub(crate) fn untouched(&self) -> bool {
+        if self.work.load(Ordering::Relaxed) != 0 || self.writes.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+        if self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner()).used != 0 {
+            return false;
+        }
         {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
@@ -5760,6 +5805,98 @@ impl HostList {
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
+    /// Counts a draw, dispatch, clear or copy.
+    pub(crate) fn count_work(&self) {
+        self.work.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether any work (draw, dispatch, clear or copy) has been recorded since the reset.
+    pub(crate) fn worked(&self) -> bool {
+        self.work.load(Ordering::Relaxed) != 0
+    }
+
+    /// Counts a dispatch or a buffer copy: what may write indirect arguments.
+    pub(crate) fn count_write(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Dispatches and buffer copies since the reset.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Room for `bytes` of clamped indirect arguments in this list's
+    /// buffers, writable by shaders from here on in the list: the buffer and
+    /// the offset. `None` for zero or more than one chunk holds.
+    pub(crate) fn clamp_room(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        const CHUNK: u64 = 256 << 10;
+        if bytes == 0 {
+            return None;
+        }
+        let bytes = bytes.next_multiple_of(16);
+        if bytes > CHUNK {
+            return None;
+        }
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        if chunks.used > 0 && chunks.at + bytes <= CHUNK {
+            let at = chunks.at;
+            chunks.at += bytes;
+            return Some((chunks.all[chunks.used - 1].0.clone(), at));
+        }
+        // The next buffer, writable.
+        if chunks.used == chunks.all.len() {
+            let buffer = host()?.uav_buffer(CHUNK)?;
+            name(&buffer, || "hoisted indirect arguments".to_string());
+            chunks.all.push((buffer, D3D12_RESOURCE_STATE_COMMON));
+        }
+        let i = chunks.used;
+        chunks.used += 1;
+        chunks.at = bytes;
+        let mut barriers = Vec::new();
+        if !chunks.barrier {
+            // What earlier lists' shaders wrote first.
+            chunks.barrier = true;
+            barriers.push(crate::indirect::uav_barrier());
+        }
+        let (buffer, state) = &mut chunks.all[i];
+        if *state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            barriers.push(transition(buffer, *state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            *state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        let buffer = buffer.clone();
+        drop(chunks);
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers (`buffer` kept alive by
+            // `clamp_chunks` and by the local clone).
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+        Some((buffer, 0))
+    }
+
+    /// Transitions all hoisted clamp chunks written so far from
+    /// `UNORDERED_ACCESS` to `INDIRECT_ARGUMENT` for the lists that follow.
+    /// Idempotent: calling again after chunks transitioned emits nothing.
+    pub(crate) fn clamp_end(&self) {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        let used = chunks.used;
+        let barriers: Vec<_> = chunks.all[..used]
+            .iter_mut()
+            .filter(|(_, state)| *state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            .map(|(buffer, state)| {
+                *state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )
+            })
+            .collect();
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers held under `chunks`.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
     }
 
     /// Notes a pipeline the list binds.

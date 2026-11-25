@@ -412,6 +412,70 @@ fn record_clamp_as(
     )
 }
 
+struct ClampBindings {
+    dst_bytes: u64,
+    src_gpu: u64,
+    count_gpu: u64,
+    records: u32,
+    constants: [u32; 7],
+}
+
+/// Validates layout alignment, source/count buffer widths, and 32-bit byte
+/// offsets (rebasing root SRV GPU VAs above 4 GiB) before binding the clamp
+/// compute shader.
+fn prepare_clamp_bindings(
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, copy_bytes, src_stride, records): (u32, u32, u32, u32),
+    ahead: bool,
+    stats: bool,
+) -> Option<ClampBindings> {
+    let (src_bytes, dst_bytes) = validate_layout_packed(
+        (kind, copy_bytes, src_stride, records),
+        src_offset,
+        count.map(|(_, off)| off),
+    )?;
+    // SAFETY: live D3D12 buffer resources. Root descriptors have no hardware
+    // bounds check in D3D12, so verify actual buffer widths before binding.
+    let (src_width, src_base) = unsafe { (src.GetDesc().Width, src.GetGPUVirtualAddress()) };
+    if !src_base.is_multiple_of(4) || src_offset.checked_add(src_bytes).is_none_or(|end| end > src_width) {
+        return None;
+    }
+    let (src_gpu, args_offset) = match src_offset
+        .checked_add(src_bytes)
+        .filter(|&end| end <= u64::from(u32::MAX))
+    {
+        Some(_) => (src_base, src_offset as u32),
+        None => (src_base.checked_add(src_offset)?, 0),
+    };
+    let (count_gpu, has_count, count_offset) = match count {
+        Some((buf, off)) => {
+            // SAFETY: a live D3D12 buffer resource.
+            let (count_width, base) = unsafe { (buf.GetDesc().Width, buf.GetGPUVirtualAddress()) };
+            if !base.is_multiple_of(4) || off.checked_add(4).is_none_or(|end| end > count_width) {
+                return None;
+            }
+            match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
+                Some(_) => (base, 1u32, off as u32),
+                None => (base.checked_add(off)?, 1u32, 0u32),
+            }
+        }
+        None => (src_gpu, 0u32, 0u32),
+    };
+    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) {
+        return None;
+    }
+    let flags = has_count | (u32::from(ahead) << 1) | (u32::from(stats) << 2);
+    let constants = [kind, src_stride, records, args_offset, flags, count_offset, copy_bytes];
+    Some(ClampBindings {
+        dst_bytes,
+        src_gpu,
+        count_gpu,
+        records,
+        constants,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_full(
     c: &Clamp,
@@ -420,69 +484,21 @@ fn record_clamp_full(
     was_in_indirect: bool,
     budget_res: Option<&ID3D12Resource>,
     budget: u64,
-    (src, src_offset): (&ID3D12Resource, u64),
+    src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
-    (kind, copy_bytes, src_stride, records): (u32, u32, u32, u32),
+    spec: (u32, u32, u32, u32),
     ahead: bool,
     stats: bool,
     chained: bool,
 ) -> bool {
-    let Some((src_bytes, dst_bytes)) = validate_layout_packed(
-        (kind, copy_bytes, src_stride, records),
-        src_offset,
-        count.map(|(_, off)| off),
-    ) else {
+    let Some(b) = prepare_clamp_bindings(src, count, spec, ahead, stats) else {
         return false;
     };
-    // SAFETY: live D3D12 buffer resources. Root descriptors have no hardware
-    // bounds check in D3D12, so verify actual buffer widths before binding.
-    let (src_width, dst_width, src_base, dst_gpu) = unsafe {
-        (
-            src.GetDesc().Width,
-            dst.GetDesc().Width,
-            src.GetGPUVirtualAddress(),
-            dst.GetGPUVirtualAddress(),
-        )
-    };
-    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+    // SAFETY: live D3D12 buffer resource.
+    let (dst_width, dst_gpu) = unsafe { (dst.GetDesc().Width, dst.GetGPUVirtualAddress()) };
+    if !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) || b.dst_bytes > dst_width {
         return false;
     }
-    if src_offset.checked_add(src_bytes).is_none_or(|end| end > src_width) || dst_bytes > dst_width {
-        return false;
-    }
-    let (src_gpu, args_offset) = match src_offset
-        .checked_add(src_bytes)
-        .filter(|&end| end <= u64::from(u32::MAX))
-    {
-        Some(_) => (src_base, src_offset as u32),
-        None => {
-            let Some(rebased) = src_base.checked_add(src_offset) else {
-                return false;
-            };
-            (rebased, 0)
-        }
-    };
-    let (count_gpu, has_count, count_offset) = match count {
-        Some((buf, off)) => {
-            // SAFETY: a live D3D12 buffer resource.
-            let (count_width, base) = unsafe { (buf.GetDesc().Width, buf.GetGPUVirtualAddress()) };
-            if !base.is_multiple_of(4) || off.checked_add(4).is_none_or(|end| end > count_width) {
-                return false;
-            }
-            match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
-                Some(_) => (base, 1u32, off as u32),
-                None => {
-                    let Some(rebased) = base.checked_add(off) else {
-                        return false;
-                    };
-                    (rebased, 1u32, 0u32)
-                }
-            }
-        }
-        None => (src_gpu, 0u32, 0u32),
-    };
-    let flags = has_count | (u32::from(ahead) << 1) | (u32::from(stats) << 2);
-    let constants = [kind, src_stride, records, args_offset, flags, count_offset, copy_bytes];
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
@@ -516,20 +532,179 @@ fn record_clamp_full(
     unsafe {
         // Earlier shader writes (or just `budget` on chained windows) first.
         l.ResourceBarrier(&first[skip..]);
-        if records > 0 {
+        if b.records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, src_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu);
+            l.SetComputeRoot32BitConstants(0, 7, b.constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, b.src_gpu);
+            l.SetComputeRootShaderResourceView(2, b.count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            l.Dispatch(b.records.div_ceil(64), 1, 1);
         }
         // `UAV -> INDIRECT_ARGUMENT` already orders `dst` for ExecuteIndirect.
         l.ResourceBarrier(&second);
     }
     true
+}
+
+/// Parses `VICTORY_HOIST_CLAMPS` (`0..=7`), defaulting to mode `7`.
+pub(crate) fn parse_hoist_mode(raw: Option<&str>) -> u8 {
+    raw.and_then(|v| v.trim().parse::<u8>().ok())
+        .filter(|&n| n < 8)
+        .unwrap_or(7)
+}
+
+/// Whether hoist `mode` (`0..=7`) hoists indirect clamps for `kind`
+/// (`0` draw, `1` indexed draw, `2` compute dispatch, `10` mesh dispatch).
+pub(crate) fn hoist_allows(mode: u8, kind: u32) -> bool {
+    const DISPATCH: u32 = 2;
+    const MESH: u32 = 10;
+    kind != DISPATCH
+        && match mode {
+            0 | 6 => false,
+            3 => kind == MESH,
+            4 => kind != MESH,
+            _ => true,
+        }
+}
+
+/// How clamps of indirect draws are recorded:
+/// - `0`: each inline before its draw (no list cut);
+/// - `1`: hoisted into a pre-list before the draw list, without barriers
+///   between clamps;
+/// - `2`: as `1`, with a UAV barrier before each hoisted draw in the draw list;
+/// - `3`: as `1`, for mesh dispatches only;
+/// - `4`: as `1`, for non-mesh draws only;
+/// - `5`: as `1`, always allocating a new list for clamps;
+/// - `6`: lists cut as for `1`, with each clamp still inline before its draw;
+/// - `7`: as `1`, with a UAV barrier on `budget` between hoisted clamps so
+///   records past the list's budget stay deterministic in draw order (the
+///   default; prevents mesh object flicker).
+///
+/// `VICTORY_HOIST_CLAMPS=<n>` sets it (default `7`; `0` disables hoisting);
+/// diagnostics builds also poll `VICTORY_HOIST_FILE` every 500 ms if set.
+pub(crate) fn hoist_mode() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
+    let mode = MODE.load(Ordering::Relaxed);
+    if mode == u8::MAX {
+        let set = parse_hoist_mode(std::env::var("VICTORY_HOIST_CLAMPS").ok().as_deref());
+        if MODE
+            .compare_exchange(u8::MAX, set, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+            && cfg!(feature = "diagnostics")
+            && let Some(file) = std::env::var_os("VICTORY_HOIST_FILE")
+        {
+            let _ = std::thread::Builder::new()
+                .name("victory-hoist".into())
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        let read = std::fs::read_to_string(&file)
+                            .ok()
+                            .and_then(|t| t.trim().parse::<u8>().ok());
+                        let cuts = CUTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                        if cuts != [0, 0] {
+                            tracing::info!(
+                                cuts = cuts[0],
+                                queries = cuts[1],
+                                "lists cut for hoisted clamps"
+                            );
+                        }
+                        if let Some(n) = read.filter(|&n| n < 8 && n != MODE.load(Ordering::Relaxed)) {
+                            MODE.store(n, Ordering::Relaxed);
+                            tracing::info!(mode = n, "clamps of indirect draws: mode changed");
+                        }
+                    }
+                });
+        }
+        return MODE.load(Ordering::Relaxed);
+    }
+    mode
+}
+
+/// Cuts made for hoisted clamps, and those skipped for open queries.
+pub(crate) static CUTS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Whether clamps of indirect draws go to a pre-list before the draw list.
+pub(crate) fn hoisting() -> bool {
+    hoist_mode() != 0
+}
+
+/// As [`bound`] / [`bound_ahead`], recorded in `clamps`, a pre-list that runs
+/// before the list executing the indirect draws. Returns `(chunk_buffer, offset)`
+/// readable as indirect arguments once `clamps.clamp_end()` has run.
+///
+/// `spec` is `(kind, copy_bytes, src_stride, records)`. When `ahead` is true
+/// (`VICTORY_INDIRECT_WINDOW` composing with hoisted clamps), unfilled garbage
+/// slots are left empty and charge nothing, and records `src_stride` bytes
+/// apart are packed tightly at `copy_bytes` intervals starting at `offset`.
+pub(crate) fn bound_before(
+    clamps: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32, u32),
+    ahead: bool,
+) -> Option<(ID3D12Resource, u64)> {
+    if spec.3 == 0 {
+        return None;
+    }
+    let b = prepare_clamp_bindings(src, count, spec, ahead, HostList::indirect_stats())?;
+    let (c, (budget_res, budget)) = (clamp()?, clamps.budget()?);
+    if !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (dst, at) = clamps.clamp_room(b.dst_bytes)?;
+    // SAFETY: live D3D12 buffer resource.
+    let (dst_width, dst_base) = unsafe { (dst.GetDesc().Width, dst.GetGPUVirtualAddress()) };
+    let dst_gpu = dst_base.checked_add(at)?;
+    if !dst_gpu.is_multiple_of(4) || at.checked_add(b.dst_bytes).is_none_or(|end| end > dst_width) {
+        return None;
+    }
+    record_hoisted_clamp(
+        c,
+        &clamps.list,
+        &b,
+        dst_gpu,
+        &budget_res,
+        budget,
+        hoist_mode() == 7,
+    );
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    Some((dst, at))
+}
+
+fn record_hoisted_clamp(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    b: &ClampBindings,
+    dst_gpu: u64,
+    budget_res: &ID3D12Resource,
+    budget: u64,
+    ordered: bool,
+) {
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // count, destination (writable: `clamp_room`) and budget buffers.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 7, b.constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, b.src_gpu);
+        l.SetComputeRootShaderResourceView(2, b.count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(b.records.div_ceil(64), 1, 1);
+        // Mode 7: serialize clamps on `budget` so records past the list's
+        // budget are charged deterministically in draw order (no flicker).
+        if ordered {
+            l.ResourceBarrier(&[uav_barrier_for(Some(budget_res))]);
+        }
+    }
 }
 
 /// Returns the scratch buffer to `COMMON` if it is currently in
@@ -554,7 +729,7 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     uav_barrier_for(None)
 }
 
@@ -1620,6 +1795,231 @@ void main() {
         let (d2, t2) = run(&mut warp, 3, 1);
         assert_eq!(d2, vec![0, 0, 0, 0]);
         assert_eq!(t2, vec![1, INFLIGHT_NONE, INFLIGHT_NONE, INFLIGHT_NONE, INFLIGHT_NONE]);
+    }
+
+    /// Verifies `VICTORY_HOIST_CLAMPS` mode parsing (default = 7, `0` = off,
+    /// `1..=7` modes, invalid/out-of-range fallback to 7) and per-kind filters.
+    #[test]
+    fn hoist_mode_parsing_and_kind_filters() {
+        assert_eq!(parse_hoist_mode(None), 7);
+        assert_eq!(parse_hoist_mode(Some("0")), 0);
+        for m in 1..=7u8 {
+            assert_eq!(parse_hoist_mode(Some(&m.to_string())), m);
+        }
+        assert_eq!(parse_hoist_mode(Some(" 3 \n")), 3);
+        assert_eq!(parse_hoist_mode(Some("8")), 7);
+        assert_eq!(parse_hoist_mode(Some("99")), 7);
+        assert_eq!(parse_hoist_mode(Some("-1")), 7);
+        assert_eq!(parse_hoist_mode(Some("off")), 7);
+        assert_eq!(parse_hoist_mode(Some("")), 7);
+
+        // Kinds: 0 DRAW, 1 INDEXED, 2 DISPATCH, 10 MESH.
+        for m in 0..=7u8 {
+            assert!(!hoist_allows(m, 2), "DISPATCH is never hoisted (mode {m})");
+        }
+        for k in [0, 1, 10] {
+            assert!(!hoist_allows(0, k));
+            assert!(!hoist_allows(6, k));
+            for m in [1, 2, 5, 7] {
+                assert!(hoist_allows(m, k), "mode {m} must hoist kind {k}");
+            }
+        }
+        // Mode 3: mesh only; Mode 4: non-mesh draws only.
+        assert!(!hoist_allows(3, 0));
+        assert!(!hoist_allows(3, 1));
+        assert!(hoist_allows(3, 10));
+        assert!(hoist_allows(4, 0));
+        assert!(hoist_allows(4, 1));
+        assert!(!hoist_allows(4, 10));
+    }
+
+    /// Exercises hoisted `bound_before` + `HostList::clamp_room` / `clamp_end` /
+    /// `reset` across single-record clamps, packed `VICTORY_INDIRECT_WINDOW`
+    /// ahead-clamps, 256 KiB chunk spillover, and post-reset chunk reuse.
+    #[test]
+    fn host_list_hoisted_clamps_pack_offsets_spill_chunks_and_reset_cleanly() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(clamps) = host.new_list() else {
+            return;
+        };
+        let Some((src_buf, src_ptr)) = host.shared_buffer(512 << 10) else {
+            return;
+        };
+        // SAFETY: mapped host buffer.
+        unsafe { std::ptr::write_bytes(src_ptr, 0, 512 << 10) };
+
+        // 1. Single mesh record (12B -> rounded to 16B) at offset 0.
+        let (b0, at0) = bound_before(&clamps, (&src_buf, 0), None, (10, 12, 12, 1), false)
+            .expect("single hoisted clamp");
+        assert_eq!(at0, 0);
+
+        // 2. Packed VICTORY_INDIRECT_WINDOW ahead-clamp (16 mesh records,
+        //    copy_bytes=12, src_stride=32 -> 192B) packs right behind at offset 16.
+        let (b1, at1) = bound_before(&clamps, (&src_buf, 32), None, (10, 12, 32, 16), true)
+            .expect("windowed hoisted clamp");
+        assert_eq!(b1.as_raw(), b0.as_raw(), "second clamp must share first 256 KiB chunk");
+        assert_eq!(at1, 16);
+
+        // 3. Third clamp follows at 16 + 192 = 208 (16-byte aligned).
+        let (b2, at2) = bound_before(&clamps, (&src_buf, 0), None, (1, 20, 20, 1), false)
+            .expect("indexed draw hoisted clamp");
+        assert_eq!(b2.as_raw(), b0.as_raw());
+        assert_eq!(at2, 208);
+
+        // 4. Request exceeding remaining space in chunk 0 spills into chunk 1 at offset 0.
+        //    Chunk 0 is 256 KiB (262,144B) with 240B already used; 13,100 indexed
+        //    records * 20B = 262,000B <= 262,144B, > 261,904B remaining.
+        let (b3, at3) = bound_before(&clamps, (&src_buf, 0), None, (1, 20, 20, 13_100), false)
+            .expect("chunk spillover must succeed");
+        assert_ne!(b3.as_raw(), b0.as_raw(), "spillover must allocate a second chunk");
+        assert_eq!(at3, 0);
+
+        // 5. Request exceeding a single 256 KiB chunk or 0 records returns None (falls back inline).
+        assert!(bound_before(&clamps, (&src_buf, 0), None, (1, 20, 20, 0), false).is_none());
+        assert!(bound_before(&clamps, (&src_buf, 0), None, (1, 20, 20, 20_000), false).is_none());
+
+        clamps.clamp_end();
+        clamps.close();
+        host.execute(&[&clamps]);
+        clamps.reset();
+
+        // After reset, chunk 0 is reused from offset 0 with clean COMMON -> UAV transition.
+        let (b4, at4) = bound_before(&clamps, (&src_buf, 0), None, (10, 12, 12, 1), false)
+            .expect("post-reset hoisted clamp");
+        assert_eq!(b4.as_raw(), b0.as_raw(), "chunk 0 must be reused after reset");
+        assert_eq!(at4, 0);
+        clamps.clamp_end();
+        clamps.close();
+        host.execute(&[&clamps]);
+        clamps.reset();
+    }
+
+    /// WARP D3D12 test verifying hoisted clamp dispatches (mode 7 serialized
+    /// on `budget` + packed `VICTORY_INDIRECT_WINDOW` ahead-clamp) write exact
+    /// clamped records at disjoint offsets in one chunk buffer and charge
+    /// `BUDGET` deterministically in dispatch order.
+    #[test]
+    fn warp_hoisted_clamps_deterministic_budget_and_window_packing() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_INDEXED: u32 = 1;
+        const KIND_MESH: u32 = 10;
+        const BUDGET_CAP: u32 = 1 << 27;
+
+        let (src_buf, src_ptr, _) = warp.shared_buffer(4096);
+        let (budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(512);
+        let chunk_buf = warp.default_uav(64 << 10);
+        // SAFETY: live D3D12 buffer.
+        let chunk_gpu = unsafe { chunk_buf.GetGPUVirtualAddress() };
+
+        let mut src = vec![0xffu8; 4096];
+        // Mesh window at src offset 0 (src_stride=32, copy_bytes=12, 4 records):
+        // records 0 and 1 filled (groups 7 and 11), records 2 and 3 unfilled (0xffffffff).
+        let write_u32 = |buf: &mut [u8], off: usize, vals: &[u32]| {
+            for (i, v) in vals.iter().enumerate() {
+                buf[off + i * 4..off + (i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+            }
+        };
+        write_u32(&mut src, 0, &[7, 1, 1]);
+        write_u32(&mut src, 32, &[11, 1, 1]);
+
+        // Three huge indexed draws at src offsets 256, 320, 384 (each asks for
+        // 1<<24 * 4 = 1<<26 = BUDGET/2): with mode-7 serialization, draw A (1<<26)
+        // fits, draw B (1<<26) saturates BUDGET (actually mesh window already
+        // spent (7+11)*128 = 2304, so draw A fits and draw B exceeds remaining
+        // BUDGET and is deterministically zeroed, as is draw C!).
+        // Make draw A ask for (1<<24, 2) = 1<<25, draw B ask for (1<<24, 4) = 1<<26,
+        // draw C ask for (1<<24, 4) = 1<<26 -> A + B = 3<<25 + 2304 < 2^27 (BOTH
+        // KEEP!), C pushes past 2^27 (DETERMINISTICALLY ZEROED!).
+        write_u32(&mut src, 256, &[1 << 24, 2, 101, 102, 103]);
+        write_u32(&mut src, 320, &[1 << 24, 4, 201, 202, 203]);
+        write_u32(&mut src, 384, &[1 << 24, 4, 301, 302, 303]);
+
+        // SAFETY: mapped buffers of sufficient capacity.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, 4096);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0, 512);
+        }
+
+        // Transition chunk COMMON -> UAV once (as `HostList::clamp_room` does).
+        // SAFETY: open list, live buffer.
+        unsafe {
+            warp.list.ResourceBarrier(&[
+                uav_barrier(),
+                transition(
+                    &chunk_buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+            ]);
+        }
+
+        // Dispatch 1: packed mesh window at chunk offset 0 (4 * 12 = 48B).
+        let b_mesh = prepare_clamp_bindings((&src_buf, 0), None, (KIND_MESH, 12, 32, 4), true, false)
+            .expect("mesh window bindings");
+        record_hoisted_clamp(&warp.clamp, &warp.list, &b_mesh, chunk_gpu, &budget_buf, budget_gpu, true);
+
+        // Dispatches 2, 3, 4: indexed draws A, B, C at chunk offsets 64, 96, 128.
+        for (src_off, dst_off) in [(256u64, 64u64), (320, 96), (384, 128)] {
+            let b = prepare_clamp_bindings((&src_buf, src_off), None, (KIND_INDEXED, 20, 20, 1), false, false)
+                .expect("indexed draw bindings");
+            record_hoisted_clamp(
+                &warp.clamp,
+                &warp.list,
+                &b,
+                chunk_gpu + dst_off,
+                &budget_buf,
+                budget_gpu,
+                true,
+            );
+        }
+
+        // One batched `clamp_end` transition UAV -> INDIRECT_ARGUMENT, then readback.
+        // SAFETY: open list, live buffers.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &chunk_buf,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+            warp.list.ResourceBarrier(&[transition(
+                &chunk_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &chunk_buf, 0, 160);
+            warp.list.ResourceBarrier(&[transition(
+                &chunk_buf,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        warp.submit_and_wait();
+
+        // SAFETY: GPU execution completed; mapped readback & budget buffers.
+        let (spent, words) = unsafe {
+            (
+                (budget_ptr as *const u32).read_volatile(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), 40).to_vec(),
+            )
+        };
+        // Mesh window packed tightly at chunk offset 0 (dwords 0..12):
+        assert_eq!(&words[0..3], &[7, 1, 1]);
+        assert_eq!(&words[3..6], &[11, 1, 1]);
+        assert_eq!(&words[6..9], &[0, 0, 0], "unfilled mesh tail 2 zeroed");
+        assert_eq!(&words[9..12], &[0, 0, 0], "unfilled mesh tail 3 zeroed");
+        // Draw A at offset 64 (dword 16): kept.
+        assert_eq!(&words[16..21], &[1 << 24, 2, 101, 102, 103]);
+        // Draw B at offset 96 (dword 24): kept.
+        assert_eq!(&words[24..29], &[1 << 24, 4, 201, 202, 203]);
+        // Draw C at offset 128 (dword 32): deterministically zeroed past BUDGET.
+        assert_eq!(&words[32..37], &[0, 0, 301, 302, 303]);
+        assert_eq!(spent, BUDGET_CAP, "budget saturated cleanly without wraparound");
     }
 }
 
