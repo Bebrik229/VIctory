@@ -237,6 +237,7 @@ const MAKING: u8 = 3;
 
 struct Queue {
     early: VecDeque<Arc<Pending>>,
+    early_depth: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
     screen: VecDeque<Arc<Pending>>,
 }
@@ -245,6 +246,7 @@ impl Queue {
     const fn new() -> Self {
         Self {
             early: VecDeque::new(),
+            early_depth: VecDeque::new(),
             requested: VecDeque::new(),
             screen: VecDeque::new(),
         }
@@ -264,6 +266,14 @@ impl Queue {
             } else {
                 self.requested.push_back(p.clone());
             }
+        } else if p
+            .graphics
+            .as_ref()
+            .is_some_and(|state| state.writes_depth_only())
+        {
+            // Shadow maps and depth prepasses supply several later draws. Rebuild
+            // their previously used PSOs first while no draw is requesting one.
+            self.early_depth.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
         }
@@ -277,8 +287,12 @@ impl Queue {
             .or_else(|| self.requested.pop_front())
             .or_else(|| {
                 // An early entry can have been promoted and claimed already.
-                std::iter::from_fn(|| self.early.pop_front())
-                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+                std::iter::from_fn(|| {
+                    self.early_depth
+                        .pop_front()
+                        .or_else(|| self.early.pop_front())
+                })
+                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
             })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
@@ -430,6 +444,45 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn early_depth_pipelines_pop_ahead_of_ordinary_early_but_behind_requested_and_screen() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
+
+        let make_depth_state = || {
+            let mut state = GraphicsState::default();
+            let subobject = [16u32, DXGI_FORMAT_D32_FLOAT.0 as u32];
+            // SAFETY: valid 8-byte subobject of kind 16 (depth-stencil format).
+            unsafe { state.read(16, subobject.as_ptr().cast()) };
+            assert!(state.writes_depth_only());
+            Box::new(state)
+        };
+        let mut screen_state = GraphicsState::default();
+        screen_state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        assert!(screen_state.screen_pass());
+
+        let early_normal = Arc::new(Pending::new(Vec::new(), None));
+        let early_depth = Arc::new(Pending::new(Vec::new(), Some(make_depth_state())));
+        let promoted_depth = Arc::new(Pending::new(Vec::new(), Some(make_depth_state())));
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let screen = Arc::new(Pending::new(Vec::new(), Some(Box::new(screen_state))));
+        let mut queue = Queue::new();
+
+        assert_eq!(queue.push(&early_normal, EARLY), Some(true));
+        assert_eq!(queue.push(&early_depth, EARLY), Some(true));
+        assert_eq!(queue.push(&promoted_depth, EARLY), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
+        assert_eq!(queue.push(&promoted_depth, REQUESTED), Some(false));
+        assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &screen));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted_depth));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &early_depth));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &early_normal));
         assert!(queue.pop().is_none());
     }
 }

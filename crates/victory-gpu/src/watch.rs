@@ -1658,33 +1658,97 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+struct Mapping {
+    changing: Option<std::ops::Range<usize>>,
+    readers: Vec<std::ops::Range<usize>>,
+}
+
+static MAPPING: Mutex<Mapping> = Mutex::new(Mapping {
+    changing: None,
+    readers: Vec::new(),
+});
+static WRITER: Mutex<()> = Mutex::new(());
+static MAPPING_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+const ALL_MEMORY: std::ops::Range<usize> = 0..usize::MAX;
+
+fn overlaps(a: &std::ops::Range<usize>, b: &std::ops::Range<usize>) -> bool {
+    a.start.max(b.start) < a.end.min(b.end)
+}
+
+impl Mapping {
+    fn changing(&self, range: &std::ops::Range<usize>) -> bool {
+        self.changing.as_ref().is_some_and(|w| overlaps(w, range))
+    }
+
+    fn pin(&mut self, range: std::ops::Range<usize>) -> Reading {
+        self.readers.push(range.clone());
+        READING_RANGES.with(|r| r.borrow_mut().push(range.clone()));
+        Reading(range, std::marker::PhantomData)
+    }
+}
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        MAPPING.lock().unwrap_or_else(|e| e.into_inner()).changing = None;
+        MAPPING_CHANGED.notify_all();
+    }
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    title_memory_remapping_range(ALL_MEMORY)
+}
+
+/// Like [`title_memory_remapping`], scoped to `range`: reads of disjoint
+/// ranges continue without waiting, while reads overlapping `range` wait
+/// until the returned guard is dropped.
+pub fn title_memory_remapping_range(range: std::ops::Range<usize>) -> Remapping {
+    let writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    state.changing = Some(range.clone());
+    let state = MAPPING_CHANGED
+        .wait_while(state, |s| s.readers.iter().any(|r| overlaps(r, &range)))
+        .unwrap_or_else(|e| e.into_inner());
+    drop(state);
+    Remapping(writer)
 }
 
 thread_local! {
-    /// Active [`Reading`] guards held by the current thread, so fault-safe
+    /// Active [`Reading`] ranges held by the current thread, so fault-safe
     /// fast reads nested inside an outer [`title_memory_reading`] (e.g.
-    /// texture refreshes) skip a recursive `SRWLOCK` acquisition.
-    static READING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// texture refreshes) skip a recursive lock acquisition.
+    static READING_RANGES: std::cell::RefCell<Vec<std::ops::Range<usize>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(std::ops::Range<usize>, std::marker::PhantomData<*const ()>);
 
 impl Drop for Reading {
     fn drop(&mut self) {
-        READING_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        READING_RANGES.with(|r| {
+            let mut ranges = r.borrow_mut();
+            if let Some(i) = ranges.iter().rposition(|range| *range == self.0) {
+                ranges.swap_remove(i);
+            }
+        });
+        let mut state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+        let i = state
+            .readers
+            .iter()
+            .position(|r| *r == self.0)
+            .expect("active mapping reader");
+        state.readers.swap_remove(i);
+        if state.changing(&self.0) {
+            MAPPING_CHANGED.notify_all();
+        }
     }
 }
 
@@ -1693,32 +1757,50 @@ impl Drop for Reading {
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
-    READING_DEPTH.with(|d| d.set(d.get() + 1));
-    Reading(guard)
+    title_memory_reading_range(ALL_MEMORY)
+}
+
+/// Like [`title_memory_reading`], scoped to `range`: remappings of disjoint
+/// ranges continue without waiting, while remappings overlapping `range`
+/// wait until the returned guard is dropped.
+pub fn title_memory_reading_range(range: std::ops::Range<usize>) -> Reading {
+    let state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    MAPPING_CHANGED
+        .wait_while(state, |s| s.changing(&range))
+        .unwrap_or_else(|e| e.into_inner())
+        .pin(range)
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
-    let guard = match MAPPING.try_read() {
-        Ok(guard) => guard,
+    title_memory_reading_now_range(ALL_MEMORY)
+}
+
+/// [`title_memory_reading_range`] if it can be had at once: `None` while
+/// the runtime changes an overlapping mapping (or `MAPPING` is contended).
+pub(crate) fn title_memory_reading_now_range(range: std::ops::Range<usize>) -> Option<Reading> {
+    let mut state = match MAPPING.try_lock() {
+        Ok(state) => state,
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return None,
     };
-    READING_DEPTH.with(|d| d.set(d.get() + 1));
-    Some(Reading(guard))
+    (!state.changing(&range)).then(|| state.pin(range))
 }
 
 /// Non-blocking read guard against concurrent title-memory remapping, safe
-/// even if this thread already holds an outer [`Reading`].
+/// even if this thread already holds an outer [`Reading`] covering `range`.
 #[cfg(target_arch = "x86_64")]
-fn acquire_reading_now() -> Option<Option<Reading>> {
-    if READING_DEPTH.with(std::cell::Cell::get) > 0 {
+fn acquire_reading_now(range: std::ops::Range<usize>) -> Option<Option<Reading>> {
+    if READING_RANGES.with(|r| {
+        r.borrow()
+            .iter()
+            .any(|held| held.start <= range.start && range.end <= held.end)
+    }) {
         Some(None)
     } else {
-        title_memory_reading_now().map(Some)
+        title_memory_reading_now_range(range).map(Some)
     }
 }
 
@@ -1892,7 +1974,8 @@ pub(crate) fn try_copy_fast(dst: *mut u8, src: *const u8, len: usize) -> bool {
         return false;
     }
     install();
-    let Some(_reading) = acquire_reading_now() else {
+    let start = src as usize;
+    let Some(_reading) = acquire_reading_now(start..start + len) else {
         return false;
     };
     let mut remaining = len;
@@ -1950,7 +2033,8 @@ pub(crate) fn try_diff_bounds_fast(src: *const u8, cur: &[u8]) -> Option<Option<
         return None;
     }
     install();
-    let _reading = acquire_reading_now()?;
+    let start = src as usize;
+    let _reading = acquire_reading_now(start..start + len)?;
     let cur_ptr = cur.as_ptr();
     let end16 = len & !15;
     let (first, faulted) = READ_RECOVER_RIP.with(|slot| {
@@ -3157,7 +3241,10 @@ mod tests {
 
 #[cfg(test)]
 mod mapping_tests {
-    use super::{title_memory_reading, title_memory_remapping};
+    use super::{
+        title_memory_reading, title_memory_reading_now_range, title_memory_reading_range,
+        title_memory_remapping, title_memory_remapping_range,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
@@ -3202,6 +3289,67 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn disjoint_ranges_proceed_while_overlapping_ranges_wait() {
+        // Remapping `[0x1000, 0x2000)` lets a disjoint read proceed at once,
+        // while an overlapping read waits until the remapping drops.
+        let changing = title_memory_remapping_range(0x1000..0x2000);
+        assert!(title_memory_reading_now_range(0x2000..0x3000).is_some());
+        assert!(title_memory_reading_now_range(0x1800..0x2800).is_none());
+        let disjoint = std::thread::spawn(|| {
+            let _r = title_memory_reading_range(0x2000..0x3000);
+        });
+        disjoint.join().unwrap();
+
+        let overlap_read = Arc::new(AtomicBool::new(false));
+        let (began, wait) = mpsc::channel();
+        let overlapping = {
+            let overlap_read = overlap_read.clone();
+            std::thread::spawn(move || {
+                began.send(()).unwrap();
+                let _r = title_memory_reading_range(0x1800..0x2800);
+                overlap_read.store(true, Ordering::SeqCst);
+            })
+        };
+        wait.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !overlap_read.load(Ordering::SeqCst),
+            "overlapping read began during a range remapping"
+        );
+        drop(changing);
+        overlapping.join().unwrap();
+        assert!(overlap_read.load(Ordering::SeqCst));
+
+        // Holding a read on `[0x2000, 0x3000)` lets a disjoint remapping proceed,
+        // while an overlapping remapping waits until the read drops.
+        let reading = title_memory_reading_range(0x2000..0x3000);
+        let disjoint_remap = std::thread::spawn(|| {
+            let _w = title_memory_remapping_range(0x1000..0x2000);
+        });
+        disjoint_remap.join().unwrap();
+
+        let overlap_changed = Arc::new(AtomicBool::new(false));
+        let (began, wait) = mpsc::channel();
+        let overlapping_remap = {
+            let overlap_changed = overlap_changed.clone();
+            std::thread::spawn(move || {
+                began.send(()).unwrap();
+                let _w = title_memory_remapping_range(0x2500..0x3500);
+                overlap_changed.store(true, Ordering::SeqCst);
+            })
+        };
+        wait.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !overlap_changed.load(Ordering::SeqCst),
+            "overlapping remapping began under an active range read"
+        );
+        drop(reading);
+        overlapping_remap.join().unwrap();
+        assert!(overlap_changed.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -3254,8 +3402,8 @@ mod mapping_tests {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod fast_copy_tests {
     use super::{
-        KERNEL_PAGE, PAGE, title_memory_reading, title_memory_remapping, try_copy_fast,
-        try_diff_bounds_fast,
+        KERNEL_PAGE, PAGE, title_memory_reading, title_memory_remapping,
+        title_memory_remapping_range, try_copy_fast, try_diff_bounds_fast,
     };
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
@@ -3444,6 +3592,21 @@ mod fast_copy_tests {
 
         // While a remapping holds the write lock, fast paths immediately return false / None.
         let remapping = title_memory_remapping();
+        assert!(!try_copy_fast(dst.as_mut_ptr(), src.as_ptr(), src.len()));
+        assert_eq!(try_diff_bounds_fast(src.as_ptr(), &dst), None);
+        drop(remapping);
+
+        // While an unrelated range is remapping, fast paths on `src` still succeed.
+        let remapping = title_memory_remapping_range(0x1000..0x2000);
+        assert_eq!(try_diff_bounds_fast(src.as_ptr(), &dst), Some(Some((0, 16))));
+        assert!(try_copy_fast(dst.as_mut_ptr(), src.as_ptr(), src.len()));
+        assert_eq!(dst, src);
+        drop(remapping);
+        dst.fill(0);
+
+        // While an overlapping range is remapping, fast paths yield.
+        let start = src.as_ptr() as usize;
+        let remapping = title_memory_remapping_range(start..start + 1);
         assert!(!try_copy_fast(dst.as_mut_ptr(), src.as_ptr(), src.len()));
         assert_eq!(try_diff_bounds_fast(src.as_ptr(), &dst), None);
         drop(remapping);

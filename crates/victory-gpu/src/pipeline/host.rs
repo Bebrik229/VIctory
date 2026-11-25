@@ -132,6 +132,68 @@ fn depth_padding() -> Range<usize> {
 }
 
 impl GraphicsState {
+    pub(super) fn writes_depth_only(&self) -> bool {
+        self.targets.NumRenderTargets == 0
+            && self.depth_format != DXGI_FORMAT_UNKNOWN
+            && self.depth.DepthEnable.as_bool()
+            && self.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL
+    }
+
+    /// The guest color buffer bypasses its blender for integer surfaces,
+    /// even when the draw asks for blending. D3D12 validates blend enable
+    /// against every active target format when the pipeline is created.
+    pub(crate) fn apply_integer_blend_bypass(&mut self) {
+        let integer = |f: &DXGI_FORMAT| {
+            matches!(
+                *f,
+                DXGI_FORMAT_R32G32B32A32_UINT
+                    | DXGI_FORMAT_R32G32B32A32_SINT
+                    | DXGI_FORMAT_R32G32B32_UINT
+                    | DXGI_FORMAT_R32G32B32_SINT
+                    | DXGI_FORMAT_R16G16B16A16_UINT
+                    | DXGI_FORMAT_R16G16B16A16_SINT
+                    | DXGI_FORMAT_R32G32_UINT
+                    | DXGI_FORMAT_R32G32_SINT
+                    | DXGI_FORMAT_R10G10B10A2_UINT
+                    | DXGI_FORMAT_R8G8B8A8_UINT
+                    | DXGI_FORMAT_R8G8B8A8_SINT
+                    | DXGI_FORMAT_R16G16_UINT
+                    | DXGI_FORMAT_R16G16_SINT
+                    | DXGI_FORMAT_R32_UINT
+                    | DXGI_FORMAT_R32_SINT
+                    | DXGI_FORMAT_R8G8_UINT
+                    | DXGI_FORMAT_R8G8_SINT
+                    | DXGI_FORMAT_R16_UINT
+                    | DXGI_FORMAT_R16_SINT
+                    | DXGI_FORMAT_R8_UINT
+                    | DXGI_FORMAT_R8_SINT
+            )
+        };
+        let formats = &self.targets.RTFormats[..(self.targets.NumRenderTargets as usize).min(8)];
+        let mut changed = false;
+        if !self.blend.IndependentBlendEnable.as_bool() {
+            let shared = self.blend.RenderTarget[0];
+            if !shared.BlendEnable.as_bool() || !formats.iter().any(integer) {
+                return;
+            }
+            // With shared blending D3D12 reads slot zero for every target.
+            // Expand it before overriding individual targets, including
+            // their shared write mask.
+            self.blend.RenderTarget[..formats.len()].fill(shared);
+            self.blend.IndependentBlendEnable = (formats.len() > 1).into();
+            changed = true;
+        }
+        for (format, target) in formats.iter().zip(&mut self.blend.RenderTarget) {
+            if integer(format) && target.BlendEnable.as_bool() {
+                target.BlendEnable = false.into();
+                changed = true;
+            }
+        }
+        if changed {
+            zero_padding(&mut self.blend, &blend_padding());
+        }
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -2161,5 +2223,54 @@ mod tests {
             root_signature(&host.device, &params_a, &samplers_diff, false).unwrap();
         assert_ne!(root_a.as_raw(), root_sampler.as_raw());
         assert!(!Arc::ptr_eq(&blob_a, &blob_sampler));
+    }
+
+    #[test]
+    fn integer_target_bypasses_blending_and_preserves_mixed_target_masks() {
+        let mut independent = GraphicsState::default();
+        independent.targets.NumRenderTargets = 3;
+        independent.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        independent.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        independent.targets.RTFormats[2] = DXGI_FORMAT_R32_UINT;
+        independent.blend.IndependentBlendEnable = true.into();
+        for (i, mask) in [(0, 0x0f), (1, 0x07), (2, 0x03)] {
+            independent.blend.RenderTarget[i].BlendEnable = true.into();
+            independent.blend.RenderTarget[i].RenderTargetWriteMask = mask;
+        }
+        independent.apply_integer_blend_bypass();
+        assert!(independent.blend.IndependentBlendEnable.as_bool());
+        assert!(independent.blend.RenderTarget[0].BlendEnable.as_bool());
+        assert!(independent.blend.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!independent.blend.RenderTarget[2].BlendEnable.as_bool());
+        assert_eq!(independent.blend.RenderTarget[0].RenderTargetWriteMask, 0x0f);
+        assert_eq!(independent.blend.RenderTarget[1].RenderTargetWriteMask, 0x07);
+        assert_eq!(independent.blend.RenderTarget[2].RenderTargetWriteMask, 0x03);
+        assert_eq!(padding_of(&independent.blend, &blend_padding()), vec![0; 24]);
+
+        let mut shared = GraphicsState::default();
+        shared.targets.NumRenderTargets = 3;
+        shared.targets.RTFormats[0] = DXGI_FORMAT_R8_UINT;
+        shared.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        shared.targets.RTFormats[2] = DXGI_FORMAT_R16G16_FLOAT;
+        shared.blend.IndependentBlendEnable = false.into();
+        shared.blend.RenderTarget[0].BlendEnable = true.into();
+        shared.blend.RenderTarget[0].BlendOp = D3D12_BLEND_OP_MAX;
+        shared.blend.RenderTarget[0].RenderTargetWriteMask = 3;
+        for i in 1..3 {
+            shared.blend.RenderTarget[i].BlendEnable = false.into();
+            shared.blend.RenderTarget[i].BlendOp = D3D12_BLEND_OP_ADD;
+            shared.blend.RenderTarget[i].RenderTargetWriteMask = 0x0f;
+        }
+        shared.apply_integer_blend_bypass();
+        assert!(shared.blend.IndependentBlendEnable.as_bool());
+        assert!(!shared.blend.RenderTarget[0].BlendEnable.as_bool());
+        assert_eq!(shared.blend.RenderTarget[0].BlendOp, D3D12_BLEND_OP_MAX);
+        assert_eq!(shared.blend.RenderTarget[0].RenderTargetWriteMask, 3);
+        for i in 1..3 {
+            assert!(shared.blend.RenderTarget[i].BlendEnable.as_bool());
+            assert_eq!(shared.blend.RenderTarget[i].BlendOp, D3D12_BLEND_OP_MAX);
+            assert_eq!(shared.blend.RenderTarget[i].RenderTargetWriteMask, 3);
+        }
+        assert_eq!(padding_of(&shared.blend, &blend_padding()), vec![0; 24]);
     }
 }
