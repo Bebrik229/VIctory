@@ -2518,37 +2518,60 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// Whether none of the unmerged `conflicts` overlap `written` (the title memory
+/// flights still in the air may write, in order and joined).
+fn stale_conflicts_clear(written: &[(usize, usize)], conflicts: &[(usize, usize)]) -> bool {
+    !conflicts.iter().any(|&(a, b)| touches(written, a, b))
+}
+
 /// With flights in the air, after the submission's write-watch asking:
-/// whether `runs` refresh a range of a host copy that a flight's shaders
-/// may write and that the title wrote since it was last copied. The
-/// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
-/// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+/// returns the joined title-address sub-ranges of `runs`' exact `Step::Refresh`
+/// spans that overlap an in-flight `GpuWrite` and still require settling before
+/// refreshing (empty when everything is disjoint or merged under writes).
+///
+/// Refresh spans are kept exact per copy (joined only where they overlap or
+/// touch) instead of collapsed to a single `[min, max)` bounding box, so two
+/// disjoint refreshes on a large heap do not falsely collide with an unrelated
+/// in-flight `GpuWrite` between them.
+fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize)> {
     use std::sync::Arc;
-    // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut per_shadow: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
+                && *len > 0
                 && shadow.writes_pending()
             {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+                let range = (*address, *address + *len);
+                match per_shadow.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                    Some((_, ranges)) => ranges.push(range),
+                    None => per_shadow.push((shadow.clone(), vec![range])),
                 }
             }
         }
     }
-    if late_exact() {
-        // The title's bytes are put in beside the flights' writes; a
-        // settle is still due where that could not be done. At most this
-        // many changed runs go up to copies in the card's memory, each a
-        // copy of its own there.
-        let mut runs_left = 512;
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+    let mut conflicts = Vec::new();
+    let exact = late_exact();
+    // At most this many changed runs go up to copies in the card's memory,
+    // each a copy of its own there.
+    let mut runs_left = 512;
+    for (shadow, mut ranges) in per_shadow {
+        let raw = std::mem::take(&mut ranges);
+        join_ranges(&mut ranges, raw);
+        for (from, to) in ranges {
+            let unmerged = if exact {
+                shadow.merge_under_writes(from, to - from, &mut runs_left)
+            } else {
+                shadow.stale_under_writes(from, to - from)
+            };
+            conflicts.extend(unmerged);
+        }
     }
-    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    if !conflicts.is_empty() {
+        let raw = std::mem::take(&mut conflicts);
+        join_ranges(&mut conflicts, raw);
+    }
+    conflicts
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -2965,7 +2988,71 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{continues, join_ranges, stale_conflicts_clear, touches};
+
+    /// Targeted `WHY_STALE` waiting clears as soon as the flights writing the
+    /// conflicting ranges have landed, even while later unrelated flights
+    /// remain in `line.written`.
+    #[test]
+    fn stale_conflicts_clear_only_waits_for_conflicting_flights() {
+        let conflicts = [(0x10000usize, 0x20000usize)];
+        // Flight 1 (writing 0x10000..0x30000) and Flight 2 (writing 0x80000..0x90000) in flight.
+        let both = [(0x10000, 0x30000), (0x80000, 0x90000)];
+        assert!(!stale_conflicts_clear(&both, &conflicts));
+        // Flight 1 landed; Flight 2 still in flight on an unrelated range -> clear!
+        let only_flight2 = [(0x80000, 0x90000)];
+        assert!(stale_conflicts_clear(&only_flight2, &conflicts));
+        // Touching endpoints do not conflict.
+        let touching = [(0x0, 0x10000), (0x20000, 0x30000)];
+        assert!(stale_conflicts_clear(&touching, &conflicts));
+        // Empty conflicts are always clear.
+        assert!(stale_conflicts_clear(&both, &[]));
+    }
+
+    /// Two disjoint `Step::Refresh` spans on a large buffer straddling an
+    /// in-flight `GpuWrite` range must NOT falsely trigger `stale_under_flights`.
+    #[test]
+    fn stale_under_flights_ignores_disjoint_refreshes_straddling_gpu_write() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        const LEN: usize = 4 << 16; // 256 KiB
+        let buf = vec![0u8; LEN];
+        let start = buf.as_ptr() as u64;
+        // Unique synthetic resource key so we don't collide with any other test.
+        let resource = buf.as_ptr() as usize;
+        crate::shadow::register(resource, start, LEN as u64);
+        let shadow = crate::shadow::find(start, LEN as u64);
+        crate::shadow::unregister(resource, start);
+        let Some(shadow) = shadow else {
+            return;
+        };
+        // Simulate an in-flight GPU write in the middle [1*64K, 2*64K).
+        let mid_start = start as usize + (1 << 16);
+        let mid_end = start as usize + (2 << 16);
+        shadow.writing(mid_start, 1 << 16);
+        // Record two disjoint refreshes straddling the in-flight GPU write:
+        // [0, 64K) and [3*64K, 4*64K). A bounding-box check would span [0, 4*64K)
+        // and falsely collide with [1*64K, 2*64K).
+        list.defer_refresh(&shadow, start as usize, 1 << 16);
+        list.defer_refresh(&shadow, start as usize + (3 << 16), 1 << 16);
+        assert!(
+            super::stale_under_flights(&[&list]).is_empty(),
+            "disjoint refreshes straddling an in-flight GpuWrite must not conflict"
+        );
+        // Now add a refresh that genuinely overlaps the in-flight GPU write:
+        // must report only that overlapping sub-range as conflicting.
+        list.defer_refresh(&shadow, mid_start + 0x1000, 0x2000);
+        assert_eq!(
+            super::stale_under_flights(&[&list]),
+            vec![(mid_start + 0x1000, mid_start + 0x3000)],
+            "overlapping refresh must report exact conflicting sub-range"
+        );
+        shadow.copy_back_done(&[(mid_start, mid_end)]);
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -4692,7 +4779,7 @@ impl Host {
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
-        if crate::watch::once() {
+        let ask_ranges: Vec<(usize, usize)> = if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             for list in runs {
                 for step in &list.deferred().copies {
@@ -4708,20 +4795,40 @@ impl Host {
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
-            // Behind flights: the title wrote memory that a flight's shaders
-            // may write too, and this submission refreshes it. The flights
-            // are settled, and the asking made again: the copy-back wrote
-            // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            ranges
+        } else {
+            Vec::new()
+        };
+        // Behind flights: the title wrote memory that a flight's shaders
+        // may write too, and this submission refreshes it. With `relay_exact`,
+        // wait only until the flights writing the unmerged conflicting ranges
+        // have landed, then re-ask the write watch (their copy-back wrote title
+        // memory, which other copies of it must see).
+        if behind {
+            if relay_exact() {
+                loop {
+                    let conflicts = stale_under_flights(runs);
+                    if conflicts.is_empty() {
+                        break;
+                    }
+                    let settling = std::time::Instant::now();
+                    relay_wait(WHY_STALE, |line| stale_conflicts_clear(&line.written, &conflicts));
+                    settled += settling.elapsed();
+                    if crate::watch::once() {
+                        crate::watch::ask_once(&ask_ranges);
+                    }
+                    if !flying() {
+                        break;
+                    }
+                }
+            } else if !stale_under_flights(runs).is_empty() {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
-                crate::watch::ask_once(&ranges);
+                if crate::watch::once() {
+                    crate::watch::ask_once(&ask_ranges);
+                }
             }
-        } else if behind && stale_under_flights(runs) {
-            let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_STALE);
-            settled += settling.elapsed();
         }
         for list in runs {
             list.run_deferred(&mut batch);

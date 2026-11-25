@@ -101,6 +101,84 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// Lock-free per-64 KiB-page bitset (indexed by `page - start / PAGE`) of
+    /// title-memory pages written back by [`Shadow::card_merge`] or
+    /// [`Shadow::card_merge_relay`]. Echo-filtering in
+    /// [`Shadow::copy_filtered`] runs only on pages marked here and clears each
+    /// bit on consumption, so a CPU rewrite restoring old bytes over an
+    /// undeclared shader write (e.g. bindless UAV) is never skipped.
+    echoed: Vec<AtomicU64>,
+}
+
+/// Number of 64 KiB title-memory pages overlapped by `[start, start + len)`.
+fn page_count(start: u64, len: u64) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    ((start + len).div_ceil(PAGE as u64) - start / PAGE as u64) as usize
+}
+
+impl Card {
+    /// Allocates a zeroed per-page `echoed` bitset covering `[start, start + len)`.
+    fn new_echoed(start: u64, len: u64) -> Vec<AtomicU64> {
+        let words = page_count(start, len).div_ceil(64);
+        (0..words).map(|_| AtomicU64::new(0)).collect()
+    }
+
+    /// Marks every 64 KiB title-memory page overlapping `[from, to)` as echoed
+    /// (written back to title memory from `self.data`).
+    fn mark_echoed(&self, base_page: usize, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let first = from / PAGE;
+        let last = (to - 1) / PAGE;
+        for page in first..=last {
+            if let Some(idx) = page.checked_sub(base_page)
+                && let Some(word) = self.echoed.get(idx / 64)
+            {
+                word.fetch_or(1u64 << (idx % 64), Ordering::Release);
+            }
+        }
+    }
+
+    /// Atomically checks and clears the echoed bit for title-memory `page`.
+    fn take_echoed(&self, base_page: usize, page: usize) -> bool {
+        let Some(idx) = page.checked_sub(base_page) else {
+            return false;
+        };
+        let Some(word) = self.echoed.get(idx / 64) else {
+            return false;
+        };
+        let mask = 1u64 << (idx % 64);
+        // Fast read-only check avoids dirtying the cache line on non-echoed pages.
+        if (word.load(Ordering::Acquire) & mask) == 0 {
+            return false;
+        }
+        (word.fetch_and(!mask, Ordering::AcqRel) & mask) != 0
+    }
+
+    #[cfg(test)]
+    fn is_echoed(&self, base_page: usize, page: usize) -> bool {
+        let Some(idx) = page.checked_sub(base_page) else {
+            return false;
+        };
+        self.echoed
+            .get(idx / 64)
+            .is_some_and(|word| (word.load(Ordering::Acquire) & (1u64 << (idx % 64))) != 0)
+    }
+}
+
+/// Parses `VICTORY_ECHO_FILTER` (default on; `"0"` disables echo filtering).
+fn parse_echo_filter(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_none_or(|v| v != "0")
+}
+
+/// Whether echo-filtering in [`Shadow::copy_filtered`] is enabled
+/// (`VICTORY_ECHO_FILTER=0` disables it; on by default).
+fn echo_filter_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_echo_filter(std::env::var_os("VICTORY_ECHO_FILTER").as_deref()))
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -139,23 +217,40 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// Parses the minimum card-buffer size in bytes from `VICTORY_CARD_BUFFERS_MIN_KB`
+/// and legacy `VICTORY_CARD_BUFFERS_MIN_MB`, clamped to at least one 64 KiB hash
+/// piece ([`PIECE`]). Defaults to 256 KiB when neither is set.
+fn card_min_bytes(min_kb: Option<&str>, min_mb: Option<&str>) -> u64 {
+    let floor = PIECE as u64;
+    if let Some(kb) = min_kb.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return kb.saturating_mul(1 << 10).max(floor);
+    }
+    if let Some(mb) = min_mb.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return mb.saturating_mul(1 << 20).max(floor);
+    }
+    256 << 10
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// `VICTORY_CARD_BUFFERS_MIN_KB` (default 256 KiB, clamped to `>= 64 KiB`;
+/// falls back to legacy `VICTORY_CARD_BUFFERS_MIN_MB` if set) and
+/// `VICTORY_CARD_BUFFERS_MB` (default 1,024 MiB).
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
-        // the shader writes of the smaller buffers are then found by the
-        // card's hashes too, and with that the first room's walls were
-        // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        let min_kb = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok();
+        let min_mb = std::env::var("VICTORY_CARD_BUFFERS_MIN_MB").ok();
+        let most = std::env::var("VICTORY_CARD_BUFFERS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            .saturating_mul(1 << 20);
+        // From 256 KiB up and 1,024 MiB in all by default: moves 256 KiB..1 MiB
+        // shader-written buffers onto GPU-side hashing too, eliminating tens of
+        // MB/frame of CPU snapshotting and comparison.
+        (card_min_bytes(min_kb.as_deref(), min_mb.as_deref()), most)
     })
 }
 
@@ -627,6 +722,48 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+    }
+
+    /// `VICTORY_CARD_BUFFERS_MIN_KB` defaults to 256 KiB, clamps to >= 64 KiB,
+    /// takes precedence over legacy `VICTORY_CARD_BUFFERS_MIN_MB`, and
+    /// `card_hash_bytes` covers all pieces for 64 KiB and 256 KiB buffers even
+    /// at unaligned start addresses.
+    #[test]
+    fn card_min_bytes_defaults_precedence_and_hash_sizing() {
+        use super::{card_hash_bytes, card_min_bytes, parse_echo_filter, pieces_of};
+        use std::ffi::OsStr;
+
+        // Default: 256 KiB.
+        assert_eq!(card_min_bytes(None, None), 256 << 10);
+        // VICTORY_CARD_BUFFERS_MIN_KB overrides default and clamps to >= 64 KiB.
+        assert_eq!(card_min_bytes(Some("512"), None), 512 << 10);
+        assert_eq!(card_min_bytes(Some("256"), None), 256 << 10);
+        assert_eq!(card_min_bytes(Some("64"), None), PIECE as u64);
+        assert_eq!(card_min_bytes(Some("32"), None), PIECE as u64);
+        assert_eq!(card_min_bytes(Some("0"), None), PIECE as u64);
+        // Legacy VICTORY_CARD_BUFFERS_MIN_MB when MIN_KB is unset (clamped >= 64 KiB).
+        assert_eq!(card_min_bytes(None, Some("1")), 1 << 20);
+        assert_eq!(card_min_bytes(None, Some("16")), 16 << 20);
+        assert_eq!(card_min_bytes(None, Some("0")), PIECE as u64);
+        // Precedence: valid MIN_KB beats MIN_MB; invalid MIN_KB falls back to MIN_MB.
+        assert_eq!(card_min_bytes(Some("128"), Some("4")), 128 << 10);
+        assert_eq!(card_min_bytes(Some("invalid"), Some("2")), 2 << 20);
+        assert_eq!(card_min_bytes(Some("invalid"), Some("bad")), 256 << 10);
+
+        // Echo filter env parser: default ON, "0" disables.
+        assert!(parse_echo_filter(None));
+        assert!(parse_echo_filter(Some(OsStr::new("1"))));
+        assert!(parse_echo_filter(Some(OsStr::new("true"))));
+        assert!(!parse_echo_filter(Some(OsStr::new("0"))));
+
+        // Hash buffer capacity covers all pieces for 64 KiB..1 MiB buffers, aligned or unaligned.
+        for size in [64u64 << 10, 128 << 10, 256 << 10, 512 << 10, 1 << 20] {
+            let hash_slots = card_hash_bytes(size) / 16;
+            for start in [0usize, 16, 4096, PIECE - 16, 0xd_b790_df00] {
+                let count = pieces_of(start, 0, size as usize).end as u64;
+                assert!(count <= hash_slots, "size={size} start={start:#x}: {count} > {hash_slots}");
+            }
+        }
     }
 }
 
@@ -1575,13 +1712,14 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// Since the last frame-rate line, of the shader-written ranges looked for
 /// on the CPU (copies not in the card's memory): bytes snapshotted in
 /// windows outside buffers and in title buffers' copies; bytes compared in
-/// windows, in buffers' copies, and of those in copies of 1 MiB or more;
-/// ranges compared in windows and in buffers' copies.
+/// windows, in buffers' copies, and of those in copies at or above
+/// [`card_limits`]' minimum size; ranges compared in windows and in buffers'
+/// copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
-/// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
+/// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_KB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -1589,10 +1727,11 @@ pub(crate) fn back_line(frames: f64) {
         return;
     }
     let mb = |v: f64| v / (1 << 20) as f64;
+    let min_kb = card_limits().0 >> 10;
     tracing::info!(
         "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
          snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
-         of 1 MiB or more (VICTORY_CARD_BUFFERS_MIN_MB=1 would have the card look there)",
+         of {min_kb} KiB or more (VICTORY_CARD_BUFFERS_MIN_KB={min_kb})",
         mb(c[2]),
         c[5],
         mb(c[0]),
@@ -2274,7 +2413,7 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
-        let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+        let pages = page_count(start, len);
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
@@ -2283,7 +2422,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
+            copied: Mutex::new(vec![0; pages]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -2535,7 +2674,7 @@ impl Shadow {
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
         BACK_CLASS[bytes].fetch_add((to - from) as u64, Ordering::Relaxed);
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);
-        if !self.window && self.len >= 1 << 20 {
+        if !self.window && self.len.next_multiple_of(PIECE as u64) >= card_limits().0 {
             BACK_CLASS[4].fetch_add((to - from) as u64, Ordering::Relaxed);
         }
     }
@@ -2740,49 +2879,53 @@ impl Shadow {
         !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
-    /// Whether [`Shadow::update`] of `[address, address + len)` would leave
-    /// title bytes behind: a range shaders may be writing holds a page the
-    /// title wrote since the copy last took it. The answer comes from the
-    /// write-watch journal alone, as the submission's one asking left it
-    /// (`crate::watch::asked`); where the journal cannot say (memory not
-    /// write-watched, a range not asked about) it is yes. A page the copy
-    /// never took whole counts as written if the title ever wrote it.
+    /// The sub-ranges of `[address, address + len)` where [`Shadow::update`]
+    /// would leave title bytes behind: ranges shaders may be writing that hold
+    /// a page the title wrote since the copy last took it. The answer comes
+    /// from the write-watch journal alone, as the submission's one asking left
+    /// it (`crate::watch::asked`); where the journal cannot say (memory not
+    /// write-watched, a range not asked about) the pending sub-range is
+    /// returned. A page the copy never took whole counts as written if the
+    /// title ever wrote it.
     ///
     /// For submissions sent to the card without a wait
     /// (`crate::host::late`): the ranges are those of flights in the air,
     /// which are then settled before this refresh.
-    pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
+    pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> Vec<(usize, usize)> {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
-            return false;
+            return Vec::new();
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy = joined(
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|&&(a, e)| a < e && a < to && e > from)
+                .map(|&(a, e)| (a.max(from), e.min(to)))
+                .collect(),
+        );
         if busy.is_empty() {
-            return false;
+            return Vec::new();
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            return true;
+            return busy;
         }
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
-            None => true,
-        })
+        busy.into_iter()
+            .filter(|&(a, e)| match crate::watch::asked(a, e) {
+                Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+                None => true,
+            })
+            .collect()
     }
 
-    /// Where [`Shadow::stale_under_writes`] says yes: puts the bytes the
-    /// title changed into the copy, in the ranges shaders may be writing,
-    /// and only those bytes, so that what the shaders write beside them
-    /// stays (`crate::host::late_exact`). For each page of such a range
+    /// Where [`Shadow::stale_under_writes`] finds stale pending ranges: puts
+    /// the bytes the title changed into the copy, in the ranges shaders may be
+    /// writing, and only those bytes, so that what the shaders write beside
+    /// them stays (`crate::host::late_exact`). For each page of such a range
     /// that the title wrote since the copy last took it, title memory as
     /// it is now is compared with what the copy held when the range was
     /// given to the shaders: the copy's CPU side for a copy in the card's
@@ -2792,31 +2935,34 @@ impl Shadow {
     /// snapshot, so the compare after the card ran takes them for the
     /// title's and not the shaders').
     ///
-    /// Whether the caller must still settle the flights: the journal
-    /// cannot say what was written, a snapshot is missing, or `runs_left`
-    /// ran out. Pages done before that stay done.
-    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+    /// Returns the sub-ranges that could not be merged (empty if none) so the
+    /// caller can settle only the flights writing them: memory not
+    /// write-watched, a missing snapshot, or `runs_left` running out. Pages
+    /// done before that stay done.
+    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> Vec<(usize, usize)> {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
-            return false;
+            return Vec::new();
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy = joined(
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|&&(a, e)| a < e && a < to && e > from)
+                .map(|&(a, e)| (a.max(from), e.min(to)))
+                .collect(),
+        );
         if busy.is_empty() {
-            return false;
+            return Vec::new();
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            return true;
+            return busy;
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
+        let mut unmerged = Vec::new();
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -2825,7 +2971,8 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                return true;
+                unmerged.push((a, e));
+                continue;
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -2854,13 +3001,14 @@ impl Shadow {
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
                 let at = lo - start;
-                if self.card.is_some() {
+                if let Some(card) = &self.card {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
-                        return true;
+                        unmerged.push((lo, e));
+                        break;
                     }
                     *runs_left -= runs.len();
                     for (r, m) in runs {
@@ -2869,9 +3017,15 @@ impl Shadow {
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
+                    // Any echoed write-back on this page has now been checked
+                    // against title memory under `before`'s lock; clear the bit
+                    // so a later unrelated CPU write is never falsely treated as
+                    // an echo.
+                    card.take_echoed(base, page);
                 } else {
                     let Some(snapshot) = before.as_mut() else {
-                        return true;
+                        unmerged.push((lo, e));
+                        break;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
                     // bytes at the copy's offsets (`writing`), and these
@@ -2899,7 +3053,7 @@ impl Shadow {
                 }
             }
         }
-        false
+        unmerged
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -3079,61 +3233,122 @@ impl Shadow {
         self.copy_filtered(from, to, false)
     }
 
-    /// [`Self::copy`], with SIMD echo-filtering when `filter_echo` is true on
-    /// a card-backed copy: `card_merge_relay` writes GPU shader outputs back
-    /// into title memory, dirtying write-watch pages whose contents already
-    /// match `self.data`. Diff-filtering avoids re-uploading and re-hashing
-    /// those unchanged echoed pages over PCIe/GPU.
+    /// [`Self::copy`], with SIMD echo-filtering when `filter_echo` and
+    /// [`echo_filter_on`] are true on card-backed pages that were actually
+    /// written back to title memory by [`Self::card_merge`] or
+    /// [`Self::card_merge_relay`] (`Card::echoed`). Non-echoed pages always
+    /// upload unconditionally so a CPU rewrite restoring old bytes over an
+    /// undeclared shader write (e.g. bindless UAV) can never leave stale VRAM.
     fn copy_filtered(&self, from: usize, to: usize, filter_echo: bool) -> usize {
+        self.copy_filtered_with(from, to, filter_echo, echo_filter_on())
+    }
+
+    fn copy_filtered_with(&self, from: usize, to: usize, filter_echo: bool, echo_on: bool) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        let Some(card) = &self.card else {
+            return self.copy_unfiltered(from, to);
+        };
+        let base = start / PAGE;
+        let first_page = from / PAGE;
+        let last_page = (to - 1) / PAGE;
+        if !filter_echo || !echo_on {
+            // Unconditional upload supersedes any pending echoed bits on these pages.
+            for page in first_page..=last_page {
+                card.take_echoed(base, page);
+            }
+            return self.copy_unfiltered(from, to);
+        }
+        // Coalesce contiguous runs of echoed vs non-echoed pages: non-echoed
+        // pages upload unconditionally; echoed pages use zero-copy SSE2 diff
+        // and consume their echoed bit.
+        let mut bytes = 0usize;
+        let mut run_start = first_page;
+        let mut run_echoed = card.take_echoed(base, first_page);
+        for page in (first_page + 1)..=last_page {
+            let echoed = card.take_echoed(base, page);
+            if echoed != run_echoed {
+                let a = (run_start * PAGE).max(from);
+                let b = (page * PAGE).min(to);
+                bytes += if run_echoed {
+                    self.copy_echo_diff(a, b)
+                } else {
+                    self.copy_unfiltered(a, b)
+                };
+                run_start = page;
+                run_echoed = echoed;
+            }
+        }
+        let a = (run_start * PAGE).max(from);
+        let b = ((last_page + 1) * PAGE).min(to);
+        bytes += if run_echoed {
+            self.copy_echo_diff(a, b)
+        } else {
+            self.copy_unfiltered(a, b)
+        };
+        bytes
+    }
+
+    /// Echo-diff path for clamped `[from, to)` on echoed card-backed pages.
+    fn copy_echo_diff(&self, from: usize, to: usize) -> usize {
         let len = to.saturating_sub(from);
         if len == 0 {
             return 0;
         }
-        let off = from - start;
-        if filter_echo && self.card.is_some() {
-            // SAFETY: inside the mapping (`from` and `to` are within the buffer),
-            // and `copy_stale` only runs on ranges outside `self.pending`.
-            let cur = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) };
-            match crate::watch::try_diff_bounds_fast(from as *const u8, cur) {
-                Some(None) => return 0,
-                Some(Some((first, last))) => {
-                    let changed_len = last + 1 - first;
-                    // SAFETY: `first <= last < len`, so `first..=last` lies within `cur`.
-                    let dst = unsafe { cur.as_mut_ptr().add(first) };
-                    let src = (from + first) as *const u8;
-                    if !crate::watch::try_copy_fast(dst, src, changed_len) {
-                        crate::host::copy_mapped(dst, src, changed_len, false);
-                    }
-                    self.changed(off + first, off + last + 1);
-                    self.card_changed(off + first, off + last + 1);
-                    return changed_len;
-                }
-                None => {}
-            }
-            thread_local! {
-                static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-            }
-            return SCRATCH.with(|cell| {
-                let mut tmp = cell.borrow_mut();
-                if tmp.len() < len {
-                    tmp.resize(len, 0);
-                }
-                let buf = &mut tmp[..len];
-                crate::host::copy_mapped(buf.as_mut_ptr(), from as *const u8, len, false);
-                let Some(first) = first_difference(buf, cur) else {
-                    return 0;
-                };
-                let last = last_difference(buf, cur).unwrap_or(first);
+        let off = from - self.start as usize;
+        // SAFETY: inside the mapping (`from` and `to` are clamped to `[start, end)`),
+        // and `copy_stale` only runs on ranges outside `self.pending`.
+        let cur = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) };
+        match crate::watch::try_diff_bounds_fast(from as *const u8, cur) {
+            Some(None) => return 0,
+            Some(Some((first, last))) => {
                 let changed_len = last + 1 - first;
-                cur[first..=last].copy_from_slice(&buf[first..=last]);
+                // SAFETY: `first <= last < len`, so `first..=last` lies within `cur`.
+                let dst = unsafe { cur.as_mut_ptr().add(first) };
+                let src = (from + first) as *const u8;
+                if !crate::watch::try_copy_fast(dst, src, changed_len) {
+                    crate::host::copy_mapped(dst, src, changed_len, false);
+                }
                 self.changed(off + first, off + last + 1);
                 self.card_changed(off + first, off + last + 1);
-                changed_len
-            });
+                return changed_len;
+            }
+            None => {}
         }
-        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SCRATCH.with(|cell| {
+            let mut tmp = cell.borrow_mut();
+            if tmp.len() < len {
+                tmp.resize(len, 0);
+            }
+            let buf = &mut tmp[..len];
+            crate::host::copy_mapped(buf.as_mut_ptr(), from as *const u8, len, false);
+            let Some(first) = first_difference(buf, cur) else {
+                return 0;
+            };
+            let last = last_difference(buf, cur).unwrap_or(first);
+            let changed_len = last + 1 - first;
+            cur[first..=last].copy_from_slice(&buf[first..=last]);
+            self.changed(off + first, off + last + 1);
+            self.card_changed(off + first, off + last + 1);
+            changed_len
+        })
+    }
+
+    /// Unconditional copy for clamped `[from, to)` into `self.data` and card dirty list.
+    fn copy_unfiltered(&self, from: usize, to: usize) -> usize {
+        let len = to.saturating_sub(from);
+        if len == 0 {
+            return 0;
+        }
+        let start = self.start as usize;
+        let off = from - start;
+        // SAFETY: inside the mapping (`from` and `to` are clamped to `[start, end)`).
         let at = unsafe { self.data.add(off) };
         crate::host::copy_mapped(at, from as *const u8, len, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
@@ -3287,6 +3502,9 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
+                if let Some(card) = &self.card {
+                    card.mark_echoed(start / PAGE, start + at, start + at + n);
+                }
                 crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
@@ -3366,6 +3584,7 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
+        card.mark_echoed(start / PAGE, start + at, start + at + n);
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
@@ -3533,6 +3752,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    echoed: Card::new_echoed(key.0, len),
                 };
                 (on_card, Some(card))
             }
@@ -3749,6 +3969,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                echoed: Card::new_echoed(start, len),
             };
             (on_card, Some(card))
         }
@@ -4029,6 +4250,7 @@ mod card_merge_tests {
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
+                echoed: Card::new_echoed(title.as_ptr() as u64, LEN as u64),
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
@@ -4049,6 +4271,126 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    /// Soundness of `copy_filtered` echo-filtering:
+    /// (i) an echoed page written back by `card_merge_relay` that still matches
+    /// `self.data` is skipped and clears its echoed bit so a subsequent
+    /// identical refresh uploads unconditionally;
+    /// (ii) a non-echoed page whose title memory matches `self.data` (e.g.
+    /// after an undeclared bindless UAV modified VRAM and the CPU restored old
+    /// bytes) STILL marks `card_changed` so VRAM is overwritten;
+    /// (iii) `VICTORY_ECHO_FILTER=0` (`echo_on = false`) disables skipping even
+    /// on an echoed page.
+    #[test]
+    fn echo_filter_skips_only_echoed_pages_clears_bit_and_respects_disable() {
+        use super::{NOT_WATCHED, PAGE};
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        // 4 pages guarantees at least 3 complete distinct 64 KiB pages even
+        // when the heap allocation is not 64 KiB aligned.
+        const LEN: usize = 4 * PAGE;
+        let mut title: Vec<u8> = (0..LEN).map(|i| (i * 11 + 5) as u8).collect();
+        let mut side = title.clone();
+        let start = title.as_ptr() as usize;
+        let base = start / PAGE;
+        // Pick three interior whole 64 KiB pages completely inside `[start, start + LEN)`.
+        let p0_addr = (base + 1) * PAGE;
+        let p1_addr = (base + 2) * PAGE;
+        let p2_addr = (base + 3) * PAGE;
+        let p0_off = p0_addr - start;
+        let p1_off = p1_addr - start;
+        let p2_off = p2_addr - start;
+        let p2_end = (p2_addr + PAGE).min(start + LEN);
+        let p2_len = p2_end - p2_addr;
+
+        let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, start as u64, LEN as u64);
+        shadow.card = Some(Card {
+            staging: staging.clone(),
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            size: 0,
+            echoed: Card::new_echoed(start as u64, LEN as u64),
+        });
+
+        let take_dirty = |s: &Shadow| -> Vec<(usize, usize)> {
+            let mut dirty = s.card.as_ref().unwrap().dirty.lock().unwrap();
+            std::mem::take(&mut *dirty)
+        };
+
+        // (ii) Non-echoed page matching `self.data` MUST still upload (marks `card_changed`).
+        assert!(!shadow.card.as_ref().unwrap().is_echoed(base, p0_addr / PAGE));
+        let copied = shadow.copy_filtered_with(p0_addr, p0_addr + PAGE, true, true);
+        assert_eq!(copied, PAGE, "non-echoed page must not be skipped");
+        assert_eq!(take_dirty(&shadow), vec![(p0_off, p0_off + PAGE)]);
+
+        // (i) `card_merge_relay` writes back a shader byte inside page p1 -> marks p1 echoed.
+        let mut gpu_piece = side[p1_off..p1_off + PAGE].to_vec();
+        gpu_piece[128] ^= 0x7f;
+        let merged = shadow.card_merge_relay(p1_off, &gpu_piece, 1, &mut Vec::new());
+        assert!(merged > 0);
+        assert_eq!(title[p1_off + 128], side[p1_off + 128]);
+        assert!(shadow.card.as_ref().unwrap().is_echoed(base, p1_addr / PAGE));
+        assert!(!shadow.card.as_ref().unwrap().is_echoed(base, p0_addr / PAGE));
+        let _ = take_dirty(&shadow);
+
+        // First filtered refresh of echoed page p1: skipped, no dirty range, echoed bit cleared.
+        let skipped = shadow.copy_filtered_with(p1_addr, p1_addr + PAGE, true, true);
+        assert_eq!(skipped, 0, "echoed page matching self.data must be skipped");
+        assert!(take_dirty(&shadow).is_empty());
+        assert!(!shadow.card.as_ref().unwrap().is_echoed(base, p1_addr / PAGE), "echoed bit must be cleared on consumption");
+
+        // Second filtered refresh of page p1 with identical bytes (echoed bit now 0):
+        // MUST upload unconditionally (protects against undeclared bindless UAV + CPU reset).
+        let second = shadow.copy_filtered_with(p1_addr, p1_addr + PAGE, true, true);
+        assert_eq!(second, PAGE, "consumed page must upload on next refresh");
+        assert_eq!(take_dirty(&shadow), vec![(p1_off, p1_off + PAGE)]);
+
+        // Mixed multi-page run `[p0_addr, p2_end)`:
+        // p0 echoed & unchanged (skipped), p1 non-echoed & unchanged (uploaded whole),
+        // p2 echoed with 1 CPU-changed byte (only that 1 byte uploaded).
+        shadow.card.as_ref().unwrap().mark_echoed(base, p0_addr, p0_addr + 1);
+        shadow.card.as_ref().unwrap().mark_echoed(base, p2_addr, p2_addr + 1);
+        let diff_at = p2_off + 7.min(p2_len.saturating_sub(1));
+        title[diff_at] ^= 0x55;
+        let mixed = shadow.copy_filtered_with(p0_addr, p2_end, true, true);
+        assert_eq!(mixed, PAGE + 1);
+        assert_eq!(side[diff_at], title[diff_at]);
+        assert_eq!(take_dirty(&shadow), vec![(p1_off, p1_off + PAGE), (diff_at, diff_at + 1)]);
+        assert!(!shadow.card.as_ref().unwrap().is_echoed(base, p0_addr / PAGE));
+        assert!(!shadow.card.as_ref().unwrap().is_echoed(base, p2_addr / PAGE));
+
+        // (iii) `card_merge` also sets echoed bit, and `VICTORY_ECHO_FILTER=0` (`echo_on = false`)
+        // disables skipping even on an echoed page (and clears its echoed bit).
+        let mut gpu_piece0 = side[p0_off..p0_off + PAGE].to_vec();
+        gpu_piece0[64] ^= 0x3c;
+        assert!(shadow.card_merge(p0_off, &gpu_piece0, &mut Vec::new()) > 0);
+        assert!(shadow.card.as_ref().unwrap().is_echoed(base, p0_addr / PAGE));
+        let _ = take_dirty(&shadow);
+        let disabled = shadow.copy_filtered_with(p0_addr, p0_addr + PAGE, true, false);
+        assert_eq!(disabled, PAGE, "VICTORY_ECHO_FILTER=0 must disable skipping");
+        assert_eq!(take_dirty(&shadow), vec![(p0_off, p0_off + PAGE)]);
+        assert!(!shadow.card.as_ref().unwrap().is_echoed(base, p0_addr / PAGE));
+
+        // Also verify `stale_under_writes` / `merge_under_writes` ignore empty pending ranges,
+        // coalesce overlapping pending ranges, and report exact conflicting sub-ranges only.
+        shadow.watched.store(NOT_WATCHED, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut pending = shadow.pending.lock().unwrap();
+            pending.push((p0_addr + 16, p0_addr + 16)); // empty range: must be ignored
+            pending.push((p1_addr, p1_addr + PAGE / 2 + 128));
+            pending.push((p1_addr + PAGE / 2, p1_addr + PAGE));
+        }
+        // Disjoint refresh on p0 does not collide with pending writes on p1.
+        assert!(shadow.stale_under_writes(p0_addr, PAGE).is_empty());
+        let mut runs_left = 512;
+        assert!(shadow.merge_under_writes(p0_addr, PAGE, &mut runs_left).is_empty());
+        // Refresh spanning p0..p2 returns the single coalesced conflict on p1.
+        assert_eq!(shadow.stale_under_writes(p0_addr, 2 * PAGE), vec![(p1_addr, p1_addr + PAGE)]);
+        assert_eq!(shadow.merge_under_writes(p0_addr, 2 * PAGE, &mut runs_left), vec![(p1_addr, p1_addr + PAGE)]);
+        drop(shadow);
     }
 }
 
