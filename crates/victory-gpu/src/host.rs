@@ -7814,6 +7814,27 @@ struct Presenter {
     rtv: ID3D12DescriptorHeap,
 }
 
+/// NVIDIA's D3D12 driver copies `ClearRenderTargetView` rects into a fixed stack
+/// buffer and fast-fails (`0xc0000409`) when passed ~100+ rects in one call.
+const READOUT_RECT_CHUNK: usize = 8;
+
+/// Clears `rects` on render target `view` in bounded chunks.
+///
+/// # Safety
+/// `list` is open, `view` is a valid RTV CPU descriptor for a resource in
+/// `D3D12_RESOURCE_STATE_RENDER_TARGET`, and every rect lies inside its bounds.
+unsafe fn clear_rtv_chunked(
+    list: &ID3D12GraphicsCommandList,
+    view: D3D12_CPU_DESCRIPTOR_HANDLE,
+    color: &[f32; 4],
+    rects: &[RECT],
+) {
+    for chunk in rects.chunks(READOUT_RECT_CHUNK) {
+        // SAFETY: caller upholds list/view/state invariants and non-empty slice.
+        unsafe { list.ClearRenderTargetView(view, color, Some(chunk)) };
+    }
+}
+
 impl Presenter {
     /// Writes the frame rate and frame time in the top left corner of
     /// `back`, which is a render target on `list`.
@@ -7843,8 +7864,8 @@ impl Presenter {
             let view = self.rtv.GetCPUDescriptorHandleForHeapStart();
             device.CreateRenderTargetView(back, None, view);
             if behind.right <= self.width as i32 && behind.bottom <= self.height as i32 {
-                list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
-                list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
+                clear_rtv_chunked(list, view, &[0.0, 0.0, 0.0, 1.0], &[behind]);
+                clear_rtv_chunked(list, view, &[1.0, 0.9, 0.1, 1.0], &marks);
             }
         }
     }
@@ -9109,5 +9130,57 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         }
         list.reset();
         assert!(list.deferred().copies.is_empty());
+    }
+
+    #[test]
+    fn readout_clears_rects_in_small_chunks_on_host_device() {
+        let Some(host) = super::host() else { return };
+        let marks = crate::readout::rects("123.4 FPS  99 MS", (6, 6), 2);
+        assert!(marks.len() > super::READOUT_RECT_CHUNK * 4);
+        let heap = super::D3D12_HEAP_PROPERTIES {
+            Type: super::D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = super::D3D12_RESOURCE_DESC {
+            Dimension: super::D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: super::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: super::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: super::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut tex: Option<super::ID3D12Resource> = None;
+        let rtv: super::ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    super::D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    super::D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut tex,
+                )
+                .unwrap();
+            host.device
+                .CreateDescriptorHeap(&super::D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: super::D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let tex = tex.unwrap();
+        let list = host.new_list().unwrap();
+        unsafe {
+            let view = rtv.GetCPUDescriptorHandleForHeapStart();
+            host.device.CreateRenderTargetView(&tex, None, view);
+            super::clear_rtv_chunked(&list.list, view, &[1.0, 0.9, 0.1, 1.0], &marks);
+        }
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
     }
 }
