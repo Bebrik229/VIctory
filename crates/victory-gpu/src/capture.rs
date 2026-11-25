@@ -373,6 +373,14 @@ pub(crate) fn dump_targets(frame: u64) {
         let state = copy.state.load(Relaxed);
         dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
     }
+    if !targets.is_empty()
+        && let Some(folder) = folder()
+    {
+        let _ = std::fs::write(
+            folder.join(format!("frame-{frame}-targets.txt")),
+            crate::resource::targets_text(),
+        );
+    }
 }
 
 fn dump_one(

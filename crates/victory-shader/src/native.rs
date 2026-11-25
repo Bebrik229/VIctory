@@ -178,8 +178,58 @@ impl NativeProgram {
                 }
             }
         }
+        apply_diagnostic_patches(&mut code, diagnostic_patches());
         code
     }
+}
+
+/// Applies matching `(container_len, code_len, offset, clear, set)` patches
+/// to `code` in place. Pure, for testing.
+fn apply_diagnostic_patches(code: &mut [u8], patches: &[(usize, usize, usize, u32, u32)]) {
+    for &(_, len, at, clear, set) in patches {
+        if code.len() == len && at.checked_add(4).is_some_and(|end| end <= code.len()) {
+            let word = u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]);
+            code[at..at + 4].copy_from_slice(&((word & !clear) | set).to_le_bytes());
+        }
+    }
+}
+
+/// Parses `VICTORY_SHADER_PATCH` entries. Pure, for testing.
+fn parse_diagnostic_patches(list: &str) -> Vec<(usize, usize, usize, u32, u32)> {
+    list.split(',')
+        .filter_map(|entry| {
+            let parts: Vec<&str> = entry.trim().split(':').collect();
+            if parts.len() != 5 {
+                return None;
+            }
+            let n: Option<Vec<u64>> = parts
+                .into_iter()
+                .map(|x| u64::from_str_radix(x.trim(), 16).ok())
+                .collect();
+            let n = n?;
+            Some((
+                usize::try_from(n[0]).ok()?,
+                usize::try_from(n[1]).ok()?,
+                usize::try_from(n[2]).ok()?,
+                u32::try_from(n[3]).ok()?,
+                u32::try_from(n[4]).ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// Diagnostics: `VICTORY_SHADER_PATCH=<container bytes>:<code bytes>:<code
+/// offset>:<bits to clear>:<bits to set>,...` (all hexadecimal) changes one
+/// word of the machine code of the programs of that size before they are
+/// translated, to see what a part of a shader does to the picture. Each
+/// entry: container length, code length, offset, cleared bits, set bits.
+pub fn diagnostic_patches() -> &'static [(usize, usize, usize, u32, u32)] {
+    static PATCHES: std::sync::OnceLock<Vec<(usize, usize, usize, u32, u32)>> =
+        std::sync::OnceLock::new();
+    PATCHES.get_or_init(|| {
+        let list = std::env::var("VICTORY_SHADER_PATCH").unwrap_or_default();
+        parse_diagnostic_patches(&list)
+    })
 }
 
 /// What a semantic is, as the stage data names it.
@@ -1099,5 +1149,24 @@ mod tests {
         let mut bad_adler = good.clone();
         *bad_adler.last_mut().unwrap() ^= 1;
         assert!(unpack(&bad_adler).is_err());
+    }
+
+    #[test]
+    fn diagnostic_patches_parse_and_modify_matching_code_only() {
+        assert!(parse_diagnostic_patches("").is_empty());
+        assert!(parse_diagnostic_patches("1:2:3:4").is_empty());
+        assert!(parse_diagnostic_patches("1:2:bad:4:5:6").is_empty());
+        let patches = parse_diagnostic_patches("100:8:4:ff:a5, 200:c:0:1:2");
+        assert_eq!(patches, vec![(0x100, 8, 4, 0xff, 0xa5), (0x200, 12, 0, 1, 2)]);
+
+        let mut code = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        apply_diagnostic_patches(&mut code, &patches);
+        // Word 0 untouched; word 1 (0x8877_6655) cleared low byte and set 0xa5 -> 0x8877_66a5.
+        assert_eq!(code, [0x11, 0x22, 0x33, 0x44, 0xa5, 0x66, 0x77, 0x88]);
+
+        // Non-matching length and out-of-bounds offsets leave code untouched.
+        let mut short = [1, 2, 3, 4];
+        apply_diagnostic_patches(&mut short, &[(0x100, 4, 2, 0xff, 0xaa), (0x100, 4, usize::MAX, 0xff, 0xaa)]);
+        assert_eq!(short, [1, 2, 3, 4]);
     }
 }

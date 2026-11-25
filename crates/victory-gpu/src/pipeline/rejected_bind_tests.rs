@@ -71,6 +71,7 @@ fn compute_pipeline(used: &[UsedResource]) -> HostPipeline {
         stage: "compute",
         hash: "rejected_bind".to_owned(),
         container: Vec::new(),
+        resolves_light: false,
         translated: Some(Translated {
             host: HostShader {
                 stage: HwStage::Cs,

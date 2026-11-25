@@ -1251,6 +1251,35 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     same.then_some(other)
 }
 
+/// Every texture the host GPU writes, by title address (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn targets_text() -> String {
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut text = String::new();
+    for (&at, &r) in targets.iter() {
+        let res = resource(r as This);
+        let o = &res.desc;
+        let state = res
+            .host
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(h, _)| h.state.load(std::sync::atomic::Ordering::Relaxed));
+        text.push_str(&format!(
+            "target {at:#x} {r:#x} {}x{}x{} mips {} f{} flags {:#x} layout {:#x} state {state:?}\n",
+            o.width, o.height, o.depth_or_array_size, o.mip_levels, o.format, o.flags, o.layout
+        ));
+    }
+    text
+}
+
+/// Where the title has the texture `r` in title memory (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn data_of(r: This) -> u64 {
+    resource(r).data() as u64
+}
+
 /// Whether host copies are made on first use. On by default;
 /// `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture,
 /// as before.

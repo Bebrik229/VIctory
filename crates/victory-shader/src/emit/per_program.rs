@@ -54,7 +54,11 @@ pub(super) fn current() -> Option<String> {
 /// decision into its own key) and so left out of the translator's
 /// fingerprint ([`super::translation_fingerprint`]): a new list translates
 /// again only the programs whose decision it changes.
-pub(super) const PER_PROGRAM_SWITCHES: [&str; 2] = ["VICTORY_WAVE_DEEP_SKIPS_NOT", "VICTORY_WAVE_DEEP_SKIPS_ONLY"];
+pub(super) const PER_PROGRAM_SWITCHES: [&str; 3] = [
+    "VICTORY_WAVE_DEEP_SKIPS_NOT",
+    "VICTORY_WAVE_DEEP_SKIPS_ONLY",
+    "VICTORY_SHADER_PATCH",
+];
 
 /// Whether the deep-skips form may be tried for the program whose hash is
 /// `hash` (`None`: not known, as for a translation outside

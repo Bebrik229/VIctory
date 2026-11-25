@@ -1126,6 +1126,37 @@ impl State {
         crate::memory::ready(list, heap, &addresses, &constants, writes)
     }
 
+    /// After a dispatch of `p`: constant indirect diffuse light, if `p` is the
+    /// program that resolves it and `VICTORY_AMBIENT` is not `off`.
+    fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        if crate::ambient::level().is_none() {
+            return false;
+        }
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no ambient light: other tables");
+            return false;
+        }
+        crate::ambient::raise(list, light as This)
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -2512,6 +2543,11 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if self.ambient(list, p) {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3828,7 +3864,14 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_made(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x} of {r:?}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x} data {:#x} of {r:?}",
+                d.Width,
+                d.Height,
+                d.Format.0,
+                d.Flags.0,
+                crate::resource::data_of(r)
+            )
         })
     };
     match view {
@@ -3842,15 +3885,27 @@ fn describe(view: Option<&View>) -> String {
                 crate::descriptor::host::buffer_range(v)
             ),
         },
-        Some(View::Placed(u, r, d)) => format!(
-            "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
-            r[0],
-            u64::from(r[4]) | u64::from(r[5]) << 32,
-            r[6],
-            r[8],
-            r[11],
-            u64::from(d[10]) | u64::from(d[11]) << 32
-        ),
+        Some(v @ View::Placed(u, r, d)) => {
+            let is = (!*u && r[0] != 1)
+                .then(|| crate::descriptor::host::placed_texture(v))
+                .flatten();
+            let is = match is {
+                Some(View::Shader(t, _)) => format!(
+                    " is {t:#x} {}",
+                    texture(t as This).unwrap_or_else(|| "no host texture".into())
+                ),
+                _ => String::new(),
+            };
+            format!(
+                "placed uav={u} dim {} {}x{} f{} layout {:#x}{is} at {:#x}",
+                r[0],
+                u64::from(r[4]) | u64::from(r[5]) << 32,
+                r[6],
+                r[8],
+                r[11],
+                u64::from(d[10]) | u64::from(d[11]) << 32
+            )
+        }
         // The first four values, as a colour rectangle's constants are.
         Some(View::Constant(address, size))
             if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
