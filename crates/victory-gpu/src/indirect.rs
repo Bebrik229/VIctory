@@ -1327,6 +1327,78 @@ void main() {
         host.execute(&[&list]);
         list.reset();
     }
+    /// Verifies our fused 64-thread coalesced `CARD_COMPARE_FETCH` shader:
+    /// mode 0 hashes, mode 3 detects a single-bit mutation, stores updated
+    /// hash, allocates a ticket, and copies the exact widened piece into
+    /// `fetched` in one pass with no intermediate barrier.
+    #[test]
+    fn warp_card_compare_fetch_fused_hashes_and_fetches_in_one_pass() {
+        use crate::host::{CARD_COMPARE_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT};
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let fused = compile_cs(&warp.device, CARD_COMPARE_FETCH)
+            .expect("CARD_COMPARE_FETCH must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        const SKEW: u32 = 40;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES + 1));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(4 + 64);
+        let slots = 2u32;
+        let (_fetched, fetched_ptr, fetched_gpu) = warp.shared_buffer(INFLIGHT_SLOT * u64::from(slots));
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        unsafe {
+            std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size);
+            table_ptr.cast::<u32>().write_volatile(0);
+        }
+        let pieces = PIECES + 1;
+        let run = |warp: &mut WarpHarness, mode: u32, landed: u32| -> (Vec<u32>, Vec<u32>) {
+            unsafe {
+                warp.list.SetComputeRootSignature(&fused.root);
+                warp.list.SetPipelineState(&fused.pso);
+                let constants = [0u32, SKEW, size as u32, pieces, 0, mode, landed, slots, pieces];
+                warp.list.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, table_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(5, fetched_gpu);
+                warp.list.Dispatch(pieces, 1, 1);
+            }
+            warp.submit_and_wait();
+            let diffs = (0..pieces as usize)
+                .map(|i| unsafe { differs_ptr.cast::<u32>().add(i).read_volatile() })
+                .collect();
+            let tbl = (0..=pieces as usize)
+                .map(|i| unsafe { table_ptr.cast::<u32>().add(i).read_volatile() })
+                .collect();
+            (diffs, tbl)
+        };
+        // Mode 0: seed hashes.
+        run(&mut warp, 0, 0);
+        // Mode 3 with no changes: all 0 diffs, all INFLIGHT_NONE, counter stays 0.
+        let (d0, t0) = run(&mut warp, 3, 0);
+        assert_eq!(d0, vec![0, 0, 0, 0]);
+        assert_eq!(t0, vec![0, INFLIGHT_NONE, INFLIGHT_NONE, INFLIGHT_NONE, INFLIGHT_NONE]);
+        // Mutate 1 byte inside piece 2 and run mode 3 (fused compare + hash update + fetch).
+        let from = 2 * PIECE - SKEW as usize;
+        let widened = from & !15;
+        unsafe { now_ptr.add(from + 100).write_volatile(content[from + 100] ^ 0x40) };
+        let (d1, t1) = run(&mut warp, 3, 0);
+        assert_eq!(d1, vec![0, 0, 1, 0]);
+        assert_eq!(t1, vec![1, INFLIGHT_NONE, INFLIGHT_NONE, 0, INFLIGHT_NONE]);
+        let mut wanted = content[widened..widened + INFLIGHT_SLOT as usize].to_vec();
+        wanted[from + 100 - widened] ^= 0x40;
+        let got = unsafe { std::slice::from_raw_parts(fetched_ptr, INFLIGHT_SLOT as usize).to_vec() };
+        assert_eq!(got, wanted, "fused pass copied mutated piece 2 into slot 0");
+        // Second run with no new changes: hash was updated, so 0 diffs now.
+        let (d2, t2) = run(&mut warp, 3, 1);
+        assert_eq!(d2, vec![0, 0, 0, 0]);
+        assert_eq!(t2, vec![1, INFLIGHT_NONE, INFLIGHT_NONE, INFLIGHT_NONE, INFLIGHT_NONE]);
+    }
 }
 
 /// What one small draw costs this card, bare and with one thing changed

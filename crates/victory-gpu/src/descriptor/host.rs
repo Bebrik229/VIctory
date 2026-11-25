@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -26,10 +27,10 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
-    /// A fingerprint of the record each slot held when the pass over
-    /// records copied in as bytes last looked at it
-    /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
-    copied: Mutex<Vec<u64>>,
+    /// Lock-free last-seen 12-byte view key per title slot for
+    /// [`HostHeap::mirror_copied_in`] (0: empty or non-view; allocated on first
+    /// use). Avoids per-slot mutex locking during `sync_heaps`.
+    copied: std::sync::OnceLock<Box<[AtomicU64]>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -951,7 +952,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            copied: Mutex::new(Vec::new()),
+            copied: std::sync::OnceLock::new(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -1808,44 +1809,42 @@ impl HostHeap {
     /// `record`: the record's bytes as the caller read them (through the
     /// kernel, which fails on a page the title unmapped meanwhile where a
     /// read in place would fault: the title unmaps heap pages too).
-    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
-        if index >= self.count {
+    /// Lock-free `mirror_copied` with `frame` hoisted by the caller: reads the
+    /// exact 12-byte `[tag, i, generation]` key that [`HostHeap::mirror`]
+    /// consumes (zero hashing, zero mutex locking).
+    pub(crate) fn mirror_copied_in(&self, index: u32, handle: u64, record: &[u8], frame: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mirrored = self.count;
+        if index >= mirrored {
             return false;
         }
-        // A slot draws read through a table lately is left to its draws,
-        // as the passes over slots picked by index leave it
-        // (`texture_slots_remapped`, `slots_written_under`): the title
-        // writes its per-draw tables into the same heap every frame, and
-        // each draw makes what its table shows in a slot of its own. Those
-        // were most of the 26,000 to 43,000 records a frame this pass
-        // mirrored in run 200 and in the play session after it, each then
-        // made and brought up to date once more by the pass over buffer
-        // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
-        // are mirrored too, as in run 200.
-        if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
-            COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !sync_tables() && self.tabled_lately(index, frame) {
+            COPIED_TABLED.fetch_add(1, Relaxed);
             return false;
         }
-        let n = record.len();
-        // Never 0, which is "never looked at". (A multiply-and-fold over
-        // the record's words: BLAKE3 here was most of the 35 to 42 ms a
-        // frame this pass took over some 250,000 to 300,000 records, run
-        // 200.)
-        let print = record_print(record) | 1;
-        {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() {
-                copied.resize(self.count as usize, 0);
-            }
-            let Some(last) = copied.get_mut(index as usize) else {
-                return false;
-            };
-            // A slot never looked at that holds nothing: as it was.
-            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
-                return false;
-            }
-            *last = print;
+        if record.len() < 12 {
+            return false;
         }
+        let tag = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+        let i = u32::from_le_bytes([record[4], record[5], record[6], record[7]]);
+        let generation = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
+        // Generations start at 1 (and inline kinds set upper bits), so any
+        // valid VIEW_TAG record has a non-zero key; non-VIEW_TAG / zeros map to 0.
+        let key = if tag == VIEW_TAG {
+            u64::from(generation) << 32 | u64::from(i)
+        } else {
+            0
+        };
+        let copied = self
+            .copied
+            .get_or_init(|| (0..mirrored as usize).map(|_| AtomicU64::new(0)).collect());
+        let Some(slot) = copied.get(index as usize) else {
+            return false;
+        };
+        if slot.load(Relaxed) == key {
+            return false;
+        }
+        slot.store(key, Relaxed);
         self.mirror(index, handle, false);
         true
     }
@@ -1873,6 +1872,14 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        if let Some(copied) = self.copied.get()
+            && let Some(slot) = copied.get(index as usize)
+        {
+            slot.store(
+                if tag == VIEW_TAG { key } else { 0 },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -2173,6 +2180,7 @@ pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomi
 /// equal records give equal prints, and two different records the same
 /// print about once in 2^64. Not a hash anyone can attack: the records
 /// are our own.
+#[cfg(test)]
 fn record_print(record: &[u8]) -> u64 {
     const K: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut h = K ^ record.len() as u64;
