@@ -896,6 +896,7 @@ pub(crate) fn bound_before(
         &budget_res,
         budget,
         hoist_mode() == 7,
+        clamps.clamp_unbound(),
     );
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
@@ -910,17 +911,22 @@ fn record_hoisted_clamp(
     budget_res: &ID3D12Resource,
     budget: u64,
     ordered: bool,
+    unbound: bool,
 ) {
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, destination (writable: `clamp_room`) and budget buffers.
     unsafe {
-        l.SetComputeRootSignature(&c.root);
-        l.SetPipelineState(&c.pso);
+        if unbound {
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+        }
         l.SetComputeRoot32BitConstants(0, 7, b.constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, b.src_gpu);
         l.SetComputeRootShaderResourceView(2, b.count_gpu);
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-        l.SetComputeRootUnorderedAccessView(4, budget);
+        if unbound {
+            l.SetComputeRootUnorderedAccessView(4, budget);
+        }
         l.Dispatch(b.records.div_ceil(64), 1, 1);
         // Mode 7: serialize clamps on `budget` so records past the list's
         // budget are charged deterministically in draw order (no flicker).
@@ -2185,7 +2191,7 @@ void main() {
         // Dispatch 1: packed mesh window at chunk offset 0 (4 * 12 = 48B).
         let b_mesh = prepare_clamp_bindings((&src_buf, 0), None, (KIND_MESH, 12, 32, 4), true, false)
             .expect("mesh window bindings");
-        record_hoisted_clamp(&warp.clamp, &warp.list, &b_mesh, chunk_gpu, &budget_buf, budget_gpu, true);
+        record_hoisted_clamp(&warp.clamp, &warp.list, &b_mesh, chunk_gpu, &budget_buf, budget_gpu, true, true);
 
         // Dispatches 2, 3, 4: indexed draws A, B, C at chunk offsets 64, 96, 128.
         for (src_off, dst_off) in [(256u64, 64u64), (320, 96), (384, 128)] {
@@ -2199,6 +2205,7 @@ void main() {
                 &budget_buf,
                 budget_gpu,
                 true,
+                false,
             );
         }
 

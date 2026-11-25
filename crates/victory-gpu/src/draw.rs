@@ -245,9 +245,14 @@ pub(crate) struct State {
     /// resets or switches (`State::reset` / `State::replay`).
     kept_pipelines: HashSet<usize>,
     kept_roots: HashSet<usize>,
-    /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// Tables made afresh in this list, by a hash of the table, slot count
+    /// and what it holds ([`table_hash`]).
+    fresh_tables: std::collections::HashMap<u64, Fresh, std::hash::BuildHasherDefault<Plain>>,
+    /// The record words of [`Fresh`] tables, one after the other.
+    fresh_records: Vec<[u32; 3]>,
+    /// What [`State::tables`] made for the stage being bound: root slot, byte
+    /// offset of its fresh table. Kept to reuse its storage across draws.
+    made: Vec<(u8, u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -267,7 +272,7 @@ pub(crate) struct State {
 
 /// An entry a bind added to one of [`State`]'s per-list slot maps.
 enum BindMade {
-    Table((u64, u32, u64)),
+    Table(u64),
     RootSrv((usize, u64)),
     RootUav((usize, u64)),
 }
@@ -301,6 +306,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.fresh_records.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
@@ -803,9 +809,81 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len)
+}
+
+/// Root slots (bytes) as a set that lives on the stack: a draw collects them
+/// without the heap, and they come out in order.
+#[derive(Default)]
+struct Slots([u64; 4]);
+
+impl Slots {
+    fn insert(&mut self, slot: u8) {
+        self.0[usize::from(slot / 64)] |= 1 << (slot % 64);
+    }
+
+    fn contains(&self, slot: u8) -> bool {
+        (self.0[usize::from(slot / 64)] >> (slot % 64)) & 1 != 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u8> {
+        let words = self.0;
+        (0..4u8).flat_map(move |w| {
+            let mut bits = words[usize::from(w)];
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros() as u8;
+                    bits &= bits - 1;
+                    w * 64 + bit
+                })
+            })
+        })
+    }
+}
+
+/// A table made afresh: what it was made from (the `n` records at `at` in
+/// [`State::fresh_records`]) and its first dynamic slot.
+struct Fresh {
+    table: u64,
+    n: u32,
+    at: usize,
+    first: u32,
+}
+
+/// A hash that is mixed already, used as it is.
+#[derive(Default)]
+struct Plain(u64);
+
+impl std::hash::Hasher for Plain {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0 << 8 | u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
+
+/// A quick hash of `table`, `n` and its `n` records. It only finds the table
+/// made before: the records are compared too, so a collision costs a copy,
+/// not wrong descriptors.
+fn table_hash(table: u64, n: u32) -> u64 {
+    let mix = |h: u64, x: u64| (h.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let h = (0..n).fold(mix(table, u64::from(n)), |h, k| {
+        let [a, b, c] = record(table, k);
+        mix(mix(h, u64::from(a) | u64::from(b) << 32), u64::from(c))
+    });
+    h ^ h >> 32
+}
+
+/// The words of entry `k` of `table`.
+fn record(table: u64, k: u32) -> [u32; 3] {
+    // SAFETY: a descriptor slot in title memory.
+    unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() }
 }
 
 macro_rules! once {
@@ -1426,17 +1504,19 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = pso;
             if self.kept_pipelines.insert(pso) {
-                list.used_pipeline(&p.name);
                 // The title may release the pipeline before it submits the list.
-                list.keep(&p.pso);
+                list.bind_pipeline(p);
             }
         }
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let failed = self
+                .tables(list, &t.used, &t.host.root_indexed_views, compute)
+                .iter()
+                .any(|m| m.1 == u32::MAX);
             STORES.set(true);
-            if made.iter().any(|m| m.1 == u32::MAX) {
+            if failed {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
@@ -1457,14 +1537,17 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // A root signature holds at most 64 dwords, constants included.
+                let mut stack = [0u32; 64];
+                let values = &mut stack[..dwords as usize];
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
                             self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
                         continue;
                     }
-                    let fresh = made
+                    let fresh = self
+                        .made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
@@ -3027,19 +3110,23 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
-    ) -> Vec<(u8, u32)> {
+    ) -> &[(u8, u32)] {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
+        let mut made = std::mem::take(&mut self.made);
+        made.clear();
+        let mut fresh = Slots::default();
+        for u in used
             .iter()
             .filter(tables)
             .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        {
+            fresh.insert(u.slot);
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if fresh.contains(u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -3053,18 +3140,15 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh.insert(u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !fresh.contains(u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        for slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
@@ -3113,17 +3197,16 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, n, h.finish())
-            };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            let key = table_hash(table, n);
+            let same = self.fresh_tables.get(&key).filter(|f| {
+                f.table == table
+                    && f.n == n
+                    && self.fresh_records[f.at..f.at + n as usize]
+                        .iter()
+                        .enumerate()
+                        .all(|(k, r)| *r == record(table, k as u32))
+            });
+            if let Some(&Fresh { first, .. }) = same {
                 for u in entries.iter() {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
@@ -3169,7 +3252,9 @@ impl State {
                 made.push((slot, u32::MAX));
                 break;
             };
-            self.fresh_tables.insert(key, first);
+            let at = self.fresh_records.len();
+            self.fresh_records.extend((0..n).map(|k| record(table, k)));
+            self.fresh_tables.insert(key, Fresh { table, n, at, first });
             self.bind_made.push(BindMade::Table(key));
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
@@ -3199,11 +3284,10 @@ impl State {
                             shadow.refresh(list, address, aligned);
                             continue;
                         }
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        let Some(gpu) = list.fill_scratch(address as *const u8, u64::from(size)) else {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
@@ -3240,7 +3324,8 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        made
+        self.made = made;
+        &self.made
     }
 
     /// The first draws, at debug level: what they bind and read
