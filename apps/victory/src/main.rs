@@ -3,6 +3,18 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+/// DirectX 12 Agility SDK 1.619.6 exports (`ID3D12Device13` / `OpenExistingHeapFromAddress1`
+/// for `VICTORY_INPLACE` on Windows 11 22621+). Resolved from `.\d3d12sdk\D3D12Core.dll`.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+pub static D3D12SDKVersion: u32 = 619;
+
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+pub static D3D12SDKPath: &[u8; 12] = b".\\d3d12sdk\\\0";
+
 mod census;
 mod inspect;
 mod run;

@@ -185,10 +185,11 @@ pub fn title() -> Title {
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess,
+        GetPriorityClass, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
-        ProcessPowerThrottling, SetProcessInformation,
+        ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
     };
     // Also opt out of Windows efficiency mode (reduced clocks / slow cores when
     // unfocused); `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
@@ -211,6 +212,29 @@ pub fn use_console_timers() {
             size_of_val(&keep) as u32,
         );
         timeBeginPeriod(1);
+    }
+    // Raise CPU scheduling priority so background tasks do not preempt the
+    // title's frame pacing or audio mixer; `VICTORY_LOW_PRIORITY=1` skips it,
+    // `VICTORY_HIGH_PRIORITY=1` bumps to `HIGH_PRIORITY_CLASS`.
+    if !std::env::var_os("VICTORY_LOW_PRIORITY").is_some_and(|v| v == "1") {
+        let target = if std::env::var_os("VICTORY_HIGH_PRIORITY").is_some_and(|v| v == "1") {
+            HIGH_PRIORITY_CLASS
+        } else {
+            ABOVE_NORMAL_PRIORITY_CLASS
+        };
+        // SAFETY: `GetCurrentProcess()` is a valid pseudo-handle and `target` is a
+        // valid priority class constant.
+        unsafe {
+            let current = GetPriorityClass(GetCurrentProcess());
+            if current == 0
+                || current == IDLE_PRIORITY_CLASS
+                || current == BELOW_NORMAL_PRIORITY_CLASS
+                || current == NORMAL_PRIORITY_CLASS
+                || (target == HIGH_PRIORITY_CLASS && current == ABOVE_NORMAL_PRIORITY_CLASS)
+            {
+                SetPriorityClass(GetCurrentProcess(), target);
+            }
+        }
     }
 }
 

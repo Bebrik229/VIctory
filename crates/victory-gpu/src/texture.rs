@@ -69,6 +69,9 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// Cached watch kind for `memory`: `0 = unknown`, `1 = write-watched`,
+    /// `2 = view-guarded` (skips doomed `guarded = false` checks).
+    watch_kind: std::sync::atomic::AtomicU8,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -922,20 +925,29 @@ impl Staging {
         };
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, end, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                return 0;
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.watch_kind.load(Relaxed) != 2 {
+            match waited(1, || {
+                crate::watch::writes_unchanged_since(start, end, last.asked, false)
+            }) {
+                Some((now, unchanged)) => {
+                    self.watch_kind.store(1, Relaxed);
+                    if unchanged {
+                        return 0;
+                    }
+                    last.asked = now;
+                    // Read through the copy, which stands unmapped pages: memory of
+                    // big pools is too slow to ask page by page.
+                    with_read(size, |read| {
+                        crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                        self.detile(read);
+                    });
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+                    return size;
+                }
+                None => self.watch_kind.store(2, Relaxed),
             }
-            last.asked = now;
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
-            });
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
         }
         // View memory has no write-watch, and a texture there was hashed
         // whole at every check: 229 MB and 51 ms a frame in a gameplay view
@@ -949,14 +961,23 @@ impl Staging {
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, end, true))
         {
-            const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
-            last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
-                return 0;
+            match waited(1, || {
+                crate::watch::writes_unchanged_since(start, end, last.asked, true)
+            }) {
+                Some((now, unwritten)) => {
+                    const HASH_EVERY: u64 = 8;
+                    last.asked = now;
+                    let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+                    if unwritten && !turn {
+                        return 0;
+                    }
+                }
+                None => {
+                    if self.watch_kind.load(Relaxed) == 2 {
+                        self.watch_kind.store(0, Relaxed);
+                    }
+                }
             }
         }
         // From here on the texture's memory may be read in place. Held until
@@ -1451,6 +1472,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        watch_kind: std::sync::atomic::AtomicU8::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)

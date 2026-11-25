@@ -757,25 +757,19 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     })
 }
 
-/// The pages of `[start, end)` (whole pages) as last written, for pages
-/// written since tracking began: `(page number, asking)` in page order, and
-/// this asking's number, which is higher than any in the list but those the
-/// kernel just reported. `None` if the memory is not write-watched (nor,
-/// with `guarded`, view memory, which is then guarded).
-pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+fn query_writes<T>(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    collect: impl FnOnce(&Journal, usize, usize) -> T,
+) -> Option<(u64, T)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // Fast path: shared read lock only so concurrent refresh workers never
     // serialize against each other or against miss-path syscalls.
     {
         let j = journal_read();
         if j.covers_ahead(first, last, guarded) {
-            return Some((
-                j.ahead_asked,
-                j.written
-                    .range(first..last)
-                    .map(|(&p, &w)| (p, w))
-                    .collect(),
-            ));
+            return Some((j.ahead_asked, collect(&j, first, last)));
         }
     }
     // View memory the guards already hold cannot be write-watched: reject
@@ -794,13 +788,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     {
         let j = journal_read();
         if j.covers_ahead(first, last, guarded) {
-            return Some((
-                j.ahead_asked,
-                j.written
-                    .range(first..last)
-                    .map(|(&p, &w)| (p, w))
-                    .collect(),
-            ));
+            return Some((j.ahead_asked, collect(&j, first, last)));
         }
     }
     #[cfg(feature = "diagnostics")]
@@ -842,13 +830,33 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     j.asked += 1;
     let now = j.asked;
     insert_dedup(&mut j.written, &dirty, now);
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, collect(&j, first, last)))
+}
+
+/// The pages of `[start, end)` (whole pages) as last written, for pages
+/// written since tracking began: `(page number, asking)` in page order, and
+/// this asking's number, which is higher than any in the list but those the
+/// kernel just reported. `None` if the memory is not write-watched (nor,
+/// with `guarded`, view memory, which is then guarded).
+pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    query_writes(start, end, guarded, |j, first, last| {
+        j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()
+    })
+}
+
+/// Returns `(asked, unchanged)` for `[start, end)` without allocating:
+/// `unchanged` is true iff `since != 0` and every written page in the range
+/// was last written at or before `since`. Follows the same tracking semantics
+/// and `guarded` / `known_view` rules as [`writes`].
+pub(crate) fn writes_unchanged_since(
+    start: usize,
+    end: usize,
+    since: u64,
+    guarded: bool,
+) -> Option<(u64, bool)> {
+    query_writes(start, end, guarded, |j, first, last| {
+        since != 0 && j.written.range(first..last).all(|(_, &w)| w <= since)
+    })
 }
 
 impl Tracked {
@@ -1774,6 +1782,7 @@ pub fn title_memory_reading_range(range: std::ops::Range<usize>) -> Reading {
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
+#[allow(dead_code)]
 pub fn title_memory_reading_now() -> Option<Reading> {
     title_memory_reading_now_range(ALL_MEMORY)
 }
@@ -3167,6 +3176,84 @@ mod tests {
         // SAFETY: our allocation.
         unsafe { VirtualFree(ww as *mut _, 0, MEM_RELEASE) };
         forget_written(ww, 4 * PAGE);
+    }
+
+    #[test]
+    fn writes_unchanged_since_matches_writes_on_watched_and_guarded_ranges() {
+        // 1. Write-watched range.
+        // SAFETY: fresh write-watched allocation, freed below.
+        let ww = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(ww, 0);
+        let (ww_start, ww_end) = (ww, ww + 2 * PAGE);
+
+        let (now0, unchanged0) =
+            writes_unchanged_since(ww_start, ww_end, 0, false).expect("watched initial");
+        assert!(!unchanged0);
+        let (_, pages0) = writes(ww_start, ww_end, false).expect("writes initial");
+        assert!(pages0.is_empty());
+
+        let (now1, unchanged1) =
+            writes_unchanged_since(ww_start, ww_end, now0, false).expect("watched untouched");
+        assert!(unchanged1);
+        let (_, pages1) = writes(ww_start, ww_end, false).expect("writes untouched");
+        assert!(pages1.iter().all(|&(_, w)| w <= now0));
+
+        // SAFETY: committed write-watched page of ours.
+        unsafe { ((ww + PAGE + 8) as *mut u8).write(1) };
+        let (now2, unchanged2) =
+            writes_unchanged_since(ww_start, ww_end, now1, false).expect("watched after write");
+        assert!(now2 > now1);
+        assert!(!unchanged2);
+        let (_, pages2) = writes(ww_start, ww_end, false).expect("writes after write");
+        assert!(!pages2.iter().all(|&(_, w)| w <= now1));
+
+        let (_, unchanged3) =
+            writes_unchanged_since(ww_start, ww_end, now2, false).expect("watched clean again");
+        assert!(unchanged3);
+
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(ww as *mut _, 0, MEM_RELEASE) };
+        forget_written(ww_start, 2 * PAGE);
+
+        // 2. Guarded physical-page view range.
+        const VIEW_SIZE: usize = 2 * BLOCK;
+        let (section, view) = one_view(VIEW_SIZE);
+        let (view_start, view_end) = (view, view + VIEW_SIZE);
+
+        let (v0, v_unchanged0) =
+            writes_unchanged_since(view_start, view_end, 0, true).expect("guarded initial");
+        assert!(!v_unchanged0);
+        assert!(writes_unchanged_since(view_start, view_end, 0, false).is_none());
+        assert!(writes(view_start, view_end, false).is_none());
+
+        let (v1, v_unchanged1) =
+            writes_unchanged_since(view_start, view_end, v0, true).expect("guarded untouched");
+        assert!(v_unchanged1);
+        let (_, v_pages1) = writes(view_start, view_end, true).expect("guarded writes untouched");
+        assert!(v_pages1.iter().all(|&(_, w)| w <= v0));
+
+        // SAFETY: guarded block 1 of `view`; VEH fault opens it and marks it written.
+        unsafe { ((view + BLOCK + 8) as *mut u8).write_volatile(0x5a) };
+        let (v2, v_unchanged2) =
+            writes_unchanged_since(view_start, view_end, v1, true).expect("guarded after write");
+        assert!(v2 > v1);
+        assert!(!v_unchanged2);
+        let (_, v_pages2) = writes(view_start, view_end, true).expect("guarded writes after write");
+        assert!(!v_pages2.iter().all(|&(_, w)| w <= v1));
+
+        let (_, v_unchanged3) =
+            writes_unchanged_since(view_start, view_end, v2, true).expect("guarded clean again");
+        assert!(v_unchanged3);
+
+        drop_views(section, &[view], VIEW_SIZE);
+        forget_written(view_start, VIEW_SIZE);
     }
 
     /// Disk-filled writes delivered through a separate runtime view are
