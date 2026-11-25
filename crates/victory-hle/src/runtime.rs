@@ -221,6 +221,13 @@ fn apply_priority_and_throttling(execution: u32, target: Option<u32>) {
     }
 }
 
+/// Whether `use_console_timers` should opt out of Windows 11 Efficiency Mode
+/// execution-speed throttling (`VICTORY_EFFICIENCY_MODE=1` leaves the OS its choice).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn efficiency_mode_opt_out(value: Option<&str>) -> bool {
+    value != Some("1")
+}
+
 #[cfg(windows)]
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
@@ -229,10 +236,10 @@ pub fn use_console_timers() {
     };
     // Also opt out of Windows efficiency mode (reduced clocks / slow cores when
     // unfocused); `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
-    let execution = if std::env::var_os("VICTORY_EFFICIENCY_MODE").is_some_and(|v| v == "1") {
-        0
-    } else {
+    let execution = if efficiency_mode_opt_out(std::env::var("VICTORY_EFFICIENCY_MODE").ok().as_deref()) {
         PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    } else {
+        0
     };
     // Raise CPU scheduling priority so background tasks do not preempt the
     // title's frame pacing or audio mixer; `VICTORY_LOW_PRIORITY=1` skips it,
@@ -275,5 +282,12 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn efficiency_mode_opt_out_defaults_on_and_respects_env() {
+        assert!(efficiency_mode_opt_out(None));
+        assert!(efficiency_mode_opt_out(Some("0")));
+        assert!(!efficiency_mode_opt_out(Some("1")));
     }
 }

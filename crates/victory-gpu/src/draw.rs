@@ -1539,7 +1539,13 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 // A root signature holds at most 64 dwords, constants included.
                 let mut stack = [0u32; 64];
-                let values = &mut stack[..dwords as usize];
+                let mut heap_values = Vec::new();
+                let values: &mut [u32] = if (dwords as usize) <= stack.len() {
+                    &mut stack[..dwords as usize]
+                } else {
+                    heap_values.resize(dwords as usize, 0);
+                    &mut heap_values
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
