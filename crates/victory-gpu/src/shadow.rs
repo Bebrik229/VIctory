@@ -3093,6 +3093,25 @@ impl Shadow {
         }
         let off = from - start;
         if filter_echo && self.card.is_some() {
+            // SAFETY: inside the mapping (`from` and `to` are within the buffer),
+            // and `copy_stale` only runs on ranges outside `self.pending`.
+            let cur = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) };
+            match crate::watch::try_diff_bounds_fast(from as *const u8, cur) {
+                Some(None) => return 0,
+                Some(Some((first, last))) => {
+                    let changed_len = last + 1 - first;
+                    // SAFETY: `first <= last < len`, so `first..=last` lies within `cur`.
+                    let dst = unsafe { cur.as_mut_ptr().add(first) };
+                    let src = (from + first) as *const u8;
+                    if !crate::watch::try_copy_fast(dst, src, changed_len) {
+                        crate::host::copy_mapped(dst, src, changed_len, false);
+                    }
+                    self.changed(off + first, off + last + 1);
+                    self.card_changed(off + first, off + last + 1);
+                    return changed_len;
+                }
+                None => {}
+            }
             thread_local! {
                 static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
             }
@@ -3103,9 +3122,6 @@ impl Shadow {
                 }
                 let buf = &mut tmp[..len];
                 crate::host::copy_mapped(buf.as_mut_ptr(), from as *const u8, len, false);
-                // SAFETY: inside the mapping (`from` and `to` are within the buffer),
-                // and `copy_stale` only runs on ranges outside `self.pending`.
-                let cur = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) };
                 let Some(first) = first_difference(buf, cur) else {
                     return 0;
                 };

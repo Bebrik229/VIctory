@@ -907,25 +907,53 @@ pub fn title_memory_remapping() -> Remapping {
     Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
 }
 
+thread_local! {
+    /// Active [`Reading`] guards held by the current thread, so fault-safe
+    /// fast reads nested inside an outer [`title_memory_reading`] (e.g.
+    /// texture refreshes) skip a recursive `SRWLOCK` acquisition.
+    static READING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// What a read of title memory in place holds ([`title_memory_reading`]).
 pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        READING_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    READING_DEPTH.with(|d| d.set(d.get() + 1));
+    Reading(guard)
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+    let guard = match MAPPING.try_read() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    READING_DEPTH.with(|d| d.set(d.get() + 1));
+    Some(Reading(guard))
+}
+
+/// Non-blocking read guard against concurrent title-memory remapping, safe
+/// even if this thread already holds an outer [`Reading`].
+#[cfg(target_arch = "x86_64")]
+fn acquire_reading_now() -> Option<Option<Reading>> {
+    if READING_DEPTH.with(std::cell::Cell::get) > 0 {
+        Some(None)
+    } else {
+        title_memory_reading_now().map(Some)
     }
 }
 
@@ -957,8 +985,27 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
-/// Registers the handler that takes writes to guarded blocks, once, ahead
-/// of the crash reporter's.
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    /// Recovery instruction pointer for fault-safe reads of title memory
+    /// ([`try_copy_fast`], [`try_diff_bounds_fast`]). Non-zero only across the
+    /// inline-assembly loop that touches title memory; cleared on normal exit
+    /// or by [`install`]'s vectored handler on a read access violation.
+    static READ_RECOVER_RIP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether title-memory copies and echo-diffs read title memory directly under
+/// [`install`]'s vectored read-fault handler instead of `ReadProcessMemory`
+/// (`VICTORY_FAST_COPY=0` disables it).
+#[cfg(target_arch = "x86_64")]
+fn fast_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_COPY").is_none_or(|v| v != "0"))
+}
+
+/// Registers the handler that takes writes to guarded blocks (and read faults
+/// inside [`try_copy_fast`] / [`try_diff_bounds_fast`]), once, ahead of the
+/// crash reporter's.
 fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -968,6 +1015,24 @@ fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        #[cfg(target_arch = "x86_64")]
+        {
+            const READ: usize = 0;
+            if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+                && r.NumberParameters >= 2
+                && r.ExceptionInformation[0] == READ
+            {
+                let recover = READ_RECOVER_RIP.with(|slot| slot.replace(0));
+                if recover != 0 {
+                    // SAFETY: `ContextRecord` belongs to the faulting thread;
+                    // `recover` is the in-block label of the active `asm!` read
+                    // loop on this thread (`rsp`, callee-saved registers, and
+                    // `DF=0` remain intact).
+                    unsafe { (*(*info).ContextRecord).Rip = recover as u64 };
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
         const WRITE: usize = 1;
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
@@ -992,10 +1057,222 @@ fn install() {
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: the handler only touches our guard state and protections.
+    // SAFETY: the handler only touches our guard state, TLS recovery slot, and
+    // page protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// Copies `len` bytes from title memory `src` into writable host memory `dst`
+/// without a kernel syscall, using [`install`]'s vectored handler to recover
+/// cleanly if `src` touches an uncommitted or inaccessible page.
+///
+/// Returns `false` if fast copy is disabled (`VICTORY_FAST_COPY=0`), if title
+/// memory is currently being remapped (non-blocking), or if a read fault occurs
+/// (in which case `dst` may have been partially written and the caller must
+/// fall back).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn try_copy_fast(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if !fast_copy() || (src as usize).checked_add(len).is_none() {
+        return false;
+    }
+    install();
+    let Some(_reading) = acquire_reading_now() else {
+        return false;
+    };
+    let mut remaining = len;
+    let s = src;
+    let d = dst;
+    READ_RECOVER_RIP.with(|slot| {
+        let slot_ptr = slot.as_ptr();
+        // SAFETY: `dst` is writable host memory of `len` bytes, non-overlapping
+        // with `src`; `_reading` prevents concurrent title-memory unmapping;
+        // `slot_ptr` points to this thread's `READ_RECOVER_RIP` slot; on a read
+        // fault during `rep movsb`, `on_write` clears the slot and redirects
+        // `Rip` to `2:` with `rcx > 0`, `rsp`/callee-saved registers intact,
+        // and `DF = 0`.
+        unsafe {
+            core::arch::asm!(
+                "lea {tmp}, [rip + 2f]",
+                "mov qword ptr [{slot}], {tmp}",
+                "cld",
+                "rep movsb",
+                "2:",
+                "mov qword ptr [{slot}], 0",
+                slot = in(reg) slot_ptr,
+                tmp = out(reg) _,
+                inout("rdi") d => _,
+                inout("rsi") s => _,
+                inout("rcx") remaining,
+                options(nostack),
+            );
+        }
+    });
+    remaining == 0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn try_copy_fast(_dst: *mut u8, _src: *const u8, len: usize) -> bool {
+    len == 0
+}
+
+/// Fault-safe, zero-copy comparison of title memory `[src, src + cur.len())`
+/// against host buffer `cur`, returning the tightest inclusive `(first, last)`
+/// byte offsets where they differ.
+///
+/// Returns:
+/// - `Some(None)` if every byte matches,
+/// - `Some(Some((first, last)))` if differing bytes were found (`first <= last < cur.len()`),
+/// - `None` if fast copy is disabled (`VICTORY_FAST_COPY=0`), if title memory
+///   is currently being remapped, or if a read fault occurred while scanning `src`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn try_diff_bounds_fast(src: *const u8, cur: &[u8]) -> Option<Option<(usize, usize)>> {
+    let len = cur.len();
+    if len == 0 {
+        return Some(None);
+    }
+    if !fast_copy() || (src as usize).checked_add(len).is_none() {
+        return None;
+    }
+    install();
+    let _reading = acquire_reading_now()?;
+    let cur_ptr = cur.as_ptr();
+    let end16 = len & !15;
+    let (first, faulted) = READ_RECOVER_RIP.with(|slot| {
+        let slot_ptr = slot.as_ptr();
+        let idx: usize;
+        let faulted: usize;
+        // SAFETY: `cur_ptr` is valid for `len` bytes; `_reading` prevents
+        // concurrent title-memory remapping; all loads stay within `[0, len)`;
+        // `DF` is never set; on a read fault from `src`, `on_write` clears
+        // `READ_RECOVER_RIP` and redirects `Rip` to `8:` with `faulted == 1`.
+        unsafe {
+            core::arch::asm!(
+                "xor {idx}, {idx}",
+                "mov {faulted}, 1",
+                "lea {tmp}, [rip + 8f]",
+                "mov qword ptr [{slot}], {tmp}",
+                "3:",
+                "cmp {idx}, {end16}",
+                "jae 4f",
+                "movdqu {x0}, xmmword ptr [{src} + {idx}]",
+                "movdqu {x1}, xmmword ptr [{cur} + {idx}]",
+                "pcmpeqb {x0}, {x1}",
+                "pmovmskb {tmp:e}, {x0}",
+                "xor {tmp:e}, 0xffff",
+                "jnz 5f",
+                "add {idx}, 16",
+                "jmp 3b",
+                "5:",
+                "bsf {tmp:e}, {tmp:e}",
+                "add {idx}, {tmp}",
+                "jmp 7f",
+                "4:",
+                "cmp {idx}, {len}",
+                "jae 7f",
+                "movzx {tmp:e}, byte ptr [{src} + {idx}]",
+                "cmp {tmp:l}, byte ptr [{cur} + {idx}]",
+                "jne 7f",
+                "inc {idx}",
+                "jmp 4b",
+                "7:",
+                "xor {faulted}, {faulted}",
+                "8:",
+                "mov qword ptr [{slot}], 0",
+                src = in(reg) src,
+                cur = in(reg) cur_ptr,
+                len = in(reg) len,
+                end16 = in(reg) end16,
+                slot = in(reg) slot_ptr,
+                idx = out(reg) idx,
+                faulted = out(reg) faulted,
+                tmp = out(reg) _,
+                x0 = out(xmm_reg) _,
+                x1 = out(xmm_reg) _,
+                options(nostack),
+            );
+        }
+        (idx, faulted)
+    });
+    if faulted != 0 {
+        return None;
+    }
+    if first >= len {
+        return Some(None);
+    }
+    if first == len - 1 {
+        return Some(Some((first, first)));
+    }
+    // Scan backward over `[first, len)` with DF=0 at all times (never `std`),
+    // rebasing pointers to `first` so relative offsets stay in `0..len - first`.
+    let src_tail = src.wrapping_add(first);
+    let cur_tail = cur_ptr.wrapping_add(first);
+    let (rel_last, faulted) = READ_RECOVER_RIP.with(|slot| {
+        let slot_ptr = slot.as_ptr();
+        let mut rem = len - first;
+        let faulted: usize;
+        // SAFETY: `cur_tail` is valid for `len - first` bytes; all loads stay
+        // strictly inside `[0, len - first)`; `DF` stays 0 at all times; on a
+        // read fault from `src_tail`, `on_write` clears `READ_RECOVER_RIP` and
+        // redirects `Rip` to `8:` with `faulted == 1`.
+        unsafe {
+            core::arch::asm!(
+                "mov {faulted}, 1",
+                "lea {tmp}, [rip + 8f]",
+                "mov qword ptr [{slot}], {tmp}",
+                "3:",
+                "cmp {rem}, 16",
+                "jb 4f",
+                "sub {rem}, 16",
+                "movdqu {x0}, xmmword ptr [{src} + {rem}]",
+                "movdqu {x1}, xmmword ptr [{cur} + {rem}]",
+                "pcmpeqb {x0}, {x1}",
+                "pmovmskb {tmp:e}, {x0}",
+                "xor {tmp:e}, 0xffff",
+                "jnz 5f",
+                "jmp 3b",
+                "5:",
+                "bsr {tmp:e}, {tmp:e}",
+                "add {rem}, {tmp}",
+                "jmp 7f",
+                "4:",
+                "test {rem}, {rem}",
+                "jz 7f",
+                "dec {rem}",
+                "movzx {tmp:e}, byte ptr [{src} + {rem}]",
+                "cmp {tmp:l}, byte ptr [{cur} + {rem}]",
+                "jne 7f",
+                "jmp 4b",
+                "7:",
+                "xor {faulted}, {faulted}",
+                "8:",
+                "mov qword ptr [{slot}], 0",
+                src = in(reg) src_tail,
+                cur = in(reg) cur_tail,
+                slot = in(reg) slot_ptr,
+                rem = inout(reg) rem,
+                faulted = out(reg) faulted,
+                tmp = out(reg) _,
+                x0 = out(xmm_reg) _,
+                x1 = out(xmm_reg) _,
+                options(nostack),
+            );
+        }
+        (rem, faulted)
+    });
+    if faulted != 0 {
+        return None;
+    }
+    Some(Some((first, first + rel_last)))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn try_diff_bounds_fast(_src: *const u8, cur: &[u8]) -> Option<Option<(usize, usize)>> {
+    cur.is_empty().then_some(None)
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -1550,5 +1827,212 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod fast_copy_tests {
+    use super::{
+        KERNEL_PAGE, PAGE, title_memory_reading, title_memory_remapping, try_copy_fast,
+        try_diff_bounds_fast,
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, VirtualProtect,
+    };
+
+    #[test]
+    fn try_copy_fast_handles_zero_unaligned_and_large_buffers() {
+        let mut sentinel = [0xaa_u8; 8];
+        // Zero-length copy succeeds even with a null source without touching memory.
+        assert!(try_copy_fast(sentinel.as_mut_ptr(), std::ptr::null(), 0));
+        assert_eq!(sentinel, [0xaa; 8]);
+
+        // Unaligned small and medium sizes across 16-byte / page boundaries.
+        let src: Vec<u8> = (0..(2 * PAGE + 317)).map(|i| (i.wrapping_mul(31) ^ (i >> 5)) as u8).collect();
+        for &(src_off, dst_off, len) in &[
+            (0, 0, 1),
+            (1, 3, 7),
+            (3, 1, 15),
+            (5, 7, 16),
+            (7, 2, 17),
+            (13, 9, 63),
+            (15, 11, 64),
+            (19, 5, 4097),
+            (27, 13, PAGE + 123),
+            (3, 17, 2 * PAGE + 257),
+        ] {
+            let mut dst = vec![0xee_u8; dst_off + len + 19];
+            // SAFETY: both slices cover `len` bytes from their respective offsets.
+            let ok = unsafe { try_copy_fast(dst.as_mut_ptr().add(dst_off), src.as_ptr().add(src_off), len) };
+            assert!(ok, "copy failed for ({src_off}, {dst_off}, {len})");
+            assert_eq!(&dst[dst_off..dst_off + len], &src[src_off..src_off + len]);
+            assert!(dst[..dst_off].iter().all(|&b| b == 0xee));
+            assert!(dst[dst_off + len..].iter().all(|&b| b == 0xee));
+        }
+    }
+
+    #[test]
+    fn try_copy_fast_recovers_from_uncommitted_and_noaccess_pages() {
+        let mut dst = vec![0x55_u8; 2 * KERNEL_PAGE];
+        // SAFETY: reserves two pages without committing; freed before returning.
+        unsafe {
+            let reserved = VirtualAlloc(std::ptr::null(), 2 * KERNEL_PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!reserved.is_null());
+            assert!(!try_copy_fast(dst.as_mut_ptr(), reserved, KERNEL_PAGE));
+
+            // Commit the first page as PAGE_NOACCESS and verify recovery as well.
+            let committed = VirtualAlloc(reserved.cast(), KERNEL_PAGE, MEM_COMMIT, PAGE_NOACCESS);
+            assert_eq!(committed, reserved.cast());
+            assert!(!try_copy_fast(dst.as_mut_ptr(), reserved, 64));
+
+            // Make it PAGE_READONLY (as guarded views are) and verify fast copy succeeds.
+            let mut old = 0;
+            assert_ne!(VirtualProtect(reserved.cast(), KERNEL_PAGE, PAGE_READWRITE, &mut old), 0);
+            reserved.write_bytes(0x3c, KERNEL_PAGE);
+            assert_ne!(VirtualProtect(reserved.cast(), KERNEL_PAGE, PAGE_READONLY, &mut old), 0);
+            dst.fill(0);
+            assert!(try_copy_fast(dst.as_mut_ptr(), reserved, KERNEL_PAGE));
+            assert!(dst[..KERNEL_PAGE].iter().all(|&b| b == 0x3c));
+
+            assert_ne!(VirtualFree(reserved.cast(), 0, MEM_RELEASE), 0);
+        }
+        // Null pointer also recovers cleanly without crashing.
+        assert!(!try_copy_fast(dst.as_mut_ptr(), std::ptr::null(), 16));
+    }
+
+    #[test]
+    fn try_copy_fast_straddling_committed_and_uncommitted_recovers_cleanly() {
+        // SAFETY: allocates a 2-page reservation with only page 0 committed; freed below.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 2 * KERNEL_PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(0x7a, KERNEL_PAGE);
+
+            let mut dst = vec![0u8; 2 * KERNEL_PAGE];
+            // Unaligned copy crossing from committed page 0 into uncommitted page 1.
+            assert!(!try_copy_fast(dst.as_mut_ptr(), base.add(37), 2 * KERNEL_PAGE - 37));
+            // A subsequent valid copy within page 0 must still succeed (slot cleanly reset).
+            let mut ok_dst = vec![0u8; KERNEL_PAGE - 37];
+            assert!(try_copy_fast(ok_dst.as_mut_ptr(), base.add(37), KERNEL_PAGE - 37));
+            assert!(ok_dst.iter().all(|&b| b == 0x7a));
+
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn try_diff_bounds_fast_matches_bytewise_across_sizes_and_offsets() {
+        // Empty slice never touches source.
+        assert_eq!(try_diff_bounds_fast(std::ptr::null(), &[]), Some(None));
+
+        let base: Vec<u8> = (0..120u32).map(|i| (i * 13 + 5) as u8).collect();
+        for len in [1, 2, 7, 8, 15, 16, 17, 31, 32, 33, 47, 48, 49, 65] {
+            let cur = &base[3..3 + len];
+            let same = cur.to_vec();
+            assert_eq!(try_diff_bounds_fast(same.as_ptr(), cur), Some(None), "identical len={len}");
+            for first in 0..len {
+                for last in first..len {
+                    let mut src = cur.to_vec();
+                    src[first] ^= 0x80;
+                    src[last] ^= 0x01;
+                    let expected_first = src.iter().zip(cur).position(|(a, b)| a != b).unwrap();
+                    let expected_last = src.iter().zip(cur).rposition(|(a, b)| a != b).unwrap();
+                    assert_eq!(
+                        try_diff_bounds_fast(src.as_ptr(), cur),
+                        Some(Some((expected_first, expected_last))),
+                        "len={len} first={first} last={last}"
+                    );
+                }
+            }
+        }
+
+        // Large 64 KiB+ buffer: identical, start, middle, end, and two-point diffs.
+        let big_len = PAGE + 37;
+        let cur: Vec<u8> = (0..big_len).map(|i| (i.wrapping_mul(29) >> 2) as u8).collect();
+        let mut src = cur.clone();
+        assert_eq!(try_diff_bounds_fast(src.as_ptr(), &cur), Some(None));
+        for &pos in &[0, 1, 15, 16, 17, 4095, 4096, PAGE / 2, big_len - 17, big_len - 16, big_len - 2, big_len - 1] {
+            src[pos] ^= 0xff;
+            assert_eq!(try_diff_bounds_fast(src.as_ptr(), &cur), Some(Some((pos, pos))), "pos={pos}");
+            src[pos] ^= 0xff;
+        }
+        src[19] ^= 0x11;
+        src[big_len - 23] ^= 0x22;
+        assert_eq!(try_diff_bounds_fast(src.as_ptr(), &cur), Some(Some((19, big_len - 23))));
+    }
+
+    #[test]
+    fn try_diff_bounds_fast_recovers_from_uncommitted_pages() {
+        // SAFETY: allocates a 3-page reservation with page 0 committed, page 1 uncommitted,
+        // and page 2 committed; freed before returning.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * KERNEL_PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(0x42, KERNEL_PAGE);
+
+            // 1. Wholly uncommitted page -> forward scan faults on byte 0.
+            let cur1 = vec![0x42_u8; KERNEL_PAGE];
+            assert_eq!(try_diff_bounds_fast(base.add(KERNEL_PAGE), &cur1), None);
+
+            // 2. Identical committed page 0 + uncommitted page 1 -> forward scan faults at page 1.
+            let cur2 = vec![0x42_u8; 2 * KERNEL_PAGE];
+            assert_eq!(try_diff_bounds_fast(base, &cur2), None);
+
+            // 3. Diff at byte 0 on committed page 0 + uncommitted page 1 -> backward scan faults at page 1!
+            let mut cur3 = vec![0x42_u8; 2 * KERNEL_PAGE];
+            cur3[0] = 0x00;
+            assert_eq!(try_diff_bounds_fast(base, &cur3), None);
+
+            // 4. Unaligned tail fault: committed page 0 identical + 5 bytes into uncommitted page 1.
+            let cur4 = vec![0x42_u8; KERNEL_PAGE + 5];
+            assert_eq!(try_diff_bounds_fast(base, &cur4), None);
+
+            // 5. Committed page 0 + uncommitted page 1 + committed page 2 with diffs at both ends:
+            // diff bounds find (0, 3*KERNEL_PAGE - 1), and then try_copy_fast faults cleanly on page 1.
+            assert_eq!(
+                VirtualAlloc(base.add(2 * KERNEL_PAGE).cast(), KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE),
+                base.add(2 * KERNEL_PAGE).cast()
+            );
+            base.add(2 * KERNEL_PAGE).write_bytes(0x42, KERNEL_PAGE);
+            let mut cur5 = vec![0x42_u8; 3 * KERNEL_PAGE];
+            cur5[0] = 0x99;
+            cur5[3 * KERNEL_PAGE - 1] = 0x88;
+            assert_eq!(
+                try_diff_bounds_fast(base, &cur5),
+                Some(Some((0, 3 * KERNEL_PAGE - 1)))
+            );
+            assert!(!try_copy_fast(cur5.as_mut_ptr(), base, cur5.len()));
+
+            // Subsequent valid diff on committed page 0 still works.
+            let mut cur_ok = vec![0x42_u8; KERNEL_PAGE];
+            assert_eq!(try_diff_bounds_fast(base, &cur_ok), Some(None));
+            cur_ok[123] = 0;
+            assert_eq!(try_diff_bounds_fast(base, &cur_ok), Some(Some((123, 123))));
+
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn fast_paths_yield_to_remapping_and_allow_nested_reading() {
+        let src = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+        let mut dst = [0u8; 17];
+
+        // While a remapping holds the write lock, fast paths immediately return false / None.
+        let remapping = title_memory_remapping();
+        assert!(!try_copy_fast(dst.as_mut_ptr(), src.as_ptr(), src.len()));
+        assert_eq!(try_diff_bounds_fast(src.as_ptr(), &dst), None);
+        drop(remapping);
+
+        // While this thread already holds `Reading`, nested fast paths succeed without deadlocking.
+        let reading = title_memory_reading();
+        assert_eq!(try_diff_bounds_fast(src.as_ptr(), &dst), Some(Some((0, 16))));
+        assert!(try_copy_fast(dst.as_mut_ptr(), src.as_ptr(), src.len()));
+        assert_eq!(dst, src);
+        assert_eq!(try_diff_bounds_fast(src.as_ptr(), &dst), Some(None));
+        drop(reading);
     }
 }
