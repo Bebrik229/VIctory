@@ -628,6 +628,39 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// We stored shaders' bytes into title view memory `page` through a view of
+/// our own ([`crate::inplace::back_own`]), without opening any guard; `others`
+/// are the other title views of the same page. Returns the asking index at
+/// which `page` was last found written (`0`: never) and the new one.
+pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
+    let _ask = watch_ask();
+    let mut j = journal_write();
+    j.asked += 1;
+    let now = j.asked;
+    if j.kept || !j.ahead_guarded.is_empty() {
+        j.ahead_asked = now;
+    }
+    let before = j.written.insert(page, now).unwrap_or(0);
+    if !j.ahead_guarded.is_empty() {
+        evict_range(&mut j.ahead_guarded, page, page + 1);
+    }
+    for &other in others {
+        if other != page {
+            j.written.insert(other, now);
+            if !j.ahead_guarded.is_empty() {
+                evict_range(&mut j.ahead_guarded, other, other + 1);
+            }
+        }
+    }
+    (before, now)
+}
+
+/// Whether the block `page` is read-only by our hand and unwritten since a
+/// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
+pub(crate) fn clean(page: usize) -> bool {
+    guards().clean.contains(&page)
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`] (or `ask_once`).
