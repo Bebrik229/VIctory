@@ -18,6 +18,33 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+/// Fast non-cryptographic pointer/integer hasher for per-submission maps and sets.
+#[derive(Default)]
+struct PtrHasher(u64);
+
+impl std::hash::Hasher for PtrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    fn write_u32(&mut self, x: u32) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(x)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_usize(&mut self, x: usize) {
+        self.0 = (self.0.rotate_left(5) ^ (x as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<PtrHasher>>;
+type FastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<PtrHasher>>;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -3090,7 +3117,7 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// 64 KiB piece; the compare hashes the whole piece for each and stores
 /// the hash, so the second of them may find it stored already and not
 /// flag it.
-fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(usize, u32)> {
+fn flagged_pieces(flags: &[(usize, u32, bool)]) -> FastSet<(usize, u32)> {
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
@@ -4626,10 +4653,8 @@ fn sync_batched() -> bool {
         }
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        let mut by_shadow: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
-        let mut seen: std::collections::HashSet<(usize, usize, usize)> =
-            std::collections::HashSet::new();
+        let mut by_shadow: FastMap<usize, usize> = FastMap::default();
+        let mut seen: FastSet<(usize, usize, usize)> = FastSet::default();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
@@ -4651,6 +4676,7 @@ fn sync_batched() -> bool {
                 }
             }
         }
+        let single = card_single_submit();
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -4665,10 +4691,14 @@ fn sync_batched() -> bool {
         if declared.is_empty() && dirty.is_empty() {
             return None;
         }
-        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let work = work.as_mut()?;
+        if single {
+            // `sync` is returned in `plan.sync` and submitted later, so do not
+            // stall the relay thread on `QUEUE_ORDER` during CPU recording.
+            drop(order.take());
+        }
         // A copy whose shader writes are declared for the first time gets
-        // its bytes from before, whole.
+        // its bytes from before, whole. Run before locking `CARD_WORK` so GPU
+        // resource creation and range sorting do not block the relay thread.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for (shadow, _) in &declared {
             if shadow.card_make_before(|size| {
@@ -4682,11 +4712,90 @@ fn sync_batched() -> bool {
                 }
             }
         }
+        let mut declared_spans: Vec<(
+            Arc<crate::shadow::Shadow>,
+            Vec<(usize, usize, crate::shadow::CardSpan)>,
+            bool,
+        )> = Vec::with_capacity(declared.len());
+        for (shadow, mut sorted) in declared {
+            sorted.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+            for (from, to) in sorted {
+                match merged.last_mut() {
+                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                    _ => merged.push((from, to)),
+                }
+            }
+            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let spans: Vec<_> = merged
+                .into_iter()
+                .filter_map(|(from, to)| shadow.card_span(from, to).map(|span| (from, to, span)))
+                .collect();
+            if !spans.is_empty() {
+                declared_spans.push((shadow, spans, twin));
+            }
+        }
+        let (plan_ranges, sync_prelude, check_prelude, root, pso, differs_gpu, inflight_params) = {
+            let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+            let work = work.as_mut()?;
+            // Each byte once, as the copy-back joins the declared ranges. The
+            // results go behind those of plans still in the air.
+            let differs_bytes = work.differs.2;
+            let mut at = work.taken;
+            let mut plan_ranges = Vec::new();
+            for (shadow, spans, twin) in declared_spans {
+                for (from, to, span) in spans {
+                    let compared = twin && u64::from(at + span.pieces) * 4 <= differs_bytes;
+                    plan_ranges.push(CardRange {
+                        shadow: shadow.clone(),
+                        declared: (from, to),
+                        span,
+                        at,
+                        compared,
+                    });
+                    if compared {
+                        at += span.pieces;
+                    }
+                }
+            }
+            work.taken = at;
+            let need_sync = !dirty.is_empty();
+            let need_check = plan_ranges.iter().any(|r| r.compared);
+            let sync_prelude = if need_sync { work.sync.pop() } else { None };
+            let check_prelude = if need_check { work.check.pop() } else { None };
+            // SAFETY: persistent buffers kept alive inside `CardWork`.
+            let (differs_gpu, inflight_params) = unsafe {
+                (
+                    work.differs.0.GetGPUVirtualAddress(),
+                    if flown {
+                        work.inflight.as_ref().map(|inflight| {
+                            (
+                                inflight.table.0.GetGPUVirtualAddress(),
+                                inflight.fetched.0.GetGPUVirtualAddress(),
+                                inflight.landed,
+                                inflight.fetched.2,
+                            )
+                        })
+                    } else {
+                        None
+                    },
+                )
+            };
+            work.out += 1;
+            (
+                plan_ranges,
+                sync_prelude,
+                check_prelude,
+                work.root.clone(),
+                work.pso.clone(),
+                differs_gpu,
+                inflight_params,
+            )
+        };
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut sync_cmd: Option<ID3D12CommandList> = None;
         if !dirty.is_empty() {
-            let single = card_single_submit();
-            let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
+            let Some(sync) = sync_prelude.or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let (allocator, list) = &sync;
@@ -4745,12 +4854,11 @@ fn sync_batched() -> bool {
                             };
                             if !*bound {
                                 *bound = true;
-                                let dummy_uav = work.differs.0.GetGPUVirtualAddress();
-                                list.SetComputeRootSignature(&work.root);
-                                list.SetPipelineState(&work.pso);
-                                list.SetComputeRootUnorderedAccessView(3, dummy_uav);
-                                list.SetComputeRootUnorderedAccessView(4, dummy_uav);
-                                list.SetComputeRootUnorderedAccessView(5, dummy_uav);
+                                list.SetComputeRootSignature(&root);
+                                list.SetPipelineState(&pso);
+                                list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                                list.SetComputeRootUnorderedAccessView(4, differs_gpu);
+                                list.SetComputeRootUnorderedAccessView(5, differs_gpu);
                             }
                             list.SetComputeRootShaderResourceView(1, w.shadow.buffer.GetGPUVirtualAddress());
                             list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
@@ -4821,7 +4929,7 @@ fn sync_batched() -> bool {
         }
         drop(order);
         let mut plan = CardPlan {
-            ranges: Vec::new(),
+            ranges: plan_ranges,
             sync: sync_cmd,
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
@@ -4830,40 +4938,8 @@ fn sync_batched() -> bool {
             inflight: false,
             inflight_landed: 0,
         };
-        // Each byte once, as the copy-back joins the declared ranges. The
-        // results go behind those of plans still in the air.
-        let mut at = work.taken;
-        for (shadow, ranges) in &declared {
-            let mut sorted = ranges.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
-                }
-            }
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
-            for (from, to) in spans {
-                let Some(span) = shadow.card_span(from, to) else {
-                    continue;
-                };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
-                plan.ranges.push(CardRange {
-                    shadow: shadow.clone(),
-                    declared: (from, to),
-                    span,
-                    at,
-                    compared,
-                });
-                if compared {
-                    at += span.pieces;
-                }
-            }
-        }
-        work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
-            let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
+            let Some(check) = check_prelude.or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
             let (allocator, list) = &check;
@@ -4884,24 +4960,22 @@ fn sync_batched() -> bool {
                             }),
                         },
                     }]);
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
-                    let differs_gpu = work.differs.0.GetGPUVirtualAddress();
+                    list.SetComputeRootSignature(&root);
+                    list.SetPipelineState(&pso);
                     list.SetComputeRootUnorderedAccessView(3, differs_gpu);
                     // Fused compare + inflight fetch (`compare == 3`): copies each
                     // changed piece while still hot in L2 cache, eliminating the
                     // mid-`check` full-GPU UAV barrier and all separate CARD_FETCH passes.
-                    let (mode, landed, slots, every_ok) = if flown
-                        && let Some(inflight) = &work.inflight
-                    {
-                        list.SetComputeRootUnorderedAccessView(4, inflight.table.0.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(5, inflight.fetched.0.GetGPUVirtualAddress());
-                        (3u32, inflight.landed, inflight.fetched.2, true)
-                    } else {
-                        list.SetComputeRootUnorderedAccessView(4, differs_gpu);
-                        list.SetComputeRootUnorderedAccessView(5, differs_gpu);
-                        (if flown { 2u32 } else { 1u32 }, 0u32, 1u32, false)
-                    };
+                    let (mode, landed, slots, every_ok) =
+                        if let Some((table_gpu, fetched_gpu, landed, slots)) = inflight_params {
+                            list.SetComputeRootUnorderedAccessView(4, table_gpu);
+                            list.SetComputeRootUnorderedAccessView(5, fetched_gpu);
+                            (3u32, landed, slots, true)
+                        } else {
+                            list.SetComputeRootUnorderedAccessView(4, differs_gpu);
+                            list.SetComputeRootUnorderedAccessView(5, differs_gpu);
+                            (if flown { 2u32 } else { 1u32 }, 0u32, 1u32, false)
+                        };
                     let mut every = every_ok;
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
@@ -4944,7 +5018,6 @@ fn sync_batched() -> bool {
             }
             plan.lists.push((true, check));
         }
-        work.out += 1;
         Some(plan)
     }
 
@@ -5029,7 +5102,7 @@ fn sync_batched() -> bool {
             // plans have run, and their dwords are given to no other plan
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = FastSet::default();
             for plan in plans {
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
@@ -5197,7 +5270,7 @@ fn sync_batched() -> bool {
         use std::sync::Arc;
         type Piece = (Arc<crate::shadow::Shadow>, usize, usize, usize, u64);
         let mut pieces: Vec<Piece> = Vec::new();
-        {
+        let (differs_ptr, table_ptr, dwords, fetched_ptr, slots, brought) = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             let Some(work) = work.as_ref() else {
                 return false;
@@ -5205,79 +5278,88 @@ fn sync_batched() -> bool {
             let Some(inflight) = &work.inflight else {
                 return false;
             };
-            let dwords = (work.differs.2 / 4) as usize;
-            // SAFETY: the mappings of the results and the tickets. The
-            // compares and fetches of these plans have run, and their dwords
-            // are given to no other plan before these are done with
-            // (`card_done`).
-            let (differs, table) = unsafe {
-                (
-                    std::slice::from_raw_parts(work.differs.1 as *const u32, dwords),
-                    std::slice::from_raw_parts((inflight.table.1 as *const u32).add(1), dwords),
-                )
-            };
-            let slots = inflight.fetched.2;
-            for plan in plans {
-                if plan.ranges.is_empty() {
-                    continue;
-                }
-                if !plan.inflight || plan.ranges.iter().any(|r| !r.compared) {
-                    return false;
-                }
-                // Pieces (copy, number) the compare flagged, with their ticket.
-                let mut tickets: std::collections::HashMap<(usize, u32), u32> = std::collections::HashMap::new();
-                let mut flags: Vec<(usize, u32, bool)> = Vec::new();
-                for r in &plan.ranges {
-                    let copy = Arc::as_ptr(&r.shadow) as usize;
-                    for p in 0..r.span.pieces {
-                        let at = (r.at + p) as usize;
-                        let (Some(&flag), Some(&entry)) = (differs.get(at), table.get(at)) else {
+            (
+                work.differs.1,
+                inflight.table.1,
+                (work.differs.2 / 4) as usize,
+                inflight.fetched.1,
+                inflight.fetched.2,
+                if inflight.brought.is_empty() {
+                    Vec::new()
+                } else {
+                    inflight.brought.clone()
+                },
+            )
+        };
+        // Outside `CARD_WORK`: the compares and fetches of these plans have run,
+        // their dwords are held until `card_done`, and no slot of these plans is
+        // reused until `inflight_tickets_landed` runs after this.
+        // SAFETY: persistent mappings sized for `dwords` / `slots`.
+        let (differs, table) = unsafe {
+            (
+                std::slice::from_raw_parts(differs_ptr as *const u32, dwords),
+                std::slice::from_raw_parts((table_ptr as *const u32).add(1), dwords),
+            )
+        };
+        for plan in plans {
+            if plan.ranges.is_empty() {
+                continue;
+            }
+            if !plan.inflight || plan.ranges.iter().any(|r| !r.compared) {
+                return false;
+            }
+            // Pieces (copy, number) the compare flagged, with their ticket.
+            let mut tickets: FastMap<(usize, u32), u32> = FastMap::default();
+            let mut flags: Vec<(usize, u32, bool)> = Vec::new();
+            for r in &plan.ranges {
+                let copy = Arc::as_ptr(&r.shadow) as usize;
+                for p in 0..r.span.pieces {
+                    let at = (r.at + p) as usize;
+                    let (Some(&flag), Some(&entry)) = (differs.get(at), table.get(at)) else {
+                        return false;
+                    };
+                    if flag != 0 {
+                        if entry == INFLIGHT_NONE {
                             return false;
-                        };
-                        if flag != 0 {
-                            if entry == INFLIGHT_NONE {
-                                return false;
-                            }
-                            if !inflight_gets_slot(entry, plan.inflight_landed, slots) {
-                                INFLIGHT_STATS[2].fetch_add(1, Ordering::Relaxed);
-                                return false;
-                            }
-                            tickets.insert((copy, r.span.first + p), entry);
                         }
-                        flags.push((copy, r.span.first + p, flag != 0));
+                        if !inflight_gets_slot(entry, plan.inflight_landed, slots) {
+                            INFLIGHT_STATS[2].fetch_add(1, Ordering::Relaxed);
+                            return false;
+                        }
+                        tickets.insert((copy, r.span.first + p), entry);
                     }
+                    flags.push((copy, r.span.first + p, flag != 0));
                 }
-                let fetched = flagged_pieces(&flags);
-                let mut seen = std::collections::HashSet::new();
-                for r in &plan.ranges {
-                    let copy = Arc::as_ptr(&r.shadow) as usize;
-                    for p in 0..r.span.pieces {
-                        let piece = r.span.first + p;
-                        if !fetched.contains(&(copy, piece)) {
-                            continue;
-                        }
-                        let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo >= hi || !seen.insert((copy, lo, hi)) {
-                            continue;
-                        }
-                        let from = inflight_piece_from(&r.span, p);
-                        let Some(&k) = tickets.get(&(copy, piece)) else {
-                            return false;
-                        };
-                        if lo < from || (hi - from) as u64 > INFLIGHT_SLOT {
-                            return false;
-                        }
-                        let slot = inflight.fetched.1 + (k % slots) as usize * INFLIGHT_SLOT as usize;
-                        // Bytes a fetch the old way brought after this flight ran.
-                        let newer: Vec<(usize, usize)> = inflight
-                            .brought
-                            .iter()
-                            .filter(|b| b.3 >= plan.sent_as && Arc::ptr_eq(&b.0, &r.shadow) && b.1 < hi && b.2 > lo)
-                            .map(|b| (b.1, b.2))
-                            .collect();
-                        for (a, b) in crate::shadow::outside(lo, hi, newer) {
-                            pieces.push((r.shadow.clone(), a, b, slot + (a - from), plan.sent_as));
-                        }
+            }
+            let fetched = flagged_pieces(&flags);
+            let mut seen = FastSet::default();
+            for r in &plan.ranges {
+                let copy = Arc::as_ptr(&r.shadow) as usize;
+                for p in 0..r.span.pieces {
+                    let piece = r.span.first + p;
+                    if !fetched.contains(&(copy, piece)) {
+                        continue;
+                    }
+                    let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                    if lo >= hi || !seen.insert((copy, lo, hi)) {
+                        continue;
+                    }
+                    let from = inflight_piece_from(&r.span, p);
+                    let Some(&k) = tickets.get(&(copy, piece)) else {
+                        return false;
+                    };
+                    if lo < from || (hi - from) as u64 > INFLIGHT_SLOT {
+                        return false;
+                    }
+                    let slot = fetched_ptr + (k % slots) as usize * INFLIGHT_SLOT as usize;
+                    // Bytes a fetch the old way brought after this flight ran.
+                    let newer: Vec<(usize, usize)> = brought
+                        .iter()
+                        .filter(|b| b.3 >= plan.sent_as && Arc::ptr_eq(&b.0, &r.shadow) && b.1 < hi && b.2 > lo)
+                        .map(|b| (b.1, b.2))
+                        .collect();
+                    for (a, b) in crate::shadow::outside(lo, hi, newer) {
+                        pieces.push((r.shadow.clone(), a, b, slot + (a - from), plan.sent_as));
                     }
                 }
             }
@@ -5441,7 +5523,7 @@ fn sync_batched() -> bool {
         &self,
         plan: &CardPlan,
         submitted: &mut u64,
-        seen: &mut std::collections::HashSet<(usize, usize, usize)>,
+        seen: &mut FastSet<(usize, usize, usize)>,
     ) {
         if plan.ranges.is_empty() {
             return;
@@ -5772,7 +5854,7 @@ fn sync_batched() -> bool {
                 }
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
-                let mut seen = std::collections::HashSet::new();
+                let mut seen = FastSet::default();
                 let mut back: Vec<Declared> = Vec::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
@@ -6248,7 +6330,7 @@ fn sync_batched() -> bool {
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
         if let Some(card) = &card {
-            self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
+            self.card_back(card, &mut submitted, &mut FastSet::default());
         }
         let back = declared_writes(runs);
         hand_back(&back);
@@ -8015,9 +8097,9 @@ struct Batch {
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
     /// comparisons a frame.
-    index: std::collections::HashMap<usize, usize>,
+    index: FastMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    textures: FastSet<usize>,
     /// Due texture refreshes deferred so a submission's textures can refresh in parallel.
     pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
@@ -8084,8 +8166,9 @@ impl Batch {
     fn flush(&mut self) {
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // not one per copy. Skip immediately when `ask_once` already holds
+        // the submission's journal state.
+        let ahead = self.refreshes.len() > 1 && !crate::watch::ask_once_active();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self

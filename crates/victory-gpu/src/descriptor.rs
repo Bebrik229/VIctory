@@ -170,6 +170,207 @@ fn mirror(handle: u64) {
 #[cfg(windows)]
 const SYNC_PAGES: usize = 8;
 
+/// Accumulates `(pages, looked, mirrored, tabled)` counts produced by [`sync_chunks`].
+#[cfg(windows)]
+fn sync_chunks(
+    host: &host::HostHeap,
+    parts: &[(u32, u32)],
+    next: &std::sync::atomic::AtomicUsize,
+    start: u64,
+    step: u64,
+    frame: u64,
+    page_bytes: &mut [u8],
+) -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (mut p, mut l, mut m, mut t) = (0u64, 0u64, 0u64, 0u64);
+    loop {
+        let idx = next.fetch_add(1, Relaxed);
+        let chunk_start = idx.saturating_mul(SYNC_PAGES);
+        if chunk_start >= parts.len() {
+            break;
+        }
+        let chunk_end = (chunk_start + SYNC_PAGES).min(parts.len());
+        for &(slot_start, slot_end) in &parts[chunk_start..chunk_end] {
+            let (page_ok, page_looked, page_mirrored, page_tabled) =
+                host.sync_copied_page(slot_start, slot_end, start, step, frame, page_bytes);
+            if page_ok {
+                p += 1;
+                l += page_looked;
+                m += page_mirrored;
+                t += page_tabled;
+            }
+        }
+    }
+    (p, l, m, t)
+}
+
+#[cfg(windows)]
+struct SyncState {
+    generation: u64,
+    active_workers: usize,
+    remaining: usize,
+    host_ptr: usize,
+    parts_ptr: usize,
+    parts_len: usize,
+    start: u64,
+    step: u64,
+    frame: u64,
+    totals: (u64, u64, u64, u64),
+}
+
+#[cfg(windows)]
+struct SyncShared {
+    state: std::sync::Mutex<SyncState>,
+    next: std::sync::atomic::AtomicUsize,
+    wake: std::sync::Condvar,
+    done: std::sync::Condvar,
+}
+
+/// Persistent warm worker pool for [`sync_heaps`], eliminating per-submission
+/// OS thread spawns and per-worker 64 KiB buffer allocations.
+#[cfg(windows)]
+struct SyncPool {
+    shared: std::sync::Arc<SyncShared>,
+    bg_workers: usize,
+}
+
+#[cfg(windows)]
+impl SyncPool {
+    fn get() -> &'static Self {
+        static SYNC_POOL: std::sync::OnceLock<SyncPool> = std::sync::OnceLock::new();
+        SYNC_POOL.get_or_init(|| {
+            let max_workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+            let bg_workers = max_workers.saturating_sub(1);
+            let shared = std::sync::Arc::new(SyncShared {
+                state: std::sync::Mutex::new(SyncState {
+                    generation: 0,
+                    active_workers: 0,
+                    remaining: 0,
+                    host_ptr: 0,
+                    parts_ptr: 0,
+                    parts_len: 0,
+                    start: 0,
+                    step: 0,
+                    frame: 0,
+                    totals: (0, 0, 0, 0),
+                }),
+                next: std::sync::atomic::AtomicUsize::new(0),
+                wake: std::sync::Condvar::new(),
+                done: std::sync::Condvar::new(),
+            });
+            for id in 0..bg_workers {
+                let shared = std::sync::Arc::clone(&shared);
+                let _ = std::thread::Builder::new()
+                    .name(format!("victory-heap-sync-{id}"))
+                    .spawn(move || {
+                        let mut seen_gen = 0u64;
+                        let mut page_bytes = vec![0u8; crate::watch::PAGE];
+                        loop {
+                            let (epoch, host_ptr, parts_ptr, parts_len, start, step, frame) = {
+                                let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                                while guard.generation == seen_gen || id >= guard.active_workers {
+                                    seen_gen = guard.generation;
+                                    guard = shared.wake.wait(guard).unwrap_or_else(|e| e.into_inner());
+                                }
+                                (
+                                    guard.generation,
+                                    guard.host_ptr,
+                                    guard.parts_ptr,
+                                    guard.parts_len,
+                                    guard.start,
+                                    guard.step,
+                                    guard.frame,
+                                )
+                            };
+                            seen_gen = epoch;
+                            struct DoneGuard<'a> {
+                                shared: &'a SyncShared,
+                                counts: (u64, u64, u64, u64),
+                            }
+                            impl Drop for DoneGuard<'_> {
+                                fn drop(&mut self) {
+                                    let mut guard = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard.totals.0 += self.counts.0;
+                                    guard.totals.1 += self.counts.1;
+                                    guard.totals.2 += self.counts.2;
+                                    guard.totals.3 += self.counts.3;
+                                    guard.remaining = guard.remaining.saturating_sub(1);
+                                    if guard.remaining == 0 {
+                                        self.shared.done.notify_one();
+                                    }
+                                }
+                            }
+                            let mut done_guard = DoneGuard {
+                                shared: &shared,
+                                counts: (0, 0, 0, 0),
+                            };
+                            // SAFETY: caller holds `SYNCING` and `SHADER_HEAPS.read()` and
+                            // waits until `remaining == 0` before returning or dropping `parts`.
+                            let host = unsafe { &*(host_ptr as *const host::HostHeap) };
+                            let parts = unsafe {
+                                std::slice::from_raw_parts(parts_ptr as *const (u32, u32), parts_len)
+                            };
+                            done_guard.counts =
+                                sync_chunks(host, parts, &shared.next, start, step, frame, &mut page_bytes);
+                        }
+                    });
+            }
+            SyncPool { shared, bg_workers }
+        })
+    }
+
+    fn run(
+        &self,
+        host: &host::HostHeap,
+        parts: &[(u32, u32)],
+        start: u64,
+        step: u64,
+        frame: u64,
+        caller_page_bytes: &mut [u8],
+    ) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let num_chunks = parts.len().div_ceil(SYNC_PAGES);
+        let bg = num_chunks.saturating_sub(1).min(self.bg_workers);
+        if bg == 0 {
+            self.shared.next.store(0, Relaxed);
+            return sync_chunks(host, parts, &self.shared.next, start, step, frame, caller_page_bytes);
+        }
+        self.shared.next.store(0, Relaxed);
+        {
+            let mut guard = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.host_ptr = std::ptr::from_ref(host) as usize;
+            guard.parts_ptr = parts.as_ptr() as usize;
+            guard.parts_len = parts.len();
+            guard.start = start;
+            guard.step = step;
+            guard.frame = frame;
+            guard.totals = (0, 0, 0, 0);
+            guard.active_workers = bg;
+            guard.remaining = bg;
+            guard.generation = guard.generation.wrapping_add(1);
+            self.shared.wake.notify_all();
+        }
+        let caller = sync_chunks(host, parts, &self.shared.next, start, step, frame, caller_page_bytes);
+        let bg_totals = {
+            let mut guard = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            while guard.remaining > 0 {
+                guard = self.shared.done.wait(guard).unwrap_or_else(|e| e.into_inner());
+            }
+            guard.active_workers = 0;
+            guard.host_ptr = 0;
+            guard.parts_ptr = 0;
+            guard.parts_len = 0;
+            guard.totals
+        };
+        (
+            caller.0 + bg_totals.0,
+            caller.1 + bg_totals.1,
+            caller.2 + bg_totals.2,
+            caller.3 + bg_totals.3,
+        )
+    }
+}
+
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.
@@ -232,12 +433,12 @@ pub(crate) fn sync_heaps() {
             continue;
         }
         host.copied_begin();
-        if parts.len() <= SYNC_PAGES {
-            PAGE_BYTES.with(|cell| {
-                let mut page_bytes = cell.borrow_mut();
-                if page_bytes.len() < crate::watch::PAGE {
-                    page_bytes.resize(crate::watch::PAGE, 0);
-                }
+        PAGE_BYTES.with(|cell| {
+            let mut page_bytes = cell.borrow_mut();
+            if page_bytes.len() < crate::watch::PAGE {
+                page_bytes.resize(crate::watch::PAGE, 0);
+            }
+            if parts.len() <= SYNC_PAGES {
                 for (slot_start, slot_end) in parts {
                     let (page_ok, page_looked, page_mirrored, page_tabled) =
                         host.sync_copied_page(slot_start, slot_end, start, step, frame, &mut page_bytes);
@@ -248,56 +449,15 @@ pub(crate) fn sync_heaps() {
                         tabled += page_tabled;
                     }
                 }
-            });
-        } else {
-            let chunks: Vec<&[(u32, u32)]> = parts.chunks(SYNC_PAGES).collect();
-            let workers = std::thread::available_parallelism()
-                .map_or(4, |n| n.get().min(8))
-                .min(chunks.len());
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let (p, l, m, t) = std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(workers);
-                for _ in 0..workers {
-                    handles.push(s.spawn(|| {
-                        let mut page_bytes = vec![0u8; crate::watch::PAGE];
-                        let (mut p, mut l, mut m, mut t) = (0u64, 0u64, 0u64, 0u64);
-                        loop {
-                            let idx = next.fetch_add(1, Relaxed);
-                            let Some(&chunk) = chunks.get(idx) else {
-                                break;
-                            };
-                            for &(slot_start, slot_end) in chunk {
-                                let (page_ok, page_looked, page_mirrored, page_tabled) = host.sync_copied_page(
-                                    slot_start,
-                                    slot_end,
-                                    start,
-                                    step,
-                                    frame,
-                                    &mut page_bytes,
-                                );
-                                if page_ok {
-                                    p += 1;
-                                    l += page_looked;
-                                    m += page_mirrored;
-                                    t += page_tabled;
-                                }
-                            }
-                        }
-                        (p, l, m, t)
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .fold((0u64, 0u64, 0u64, 0u64), |acc, h| {
-                        let (p, l, m, t) = h.join().unwrap_or((0, 0, 0, 0));
-                        (acc.0 + p, acc.1 + l, acc.2 + m, acc.3 + t)
-                    })
-            });
-            pages += p;
-            looked += l;
-            mirrored += m;
-            tabled += t;
-        }
+            } else {
+                let (p, l, m, t) =
+                    SyncPool::get().run(host, &parts, start, step, frame, &mut page_bytes);
+                pages += p;
+                looked += l;
+                mirrored += m;
+                tabled += t;
+            }
+        });
     }
     if tabled > 0 {
         host::COPIED_TABLED.fetch_add(tabled, Relaxed);
@@ -1634,6 +1794,93 @@ mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// Reusing the persistent `SyncPool` across consecutive batches mirrors
+    /// descriptors cleanly on every pass for both partial and full worker counts.
+    #[cfg(windows)]
+    #[test]
+    fn sync_pool_reuses_workers_across_batches() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let pages = SYNC_PAGES * 3;
+        let bytes = pages * crate::watch::PAGE;
+        let count = (bytes / 16) as u32;
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                bytes,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory as u64,
+            size: u64::from(count) * 16,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut elsewhere = [0u64; 2];
+            let source = elsewhere.as_mut_ptr() as u64;
+            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            create_sampler(std::ptr::null(), &sampler, source);
+            let slots_per_page = (crate::watch::PAGE / 16) as u32;
+            let slots: Vec<(u32, u32)> = (0..pages as u32)
+                .map(|p| (p * slots_per_page, (p + 1) * slots_per_page))
+                .collect();
+            let mut page_bytes = vec![0u8; crate::watch::PAGE];
+            host.copied_begin();
+
+            // Batch 1: small parallel batch (few chunks).
+            for p in 0..(SYNC_PAGES + 1) as u32 {
+                let idx = p * slots_per_page + 2;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source as *const u8,
+                        memory.cast::<u8>().add(idx as usize * 16),
+                        16,
+                    )
+                };
+            }
+            let (p1, _, m1, _) = SyncPool::get().run(
+                host,
+                &slots[..SYNC_PAGES + 1],
+                memory as u64,
+                16,
+                1,
+                &mut page_bytes,
+            );
+            assert_eq!(p1, (SYNC_PAGES + 1) as u64);
+            assert_eq!(m1, (SYNC_PAGES + 1) as u64);
+
+            // Batch 2: full parallel batch across the remaining pages + re-scan.
+            for p in (SYNC_PAGES + 1) as u32..pages as u32 {
+                let idx = p * slots_per_page + 5;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source as *const u8,
+                        memory.cast::<u8>().add(idx as usize * 16),
+                        16,
+                    )
+                };
+            }
+            let (p2, _, m2, _) =
+                SyncPool::get().run(host, &slots, memory as u64, 16, 2, &mut page_bytes);
+            assert_eq!(p2, pages as u64);
+            assert_eq!(m2, (pages - (SYNC_PAGES + 1)) as u64);
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 

@@ -248,8 +248,12 @@ pub(crate) struct State {
     /// Host pipelines and root signatures already kept on the current host list
     /// (`list.keep` / `list.used_pipeline`), cleared only when the host list
     /// resets or switches (`State::reset` / `State::replay`).
-    kept_pipelines: HashSet<usize>,
-    kept_roots: HashSet<usize>,
+    kept_pipelines: HashSet<usize, std::hash::BuildHasherDefault<PtrHash>>,
+    kept_roots: HashSet<usize, std::hash::BuildHasherDefault<PtrHash>>,
+    /// Scratch buffers reused across [`State::tables`] calls so hot draws do
+    /// not heap-allocate per table slot.
+    table_entries: Vec<usize>,
+    table_selected: Vec<u32>,
     /// Tables made afresh in this list, by a hash of the table, slot count
     /// and what it holds ([`table_hash`]).
     fresh_tables: std::collections::HashMap<u64, Fresh, std::hash::BuildHasherDefault<Plain>>,
@@ -939,6 +943,24 @@ struct Fresh {
     n: u32,
     at: usize,
     first: u32,
+}
+
+/// Fast non-cryptographic pointer/address hasher for per-list state sets.
+#[derive(Default)]
+struct PtrHash(u64);
+
+impl std::hash::Hasher for PtrHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    fn write_usize(&mut self, x: usize) {
+        self.0 = (x as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
 }
 
 /// A hash that is mixed already, used as it is.
@@ -3622,6 +3644,8 @@ impl State {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut made = std::mem::take(&mut self.made);
         made.clear();
+        let mut entries = std::mem::take(&mut self.table_entries);
+        let mut selected = std::mem::take(&mut self.table_selected);
         let mut fresh = Slots::default();
         for u in used
             .iter()
@@ -3660,11 +3684,12 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            entries.clear();
+            for (i, u) in used.iter().enumerate() {
+                if u.root == RootType::Table && u.slot == slot {
+                    entries.push(i);
+                }
+            }
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -3674,25 +3699,22 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
+            selected.clear();
+            for index in indexed.iter().filter(|index| index.table_slot == slot) {
+                let constant = self.user_value(
+                    compute,
+                    index.constant_slot,
+                    RootType::Constants,
+                    index.constant_dword,
+                );
+                // The shader adds i32 byte offsets and shifts by 5.
+                selected.push(index.byte_offset.wrapping_add(constant << index.shift) / 32);
+            }
             selected.sort_unstable();
             selected.dedup();
             let n = entries
                 .iter()
-                .map(|u| u.table_offset_dwords / 8)
+                .map(|&i| used[i].table_offset_dwords / 8)
                 .chain(selected.last().copied())
                 .max()
                 .unwrap_or(0)
@@ -3737,7 +3759,7 @@ impl State {
                     .contains(&(table, n))
                     .then(|| heap.index(table).filter(|at| at + n <= host.mirrored_count()))
                     .flatten();
-                for u in entries.iter() {
+                for u in entries.iter().map(|&i| &used[i]) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
                         Some(View::Constant(address, size)) => {
@@ -3761,8 +3783,8 @@ impl State {
                         _ => {}
                     }
                 }
-                for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                for &k in &selected {
+                    if entries.iter().any(|&i| used[i].table_offset_dwords / 8 == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -3823,7 +3845,7 @@ impl State {
                 .map(|(_, views)| views.into_iter());
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = entries.iter().map(|&i| &used[i]).find(|u| u.table_offset_dwords / 8 == k);
                 // The views the overflow copy looked up, else each looked up.
                 let view = match copied.as_mut() {
                     Some(views) => views.next().flatten(),
@@ -3891,6 +3913,8 @@ impl State {
             }
             made.push((slot, first * 32));
         }
+        self.table_entries = entries;
+        self.table_selected = selected;
         self.made = made;
         &self.made
     }

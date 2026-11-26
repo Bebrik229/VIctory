@@ -32,6 +32,65 @@ static POOL: Mutex<Vec<(u64, ID3D12Resource)>> = Mutex::new(Vec::new());
 
 thread_local! {
     static TILED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static PREV: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Returns the narrowest byte range `[lo, hi)` where `before` and `after` differ,
+/// or `None` when identical.
+fn changed_span(before: &[u8], after: &[u8]) -> Option<(usize, usize)> {
+    debug_assert_eq!(before.len(), after.len());
+    let len = before.len().min(after.len());
+    if len == 0 {
+        return None;
+    }
+    let words = len / 8;
+    // Fast word scan from front and back to find differing 8-byte blocks.
+    let mut lo_word = 0usize;
+    while lo_word < words {
+        let off = lo_word * 8;
+        if before[off..off + 8] != after[off..off + 8] {
+            break;
+        }
+        lo_word += 1;
+    }
+    if lo_word == words {
+        let mut lo = words * 8;
+        while lo < len && before[lo] == after[lo] {
+            lo += 1;
+        }
+        if lo == len {
+            return None;
+        }
+        let mut hi = len;
+        while hi > lo + 1 && before[hi - 1] == after[hi - 1] {
+            hi -= 1;
+        }
+        return Some((lo, hi));
+    }
+    let mut lo = lo_word * 8;
+    while lo < len && before[lo] == after[lo] {
+        lo += 1;
+    }
+    let mut hi = len;
+    let tail_start = words * 8;
+    while hi > tail_start && before[hi - 1] == after[hi - 1] {
+        hi -= 1;
+    }
+    if hi == tail_start {
+        let mut hi_word = words;
+        while hi_word > lo_word + 1 {
+            let off = (hi_word - 1) * 8;
+            if before[off..off + 8] != after[off..off + 8] {
+                break;
+            }
+            hi_word -= 1;
+        }
+        hi = hi_word * 8;
+        while hi > lo + 1 && before[hi - 1] == after[hi - 1] {
+            hi -= 1;
+        }
+    }
+    Some((lo, hi))
 }
 
 /// Picks the smallest pooled readback buffer with `cap >= needed` and at most
@@ -279,6 +338,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 /// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     let Some(buffer) = back.buffer.as_ref() else {
         return;
@@ -300,43 +360,51 @@ pub(crate) fn land(back: &Back) {
         if !crate::host::read_into(at as *const u8, tiled) {
             return;
         }
-        let mut data = std::ptr::null_mut();
-        // SAFETY: our read-back buffer, written by the list that has run.
-        unsafe {
-            if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
-                for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
-                    let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
-                    let f = footprint.Footprint;
-                    let pitch = f.RowPitch as usize;
-                    let len = pitch * rows as usize * f.Depth as usize;
-                    // SAFETY: the subresource's part of the mapped buffer.
-                    let linear = std::slice::from_raw_parts(
-                        data.cast::<u8>().add(footprint.Offset as usize),
-                        len,
-                    );
-                    if let Err(e) =
-                        back.layout
-                            .tile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-                    {
-                        static ONCE: std::sync::Once = std::sync::Once::new();
-                        ONCE.call_once(|| {
-                            tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled")
-                        });
-                        buffer.Unmap(0, None);
-                        return;
+        PREV.with_borrow_mut(|prev| {
+            prev.clear();
+            prev.extend_from_slice(tiled);
+            let mut data = std::ptr::null_mut();
+            // SAFETY: our read-back buffer, written by the list that has run.
+            unsafe {
+                if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
+                    for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
+                        let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
+                        let f = footprint.Footprint;
+                        let pitch = f.RowPitch as usize;
+                        let len = pitch * rows as usize * f.Depth as usize;
+                        // SAFETY: the subresource's part of the mapped buffer.
+                        let linear = std::slice::from_raw_parts(
+                            data.cast::<u8>().add(footprint.Offset as usize),
+                            len,
+                        );
+                        if let Err(e) =
+                            back.layout
+                                .tile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                        {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| {
+                                tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled")
+                            });
+                            buffer.Unmap(0, None);
+                            return;
+                        }
                     }
+                    buffer.Unmap(0, None);
+                } else {
+                    return;
                 }
-                buffer.Unmap(0, None);
-            } else {
-                return;
             }
-        }
-        crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
-        crate::watch::wrote(at, size);
-        let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
-        if copied == 1 || copied.is_multiple_of(128) {
-            tracing::info!(copied, bytes = size, "texture readback landed");
-        }
+            let Some((lo, hi)) = changed_span(prev, tiled) else {
+                SKIPPED.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            crate::host::copy_mapped((at + lo) as *mut u8, tiled[lo..hi].as_ptr(), hi - lo, true);
+            crate::watch::wrote(at + lo, hi - lo);
+            let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+            if copied == 1 || copied.is_multiple_of(128) {
+                tracing::info!(copied, bytes = hi - lo, total = size, "texture readback landed");
+            }
+        });
     });
 }
 
@@ -368,5 +436,33 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn changed_span_finds_narrowest_dirty_bounds_or_none() {
+        assert_eq!(changed_span(&[], &[]), None);
+        assert_eq!(changed_span(&[1, 2, 3], &[1, 2, 3]), None);
+        let zeros = vec![0u8; 64];
+        assert_eq!(changed_span(&zeros, &zeros), None);
+
+        let mut mod_tail = vec![0u8; 19];
+        let orig_tail = mod_tail.clone();
+        mod_tail[17] = 9;
+        assert_eq!(changed_span(&orig_tail, &mod_tail), Some((17, 18)));
+
+        let mut mod_start = vec![0u8; 32];
+        let orig_start = mod_start.clone();
+        mod_start[0] = 1;
+        assert_eq!(changed_span(&orig_start, &mod_start), Some((0, 1)));
+
+        let mut mod_mid = vec![0u8; 40];
+        let orig_mid = mod_mid.clone();
+        mod_mid[9] = 4;
+        mod_mid[27] = 7;
+        assert_eq!(changed_span(&orig_mid, &mod_mid), Some((9, 28)));
+
+        let ones = vec![1u8; 37];
+        let twos = vec![2u8; 37];
+        assert_eq!(changed_span(&ones, &twos), Some((0, 37)));
     }
 }

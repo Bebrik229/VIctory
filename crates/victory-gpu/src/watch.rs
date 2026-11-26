@@ -81,7 +81,20 @@ struct Journal {
     kept: bool,
 }
 
+static ASK_ONCE_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Lock-free check whether [`ask_once`] currently holds an active asking for
+/// the submission in flight.
+pub(crate) fn ask_once_active() -> bool {
+    ASK_ONCE_KEPT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 impl Journal {
+    fn set_kept(&mut self, value: bool) {
+        self.kept = value;
+        ASK_ONCE_KEPT.store(value, std::sync::atomic::Ordering::Release);
+    }
+
     fn covers_ahead(&self, first: usize, last: usize, guarded: bool) -> bool {
         covers(&self.ahead, first, last) || (guarded && covers(&self.ahead_guarded, first, last))
     }
@@ -448,7 +461,7 @@ fn guard_view_pieces_with(
 /// into `ahead_guarded`; lone non-view ranges are left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     // Fast path: the submission's one asking stands (`ask_once`).
-    if journal_read().kept {
+    if ask_once_active() {
         return;
     }
     if ranges.iter().filter(|r| r.0 < r.1).take(2).count() < 2 {
@@ -527,6 +540,9 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
+    if ask_once_active() {
+        return;
+    }
     {
         let j = journal_read();
         if j.kept || (j.ahead.is_empty() && j.ahead_guarded.is_empty()) {
@@ -587,7 +603,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     };
     if need_clear {
         let mut j = journal_write();
-        j.kept = false;
+        j.set_kept(false);
         j.ahead.clear();
         j.ahead_guarded.clear();
     }
@@ -623,7 +639,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     } else {
         j.ahead_guarded.clear();
     }
-    j.kept = !j.ahead.is_empty() || !j.ahead_guarded.is_empty();
+    let kept = !j.ahead.is_empty() || !j.ahead_guarded.is_empty();
+    j.set_kept(kept);
     if light_kept() && !view_pieces.is_empty() {
         publish_ranges(&j, &dirty, &view_pieces, told());
     }
@@ -632,13 +649,13 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    if !journal_read().kept {
+    if !ask_once_active() || !journal_read().kept {
         return;
     }
     let _ask = watch_ask();
     let mut j = journal_write();
     if j.kept {
-        j.kept = false;
+        j.set_kept(false);
         j.ahead.clear();
         j.ahead_guarded.clear();
     }
@@ -648,7 +665,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    if len == 0 {
+    if len == 0 || !ask_once_active() {
         return;
     }
     let has_guarded = {
@@ -4792,6 +4809,31 @@ mod tests {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ });
             CloseHandle(section);
         }
+    }
+
+    #[test]
+    fn ask_once_active_tracks_ask_once_lifecycle() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let mem = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE * 2,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!mem.is_null());
+        super::ask_once_end();
+        assert!(!super::ask_once_active());
+        let addr = mem as usize;
+        super::ask_once(&[(addr, addr + PAGE), (addr + PAGE, addr + PAGE * 2)]);
+        assert!(super::ask_once_active());
+        super::ask_once_end();
+        assert!(!super::ask_once_active());
+        unsafe { VirtualFree(mem, 0, MEM_RELEASE) };
     }
 }
 
