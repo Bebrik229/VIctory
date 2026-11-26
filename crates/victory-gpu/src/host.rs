@@ -301,6 +301,16 @@ pub(crate) fn retire_resources(objects: Vec<ID3D12Resource>) {
         .extend(objects.into_iter().map(|o| (started, Retired::Resource(o))));
 }
 
+/// Drops an excess [`HostList`] on [`reaper`] when [`reaper_on`] is active,
+/// or inline without boxing when it is off.
+pub(crate) fn retire_list(host: std::sync::Arc<HostList>) {
+    if !reaper_on() {
+        drop(host);
+        return;
+    }
+    reap_one(Retired::Any(Box::new(host)));
+}
+
 /// Whether descriptor slots written again with the object they already
 /// held let the old reference go at once instead of retiring it, and
 /// [`bury`] partitions what it drops outside the lock (`VICTORY_RETIRE_LEAN=1`;
@@ -3592,14 +3602,28 @@ mod grouped_tests {
 /// disjoint refreshes on a large heap do not falsely collide with an unrelated
 /// in-flight `GpuWrite` between them.
 fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize)> {
+    use std::cell::RefCell;
     use std::sync::Arc;
+
+    #[derive(Default)]
+    struct StaleScratch {
+        known: FastMap<usize, Option<usize>>,
+        per_ranges: Vec<Vec<(usize, usize)>>,
+    }
+
+    thread_local! {
+        static STALE_SCRATCH: RefCell<StaleScratch> = RefCell::new(StaleScratch::default());
+    }
+
+    let mut scratch = STALE_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    scratch.known.clear();
+
     let mut per_shadow: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
     if step_index() {
         // By copy (its address): its place in `per_shadow`, or that no
         // shader's writes are pending on it. Asked once a copy, not once a
         // step; steps of one copy mostly follow one another, so the last
         // answer is tried first.
-        let mut known: std::collections::HashMap<usize, Option<usize>> = std::collections::HashMap::new();
         let mut last: (usize, Option<usize>) = (0, None);
         for list in runs {
             for step in &list.deferred().copies {
@@ -3610,9 +3634,10 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize)> {
                     let at = if last.0 == key {
                         last.1
                     } else {
-                        let at = *known.entry(key).or_insert_with(|| {
+                        let at = *scratch.known.entry(key).or_insert_with(|| {
                             shadow.writes_pending().then(|| {
-                                per_shadow.push((shadow.clone(), Vec::new()));
+                                let buf = scratch.per_ranges.pop().unwrap_or_default();
+                                per_shadow.push((shadow.clone(), buf));
                                 per_shadow.len() - 1
                             })
                         });
@@ -3625,6 +3650,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize)> {
                 }
             }
         }
+        scratch.known.clear();
     } else {
         for list in runs {
             for step in &list.deferred().copies {
@@ -3635,7 +3661,11 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize)> {
                     let range = (*address, *address + *len);
                     match per_shadow.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
                         Some((_, ranges)) => ranges.push(range),
-                        None => per_shadow.push((shadow.clone(), vec![range])),
+                        None => {
+                            let mut buf = scratch.per_ranges.pop().unwrap_or_default();
+                            buf.push(range);
+                            per_shadow.push((shadow.clone(), buf));
+                        }
                     }
                 }
             }
@@ -3655,22 +3685,59 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize)> {
     if settle_room() {
         runs_left = (runs_left * 8).min(1 << 16);
     }
-    for (shadow, mut ranges) in per_shadow {
-        let raw = std::mem::take(&mut ranges);
-        join_ranges(&mut ranges, raw);
-        for (from, to) in ranges {
-            let unmerged = if exact {
-                shadow.merge_under_writes(from, to - from, &mut runs_left)
-            } else {
-                shadow.stale_under_writes(from, to - from)
-            };
-            conflicts.extend(unmerged);
+    if per_shadow.len() >= 2 && wide_refresh() {
+        let n = per_shadow.len();
+        let per_budget = (runs_left / n).max(256);
+        let shared = Arc::new(Mutex::new((Vec::new(), Vec::with_capacity(n))));
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = per_shadow
+            .into_iter()
+            .map(|(shadow, mut ranges)| {
+                let shared = shared.clone();
+                Box::new(move || {
+                    let mut left = per_budget;
+                    let raw = std::mem::take(&mut ranges);
+                    join_ranges(&mut ranges, raw);
+                    let mut local = Vec::new();
+                    for &(from, to) in &ranges {
+                        let unmerged = if exact {
+                            shadow.merge_under_writes(from, to - from, &mut left)
+                        } else {
+                            shadow.stale_under_writes(from, to - from)
+                        };
+                        local.extend(unmerged);
+                    }
+                    ranges.clear();
+                    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.0.extend(local);
+                    guard.1.push(ranges);
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let (c, recycled) = std::mem::take(&mut *shared.lock().unwrap_or_else(|e| e.into_inner()));
+        conflicts = c;
+        scratch.per_ranges.extend(recycled);
+    } else {
+        for (shadow, mut ranges) in per_shadow {
+            let raw = std::mem::take(&mut ranges);
+            join_ranges(&mut ranges, raw);
+            for &(from, to) in &ranges {
+                let unmerged = if exact {
+                    shadow.merge_under_writes(from, to - from, &mut runs_left)
+                } else {
+                    shadow.stale_under_writes(from, to - from)
+                };
+                conflicts.extend(unmerged);
+            }
+            ranges.clear();
+            scratch.per_ranges.push(ranges);
         }
     }
     if !conflicts.is_empty() {
         let raw = std::mem::take(&mut conflicts);
         join_ranges(&mut conflicts, raw);
     }
+    STALE_SCRATCH.with(|cell| *cell.borrow_mut() = scratch);
     conflicts
 }
 
@@ -4908,25 +4975,33 @@ fn sync_batched() -> bool {
                     }
                     let batched = Self::sync_batched();
                     let mut synced: Vec<Synced> = Vec::with_capacity(dirty.len());
-                    let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+                    let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = if single {
+                        Vec::with_capacity(dirty.len())
+                    } else {
+                        Vec::new()
+                    };
+                    let mut moves: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(if batched { dirty.len() } else { 1 });
                     let mut bound = false;
                     let hashes = |list: &ID3D12GraphicsCommandList,
                                   group: &[Synced],
                                   bound: &mut bool,
+                                  moves: &mut Vec<D3D12_RESOURCE_BARRIER>,
                                   post_barriers: &mut Vec<D3D12_RESOURCE_BARRIER>| {
-                        let moves: Vec<_> = group
-                            .iter()
-                            .filter(|w| w.before.is_some() && !w.ranges.is_empty())
-                            .map(|w| {
-                                transition(
-                                    &w.shadow.buffer,
-                                    D3D12_RESOURCE_STATE_COPY_DEST,
-                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                )
-                            })
-                            .collect();
+                        moves.clear();
+                        moves.extend(
+                            group
+                                .iter()
+                                .filter(|w| w.before.is_some() && !w.ranges.is_empty())
+                                .map(|w| {
+                                    transition(
+                                        &w.shadow.buffer,
+                                        D3D12_RESOURCE_STATE_COPY_DEST,
+                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                    )
+                                }),
+                        );
                         if !moves.is_empty() {
-                            list.ResourceBarrier(&moves);
+                            list.ResourceBarrier(moves);
                         }
                         for w in group {
                             let Some(before) = &w.before else {
@@ -4992,11 +5067,11 @@ fn sync_batched() -> bool {
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         synced.push(Synced { shadow, ranges, before, size });
                         if !batched {
-                            hashes(list, &synced[synced.len() - 1..], &mut bound, &mut post_barriers);
+                            hashes(list, &synced[synced.len() - 1..], &mut bound, &mut moves, &mut post_barriers);
                         }
                     }
                     if batched {
-                        hashes(list, &synced, &mut bound, &mut post_barriers);
+                        hashes(list, &synced, &mut bound, &mut moves, &mut post_barriers);
                     }
                     if single {
                         if !post_barriers.is_empty() {
@@ -8272,6 +8347,32 @@ impl Batch {
         // not one per copy. Skip immediately when `ask_once` already holds
         // the submission's journal state.
         let ahead = self.refreshes.len() > 1 && !crate::watch::ask_once_active();
+        if wide_refresh() && !ahead && !self.refreshes.is_empty() && !self.pending_textures.is_empty() {
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> =
+                Vec::with_capacity(self.refreshes.len() + self.pending_textures.len());
+            jobs.extend(self.refreshes.drain(..).map(|(shadow, from, to)| {
+                Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>
+            }));
+            jobs.extend(self.pending_textures.drain(..).map(|staging| {
+                Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>
+            }));
+            let before0 = PREPARING[0].load(Ordering::Relaxed);
+            let before2 = PREPARING[2].load(Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            crate::shadow::wide_run(jobs);
+            let sum0 = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before0);
+            let sum2 = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before2);
+            let wall = started.elapsed().as_micros() as u64;
+            let total_sum = sum0 + sum2;
+            if total_sum > wall {
+                let excess = total_sum - wall;
+                let sub0 = ((excess as u128 * sum0 as u128) / total_sum as u128) as u64;
+                let sub2 = excess.saturating_sub(sub0);
+                PREPARING[0].fetch_sub(sub0, Ordering::Relaxed);
+                PREPARING[2].fetch_sub(sub2, Ordering::Relaxed);
+            }
+            return;
+        }
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -8960,6 +9061,11 @@ impl Meter {
         crate::shadow::back_line(frames);
         crate::shadow::placed_line();
         crate::plaincopy::line(frames);
+        {
+            static MADE_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let made = LISTS[0].load(Ordering::Relaxed);
+            crate::list::pool_line(frames, (made - MADE_BEFORE.swap(made, Ordering::Relaxed)) as f64 / frames);
+        }
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {

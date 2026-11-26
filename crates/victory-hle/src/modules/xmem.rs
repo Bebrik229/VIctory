@@ -370,7 +370,18 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section(HANDLE, bool);
+
+/// Whether physical sections should be pre-committed with `SEC_COMMIT`.
+/// Defaults to `on_wine()`, overridable with `VICTORY_XMEM_COMMIT=1|0`.
+fn commit_sections() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_XMEM_COMMIT").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => on_wine(),
+    })
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -459,22 +470,59 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         return 0;
     };
     // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    // first mapped or written (`commit`), or pre-committed with `SEC_COMMIT`
+    // when `commit_sections()` is enabled for zero-copy GPU heaps.
+    let (handle, committed) = if commit_sections() {
+        // SAFETY: plain section creation.
+        let h = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if !h.is_null() {
+            tracing::info!(
+                size_mb = size >> 20,
+                "XMemAllocatePhysicalPages: opened SEC_COMMIT physical section for zero-copy GPU heaps"
+            );
+            (h, true)
+        } else {
+            tracing::warn!(
+                n,
+                size_mb = size >> 20,
+                error = %std::io::Error::last_os_error(),
+                "XMemAllocatePhysicalPages: SEC_COMMIT failed, falling back to SEC_RESERVE"
+            );
+            // SAFETY: plain section creation.
+            let h = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE | SEC_RESERVE,
+                    (size as u64 >> 32) as u32,
+                    size as u32,
+                    std::ptr::null(),
+                )
+            };
+            (h, false)
+        }
+    } else {
+        // SAFETY: plain section creation.
+        let h = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        (h, false)
     };
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
@@ -490,8 +538,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    victory_gpu::title_memory_section(handle as usize, size as u64, committed);
+    let section = Arc::new(Section(handle, committed));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -552,7 +600,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len, slice.section.1).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -885,7 +933,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !commit(base, len, slice.section.1) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -942,9 +990,9 @@ fn join_placeholders(base: usize, len: usize) -> bool {
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+fn commit(base: usize, len: usize, section_committed: bool) -> bool {
+    if section_committed || on_wine() {
+        return true;
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
@@ -1722,5 +1770,34 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn sec_commit_section_maps_and_skips_virtual_alloc() {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        let len = PAGE;
+        // SAFETY: creates an anonymous pagefile-backed SEC_COMMIT section.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                0,
+                len as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!handle.is_null());
+        // SAFETY: maps the committed section read-write.
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, len) };
+        assert!(!view.Value.is_null());
+        assert!(commit(view.Value as usize, len, true));
+        // SAFETY: the mapped view is already committed read-write.
+        unsafe {
+            view.Value.cast::<u8>().write(0x5a);
+            assert_eq!(view.Value.cast::<u8>().read(), 0x5a);
+            assert_ne!(UnmapViewOfFile(view), 0);
+            assert_ne!(CloseHandle(handle), 0);
+        }
     }
 }

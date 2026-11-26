@@ -649,6 +649,35 @@ pub(crate) fn sync_line(frames: f64) {
             found_done as f64 / frames
         );
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = host::MIRRORED.each_ref().map(|a| a.swap(0, Relaxed) as f64 / frames);
+        let us = host::MIRROR_US.each_ref().map(|a| a.swap(0, Relaxed) as f64 / 1e3 / frames);
+        tracing::info!(
+            "the view-heap pass's records made, per frame, by what making them did (count, ms): made already {:.0} {:.2}, \
+             not a view of ours {:.0} {:.2}, the same view as made {:.0} {:.2}, the old view kept {:.0} {:.2}, \
+             left for later (a null view made) {:.0} {:.2}, a view created {:.0} {:.2}, other {:.0} {:.2}; inside: \
+             buffer notes and stale slots {:.2} ms, creating views {:.2} ms, keeping the slots' resources {:.2} ms",
+            n[0],
+            n[7] / 1e3,
+            n[1],
+            n[8] / 1e3,
+            n[2],
+            n[9] / 1e3,
+            n[3],
+            n[10] / 1e3,
+            n[4],
+            n[11] / 1e3,
+            n[5],
+            n[12] / 1e3,
+            n[6],
+            n[13] / 1e3,
+            us[0],
+            us[1],
+            us[2]
+        );
+    }
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.

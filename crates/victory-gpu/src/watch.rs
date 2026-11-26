@@ -1846,6 +1846,16 @@ fn hot_guard_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HOT_GUARD").is_none_or(|v| v != "0"))
 }
 
+/// Whether a range that holds a hot block may stand in a submission's one
+/// asking ([`ask_once`]) like any other (`VICTORY_HOT_AHEAD=0`: it is left
+/// out, as before, and every refresh of a copy in it asks the guards again
+/// under [`WATCH_ASK`], one refresh at a time, and copies its hot blocks
+/// again).
+fn hot_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOT_AHEAD").is_none_or(|v| v != "0"))
+}
+
 const HOT_FAULT_WINDOW: u64 = 32;
 const HOT_FAULT_THRESHOLD: u16 = 2;
 const HOT_PIN_EPOCHS: u64 = 128;
@@ -1891,7 +1901,7 @@ struct Guards {
     /// can land after the call returns, and the kernel fails rather than
     /// faulting into our handler. Until expiry they stay writable and every
     /// check reports them dirty.
-    pins: Vec<(usize, usize, std::time::Instant)>,
+    pins: Pins,
     /// Incremented once per `guard_view_pieces` batch or standalone `guard()` check.
     guard_epoch: u64,
     /// Per-block `(last_epoch, consecutive_veh_faults)` for hot-block detection.
@@ -1903,33 +1913,167 @@ struct Guards {
 /// How long blocks stay writable after [`writing`].
 const PIN: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The pins of [`Guards`]: each the first block, the one past the last, and
+/// until when. Thousands stand at a time and the checks ask of thousands of
+/// blocks a frame whether one is pinned, under the guards' lock: so the
+/// blocks of the narrow pins are counted in a map, and only the few wide
+/// ones are looked through. A pin counts for as long as it is held, whatever
+/// the time: [`Pins::expire`] lets go of those that are over.
+struct Pins {
+    /// Pins of at most [`Pins::NARROW`] blocks, in the order they were made,
+    /// which is the order they expire in.
+    narrow: std::collections::VecDeque<(usize, usize, std::time::Instant)>,
+    /// How many pins of `narrow` cover each block.
+    covered: BlockMap<u32>,
+    /// The wider ones (an `fread` of gigabytes), and the pieces left of
+    /// them: few, looked through one by one.
+    wide: Vec<(usize, usize, std::time::Instant)>,
+}
+
+impl Pins {
+    /// The most blocks a pin covers that are counted one by one in `covered`.
+    const NARROW: usize = 64;
+
+    /// The most blocks [`Pins::remove`] looks up one by one in `covered`
+    /// before going through `narrow`.
+    const LOOKED_UP: usize = 256;
+
+    /// No pin.
+    const fn new() -> Self {
+        Self {
+            narrow: std::collections::VecDeque::new(),
+            covered: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            wide: Vec::new(),
+        }
+    }
+
+    /// Whether no pin is held.
+    fn is_empty(&self) -> bool {
+        self.narrow.is_empty() && self.wide.is_empty()
+    }
+
+    /// Whether a pin that is held covers `block`.
+    fn contains(&self, block: usize) -> bool {
+        self.covered.contains_key(&block) || self.wide.iter().any(|&(from, to, _)| from <= block && block < to)
+    }
+
+    /// Pins `[from, to)` until `until`. A pin of no block is not held.
+    fn push(&mut self, from: usize, to: usize, until: std::time::Instant) {
+        if from >= to {
+            return;
+        }
+        if to - from <= Self::NARROW {
+            self.cover(from, to);
+            self.narrow.push_back((from, to, until));
+        } else {
+            self.wide.push((from, to, until));
+        }
+    }
+
+    /// Lets go of the pins that are over at `now`. The narrow ones are let
+    /// go from the oldest on, up to the first that is not over: one made by
+    /// a thread that read the clock microseconds before another and took the
+    /// lock after it stands behind a pin that ends later, and is let go that
+    /// many microseconds late, with it.
+    fn expire(&mut self, now: std::time::Instant) {
+        while let Some(&(from, to, until)) = self.narrow.front() {
+            if until > now {
+                break;
+            }
+            self.narrow.pop_front();
+            self.uncover(from, to);
+        }
+        if !self.wide.is_empty() {
+            self.wide.retain(|&(_, _, until)| until > now);
+        }
+    }
+
+    /// Takes `[first, last)` out of every pin: one that reaches beyond it is
+    /// left as its parts outside it (one before, one after, or both), each
+    /// until when the pin was, in the pin's place among the others. The
+    /// parts of a wide pin stay with the wide ones, however small. Called
+    /// hundreds of times a frame with a few blocks nothing is pinned in:
+    /// those are only looked up.
+    fn remove(&mut self, first: usize, last: usize) {
+        if first >= last {
+            return;
+        }
+        let narrow = if last - first <= Self::LOOKED_UP {
+            (first..last).any(|block| self.covered.contains_key(&block))
+        } else {
+            self.narrow.iter().any(|&(from, to, _)| from < last && first < to)
+        };
+        if narrow {
+            let pins = std::mem::take(&mut self.narrow);
+            self.narrow.reserve(pins.len() + 1);
+            for (from, to, until) in pins {
+                if to <= first || from >= last {
+                    self.narrow.push_back((from, to, until));
+                    continue;
+                }
+                self.uncover(from.max(first), to.min(last));
+                if from < first {
+                    self.narrow.push_back((from, first, until));
+                }
+                if to > last {
+                    self.narrow.push_back((last, to, until));
+                }
+            }
+        }
+        if self.wide.iter().any(|&(from, to, _)| from < last && first < to) {
+            let pins = std::mem::take(&mut self.wide);
+            self.wide.reserve(pins.len() + 1);
+            for (from, to, until) in pins {
+                if to <= first || from >= last {
+                    self.wide.push((from, to, until));
+                    continue;
+                }
+                if from < first {
+                    self.wide.push((from, first, until));
+                }
+                if to > last {
+                    self.wide.push((last, to, until));
+                }
+            }
+        }
+    }
+
+    /// Counts one more narrow pin over each block of `[from, to)`.
+    fn cover(&mut self, from: usize, to: usize) {
+        for block in from..to {
+            *self.covered.entry(block).or_insert(0) += 1;
+        }
+    }
+
+    /// Counts one narrow pin fewer over each block of `[from, to)`, and
+    /// forgets a block no pin is left over.
+    fn uncover(&mut self, from: usize, to: usize) {
+        for block in from..to {
+            if let std::collections::hash_map::Entry::Occupied(mut count) = self.covered.entry(block) {
+                if *count.get() > 1 {
+                    *count.get_mut() -= 1;
+                } else {
+                    count.remove();
+                }
+            }
+        }
+    }
+}
+
 impl Guards {
     /// Whether `block` is left writable for an in-flight kernel write.
     fn pinned(&self, block: usize) -> bool {
-        self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
+        self.pins.contains(block)
     }
 
     /// Removes `[first, last)` from `pins`, splitting any pin that extends
     /// beyond it (called on remap/unmap so reused virtual addresses never
     /// inherit stale pins).
     fn unpin(&mut self, first: usize, last: usize) {
-        if first >= last || self.pins.is_empty() {
+        if first >= last {
             return;
         }
-        let mut next = Vec::with_capacity(self.pins.len());
-        for &(from, to, until) in &self.pins {
-            if to <= first || from >= last {
-                next.push((from, to, until));
-            } else {
-                if from < first {
-                    next.push((from, first, until));
-                }
-                if to > last {
-                    next.push((last, to, until));
-                }
-            }
-        }
-        self.pins = next;
+        self.pins.remove(first, last);
     }
 }
 
@@ -1941,7 +2085,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     verified: BTreeMap::new(),
     holes: BTreeSet::new(),
     aliased: BTreeSet::new(),
-    pins: Vec::new(),
+    pins: Pins::new(),
     guard_epoch: 0,
     fault_counts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     hot_pins: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
@@ -1994,8 +2138,7 @@ fn guard_at(start: usize, end: usize, bump_epoch: bool, now: u64, keep: u64) -> 
         g.guard_epoch = g.guard_epoch.wrapping_add(1);
     }
     if !g.pins.is_empty() {
-        let now = std::time::Instant::now();
-        g.pins.retain(|&(_, _, until)| until > now);
+        g.pins.expire(std::time::Instant::now());
     }
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // Fast zero-alloc check: blocks in `clean | absent_static` require no inspection.
@@ -2062,8 +2205,14 @@ fn guard_at(start: usize, end: usize, bump_epoch: bool, now: u64, keep: u64) -> 
                 false
             };
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.pinned(block) || is_hot {
-                any_pinned = true;
+            let kernel_pinned = g.pinned(block);
+            if kernel_pinned || is_hot {
+                // A hot block is said written at every asking, so the next
+                // submission's asking sees what is written to it from here
+                // on, as it does for a guarded block: its range may stand
+                // for the submission ([`hot_ahead`]). One the kernel may
+                // still write is asked again at every refresh, as before.
+                any_pinned |= kernel_pinned || !hot_ahead();
                 if is_hot {
                     HOT_GUARD_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -2379,10 +2528,9 @@ pub fn writing(at: usize, len: usize) {
     let aliases = {
         let mut g = guards();
         if !g.pins.is_empty() {
-            let now = std::time::Instant::now();
-            g.pins.retain(|&(_, _, t)| t > now);
+            g.pins.expire(std::time::Instant::now());
         }
-        g.pins.push((first, last, until));
+        g.pins.push(first, last, until);
         let (_, mut aliases) = open_collecting(&mut g, at, end);
         if view_guard() {
             crate::inplace::for_each_alias_in_range(
@@ -2391,7 +2539,7 @@ pub fn writing(at: usize, len: usize) {
                 MANY_VIEWS,
                 |_, alias| {
                     let alias_block = alias / BLOCK;
-                    g.pins.push((alias_block, alias_block + 1, until));
+                    g.pins.push(alias_block, alias_block + 1, until);
                     PUBLISHED.clear(alias_block);
                     open_here(&mut g, alias, alias.saturating_add(BLOCK));
                     aliases.push(alias_block);
@@ -4882,6 +5030,118 @@ mod tests {
         assert!(tracked.take(addr, addr + bytes).is_empty());
         unsafe { VirtualFree(mem.cast(), 0, MEM_RELEASE) };
     }
+
+    /// The pins answer as the list of them looked through one by one did:
+    /// narrow and wide ones made, ranges taken out of them, and those that
+    /// are over let go, in any order.
+    #[test]
+    fn pins_match_a_list_looked_through() {
+        use std::time::{Duration, Instant};
+        /// Blocks asked of after every step: the widest pin made ends before it.
+        const UNIVERSE: usize = 640;
+        /// What `Guards::unpin` did to the list.
+        fn unpin(list: &mut Vec<(usize, usize, Instant)>, first: usize, last: usize) {
+            if first >= last || list.is_empty() {
+                return;
+            }
+            let mut next = Vec::with_capacity(list.len());
+            for &(from, to, until) in list.iter() {
+                if to <= first || from >= last {
+                    next.push((from, to, until));
+                } else {
+                    if from < first {
+                        next.push((from, first, until));
+                    }
+                    if to > last {
+                        next.push((last, to, until));
+                    }
+                }
+            }
+            *list = next;
+        }
+        let t0 = Instant::now();
+        let mut pins = Pins::new();
+        let mut list: Vec<(usize, usize, Instant)> = Vec::new();
+        // A pin of no block is not held.
+        pins.push(5, 5, t0);
+        pins.push(7, 3, t0);
+        assert!(pins.is_empty());
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move |below: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ((x >> 20) % below as u64) as usize
+        };
+        let mut step = 0u64;
+        let (mut narrow, mut wide, mut cut, mut over) = (0, 0, 0, 0);
+        for _ in 0..4000 {
+            let from = random(400);
+            match random(16) {
+                // A narrow pin, the widest of them now and then.
+                0..=7 => {
+                    let blocks = if random(8) == 0 { Pins::NARROW } else { 1 + random(8) };
+                    step += 1;
+                    let until = t0 + Duration::from_millis(step);
+                    pins.push(from, from + blocks, until);
+                    list.push((from, from + blocks, until));
+                    narrow += 1;
+                }
+                // A wide one.
+                8 => {
+                    let blocks = Pins::NARROW + 1 + random(150);
+                    step += 1;
+                    let until = t0 + Duration::from_millis(step);
+                    pins.push(from, from + blocks, until);
+                    list.push((from, from + blocks, until));
+                    wide += 1;
+                }
+                // A few blocks taken out, then many (looked up, then gone through).
+                9..=11 => {
+                    let last = from + 1 + random(6);
+                    cut += usize::from((from..last).any(|b| pins.contains(b)));
+                    pins.remove(from, last);
+                    unpin(&mut list, from, last);
+                }
+                12 => {
+                    let last = from + Pins::LOOKED_UP - 8 + random(40);
+                    cut += usize::from((from..last).any(|b| pins.contains(b)));
+                    pins.remove(from, last);
+                    unpin(&mut list, from, last);
+                }
+                // Those over some pins ago let go; now and then, all of them.
+                _ => {
+                    let back = if random(24) == 0 { 0 } else { 1 + random(48) as u64 };
+                    let now = t0 + Duration::from_millis(step.saturating_sub(back));
+                    over += list.iter().filter(|&&(_, _, until)| until <= now).count();
+                    pins.expire(now);
+                    list.retain(|&(_, _, until)| until > now);
+                }
+            }
+            for block in 0..UNIVERSE {
+                let pinned = list.iter().any(|&(from, to, _)| from <= block && block < to);
+                assert_eq!(pins.contains(block), pinned, "block {block} after {step} pins");
+            }
+            assert_eq!(pins.is_empty(), list.is_empty());
+            // The counts are those of the narrow pins held, which stand in the order they end in.
+            let mut counted = BlockMap::<u32>::default();
+            for &(from, to, _) in &pins.narrow {
+                assert!(from < to && to - from <= Pins::NARROW);
+                for block in from..to {
+                    *counted.entry(block).or_insert(0) += 1;
+                }
+            }
+            assert_eq!(pins.covered, counted);
+            assert!(pins.narrow.iter().map(|pin| pin.2).is_sorted());
+            assert_eq!(pins.narrow.len() + pins.wide.len(), list.len());
+        }
+        // Every kind of step was taken, and found pins to cut and to let go.
+        assert!(narrow > 1000 && wide > 100, "{narrow} narrow pins, {wide} wide");
+        assert!(cut > 300 && over > 500, "{cut} ranges cut, {over} pins over");
+        pins.expire(t0 + Duration::from_millis(step));
+        assert!(pins.is_empty());
+        assert!(pins.covered.is_empty(), "no count is left of a pin let go");
+    }
 }
 
 #[cfg(test)]
@@ -5034,7 +5294,7 @@ mod mapping_tests {
         // Clean up pin and view.
         {
             let mut g = guards();
-            g.pins.retain(|&(from, to, _)| !(from == base / BLOCK && to == base / BLOCK + 1));
+            g.unpin(base / BLOCK, base / BLOCK + 1);
         }
         title_memory_remapped(base, 2 * BLOCK);
         unsafe {
@@ -5142,7 +5402,7 @@ mod mapping_tests {
 
         {
             let mut g = guards();
-            g.pins.retain(|&(from, to, _)| !(from == pinned_range.0 / BLOCK && to == pinned_range.0 / BLOCK + 1));
+            g.unpin(pinned_range.0 / BLOCK, pinned_range.0 / BLOCK + 1);
         }
         title_memory_remapped(base, 4 * BLOCK);
         unsafe {
@@ -5198,6 +5458,48 @@ mod mapping_tests {
         }
         assert!(!writable(base), "expired hot-pin must re-protect block READONLY");
         assert_eq!(guard(base, base + BLOCK), Some(Vec::new()));
+
+        title_memory_remapped(base, BLOCK);
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn a_hot_block_is_said_written_and_its_range_stands_for_the_submission() {
+        use super::{
+            BLOCK, HOT_FAULT_THRESHOLD, PAGE, guard, guard_view_pieces_with, hot_ahead, hot_guard_on,
+            title_memory_remapped, writable,
+        };
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE,
+            UnmapViewOfFile,
+        };
+        if !hot_guard_on() || !hot_ahead() {
+            return;
+        }
+        let section =
+            unsafe { CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null()) };
+        assert!(!section.is_null());
+        let base = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK) }.Value as usize;
+        assert_ne!(base, 0);
+        let p0 = base / PAGE;
+        assert_eq!(guard(base, base + BLOCK), Some(vec![p0]));
+        for _ in 0..HOT_FAULT_THRESHOLD {
+            unsafe { (base as *mut u8).write_volatile(7) };
+            assert_eq!(guard(base, base + BLOCK), Some(vec![p0]));
+        }
+        assert!(writable(base), "the block is hot");
+
+        // Twice: said written each time, and the range stands each time.
+        for _ in 0..2 {
+            let (mut pieces, mut ahead, mut dirty) = (vec![(p0, p0 + 1)], Vec::new(), Vec::new());
+            guard_view_pieces_with(&mut pieces, &mut ahead, &mut dirty, false);
+            assert_eq!(dirty, vec![p0]);
+            assert_eq!(ahead, vec![(p0, p0 + 1)]);
+            assert!(writable(base));
+        }
 
         title_memory_remapped(base, BLOCK);
         unsafe {

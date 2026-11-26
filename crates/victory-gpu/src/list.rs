@@ -250,7 +250,35 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (128, 256 << 20);
+// (1024: `VICTORY_SETTLE_ROOM` lets 512 lists fly while the title records
+// the next frame's, so more than 128, and more than the 512 of the tree
+// this follows, are out at a time. Those past the cap were thrown away at
+// their landing and made anew at the next reset: a fifth of the submitting
+// thread in their drop and 4 to 7 % of each recording thread making their
+// buffers, sampled. An idle list holds no more than it held in the air.)
+const IDLE_MOST: (usize, u64) = (1024, 512 << 20);
+
+/// Since the last frame line: host lists kept for reuse at their landing,
+/// and those let go because they did not run, because something else still
+/// held them, or because the pool was full ([`IDLE_MOST`]).
+#[cfg(windows)]
+static RECYCLED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// With the frame line: what became of the host lists that landed, per
+/// frame over `frames`, beside the lists made new.
+#[cfg(windows)]
+pub(crate) fn pool_line(frames: f64, made: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [kept, not_ran, shared, full] = [0, 1, 2, 3].map(|i| RECYCLED[i].swap(0, Relaxed) as f64 / frames);
+    if kept + not_ran + shared + full + made < 0.05 {
+        return;
+    }
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len();
+    tracing::info!(
+        "host lists per frame: {made:.1} made new, {kept:.1} kept for reuse at their landing, let go: {not_ran:.1} that did not run, {shared:.1} still held elsewhere, {full:.1} with the pool full; {idle} idle now (at most {})",
+        IDLE_MOST.0
+    );
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -293,20 +321,38 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i)
-            || std::sync::Arc::strong_count(&host) != 1
-            || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0
-        {
+        let let_go = if !ran.contains(&i) {
+            Some(1)
+        } else if std::sync::Arc::strong_count(&host) != 1 {
+            Some(2)
+        } else if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+            Some(3)
+        } else {
+            None
+        };
+        if let Some(why) = let_go {
+            RECYCLED[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::host::retire_list(host);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
         let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
+        let discarded = {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+                idle.0.push(Idle(host, bytes));
+                idle.1 += bytes;
+                RECYCLED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            } else {
+                RECYCLED[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(host)
+            }
+        };
+        if let Some(host) = discarded {
+            crate::host::retire_list(host);
         }
     }
 }
