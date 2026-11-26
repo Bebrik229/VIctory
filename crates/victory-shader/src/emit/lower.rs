@@ -26,12 +26,39 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 pub(super) mod intersect;
 
 mod half;
+#[cfg(all(test, windows))]
+mod cbv_subdword_tests;
 
 #[path = "group_uniform.rs"]
 mod group_uniform;
 use group_uniform::{all_group_blocks, all_lane_blocks, lane_regions, lds_meetings};
 
 type Why = &'static str;
+
+enum SamplerSelector {
+    Slot(u32),
+    Phi {
+        join: usize,
+        incoming: Vec<(Self, usize)>,
+    },
+}
+
+impl SamplerSelector {
+    fn emit(self, s: &mut Shader) -> V {
+        match self {
+            Self::Slot(n) => s.m.i32(n),
+            Self::Phi { join, incoming } => {
+                let incoming = incoming
+                    .into_iter()
+                    .map(|(arg, edge)| (arg.emit(s), edge))
+                    .collect();
+                let phi = s.m.phi(join, s.t.i32);
+                s.m.set_phi(phi, incoming);
+                phi
+            }
+        }
+    }
+}
 
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
@@ -1179,19 +1206,18 @@ impl<'a> Lower<'a> {
             let wave_shared_lds = group > 1 && one_wave && s.lds_dwords > 0;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
-            // exactly in waves of 32: the thread relabelling makes each host wave one half of a
-            // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
-            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
-            // masks), nor when LDS may be shared within the console wave without barriers (a
-            // group over 32 threads with LDS): those still need 64-lane waves.
+            // `ds_swizzle`, `ds_bpermute`, `v_permlane16` / `v_permlanex16`, which the ISA confines
+            // there – runs exactly in waves of 32: the thread relabelling makes each host wave one
+            // half of a console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
+            // `v_readlane`, `v_writelane`, `ds_permute`, masks as numbers or lane-constant masks),
+            // nor when LDS may be shared within the console wave without barriers (a group over 32
+            // threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || wave_shared_lds) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -4429,26 +4455,22 @@ impl<'a> Lower<'a> {
         if name == "ds_bpermute_b32" {
             // Backward permute: no LDS is touched. Each lane takes the data
             // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
-            // the title's checkerboard shadow-mask generators read their
-            // neighbours' samples with it; without them every shadowed light
-            // was multiplied by an empty mask.)
+            // within its own 32-lane half (RDNA2 ISA 10.4.4); a source lane
+            // outside EXEC gives 0. (the title's checkerboard shadow-mask
+            // generators read their neighbours' samples with it; without them
+            // every shadowed light was multiplied by an empty mask.)
             // shortcut: a source lane that is not at this instruction on the
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
+            let wave = self.s.wave_size.unwrap_or_else(|| self.wave());
+            let last = self.s.m.i32(wave - 1);
             let src = self.s.m.bin(c, Bin::And, src, last);
             let x = match guard {
                 Some(g) => {
@@ -6072,6 +6094,21 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// Extracts an 8- or 16-bit lane at byte address `byte` from its
+    /// containing 32-bit dword `w`, zero- or sign-extending to 32 bits.
+    fn extract_sub(&mut self, w: V, byte: V, width: u32, signed: bool) -> V {
+        let c = self.cur;
+        let three = self.s.m.i32(3);
+        let off = self.s.m.bin(c, Bin::And, byte, three);
+        let sh = self.s.m.bin(c, Bin::Shl, off, three);
+        let x = self.s.m.bin(c, Bin::LShr, w, sh);
+        let left = self.s.m.i32(32 - width);
+        let x = self.s.m.bin(c, Bin::Shl, x, left);
+        self.s
+            .m
+            .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left)
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
@@ -6304,25 +6341,10 @@ impl<'a> Lower<'a> {
                 self.handles.insert(key, h);
                 Ok(h)
             }
-            Source::Constant(words) if sampler => {
-                let words: [u32; 4] = words
-                    .get(..4)
-                    .and_then(|w| w.try_into().ok())
-                    .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
-                    Some(n) => n,
-                    None => {
-                        self.samplers.push(words);
-                        self.samplers.len() - 1
-                    }
-                };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
-                Ok(self.s.sampler_handle(self.cur, n as u32))
-            }
+            Source::Constant(words) if sampler => self.immediate_sampler(
+                *words.first_chunk().ok_or("a sampler constant")?,
+                props.0 & 0x8000 != 0,
+            ),
             Source::Constant(_) => Err("a constant resource descriptor"),
             Source::Built { address, .. } => {
                 let rp = *self
@@ -6359,6 +6381,11 @@ impl<'a> Lower<'a> {
                 }
             }
             Source::Phi { block, args } => {
+                if sampler
+                    && let Some(h) = self.immediate_sampler_phi(src, props.0 & 0x8000 != 0)?
+                {
+                    return Ok(h);
+                }
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
                 Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
@@ -6430,6 +6457,95 @@ impl<'a> Lower<'a> {
         let phi = self.s.m.phi(join, self.s.t.i32);
         self.s.m.set_phi(phi, incoming);
         Ok(phi)
+    }
+
+    fn immediate_sampler(&mut self, words: [u32; 4], comparison: bool) -> Result<V, Why> {
+        let slot = self.samplers.iter().enumerate().position(|(n, w)| {
+            *w == words && (self.s.cmp_samplers >> n & 1 != 0) == comparison
+        });
+        let n = match slot {
+            Some(n) => n,
+            None => {
+                let n = self.samplers.len();
+                if n >= u64::BITS as usize {
+                    return Err("more than 64 immediate sampler slots");
+                }
+                self.samplers.push(words);
+                self.s.cmp_samplers |= u64::from(comparison) << n;
+                n
+            }
+        };
+        Ok(self.s.sampler_handle(self.cur, n as u32))
+    }
+
+    fn immediate_sampler_phi(&mut self, src: &Source, comparison: bool) -> Result<Option<V>, Why> {
+        let mut samplers = Vec::new();
+        let Some(selector) = self.sampler_selector(src, &mut samplers, &mut HashSet::new())? else {
+            return Ok(None);
+        };
+        if samplers.is_empty() {
+            return Ok(None);
+        }
+        let mut handles = samplers
+            .into_iter()
+            .map(|words| self.immediate_sampler(words, comparison))
+            .collect::<Result<Vec<_>, _>>()?;
+        let primary = handles.remove(0);
+        if !handles.is_empty() {
+            let selector = selector.emit(&mut self.s);
+            self.s.sampler_choices.push((primary, selector, handles));
+        }
+        Ok(Some(primary))
+    }
+
+    /// Plan a selector before emitting anything, so mixed sources can use
+    /// the heap path. All leaves share the sampling operation's comparison mode.
+    fn sampler_selector(
+        &self,
+        src: &Source,
+        samplers: &mut Vec<[u32; 4]>,
+        active: &mut HashSet<*const Source>,
+    ) -> Result<Option<SamplerSelector>, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        match src {
+            Source::Constant(words) => {
+                let words = *words.first_chunk().ok_or("a sampler constant")?;
+                let slot = if let Some(slot) = samplers.iter().position(|w| *w == words) {
+                    slot
+                } else {
+                    let slot = samplers.len();
+                    samplers.push(words);
+                    slot
+                };
+                Ok(Some(SamplerSelector::Slot(slot as u32)))
+            }
+            Source::Phi { block, args } => {
+                let key = std::ptr::from_ref(src);
+                if !active.insert(key) {
+                    return Err(WHY);
+                }
+                let join = self.block[*block].ok_or(WHY)?;
+                let mut incoming = Vec::new();
+                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                    if self.block[q].is_none() {
+                        continue;
+                    }
+                    let tail = self.tail[q].ok_or(WHY)?;
+                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let Some(value) = self.sampler_selector(arg, samplers, active)? else {
+                        return Ok(None);
+                    };
+                    incoming.push((value, at));
+                }
+                active.remove(&key);
+                Ok(Some(if incoming.is_empty() {
+                    SamplerSelector::Slot(0)
+                } else {
+                    SamplerSelector::Phi { join, incoming }
+                }))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// The bytes per element of the buffer view `src` names, if the program
@@ -6863,7 +6979,12 @@ impl<'a> Lower<'a> {
         if let Some((rows, banks)) = masks {
             // Row (16 lanes) and bank (4 lanes of a row) write masks.
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
+            let row_lane = if self.halves.is_some() && rows & 3 != rows >> 2 {
+                self.console_thread()
+            } else {
+                lane
+            };
+            let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
             let bi = self.s.m.bin(c, Bin::And, bi, three);
@@ -10438,6 +10559,9 @@ impl<'a> Lower<'a> {
             index = None;
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
+            if store || atomic.is_some() {
+                return Err("a store or atomic on a constant buffer");
+            }
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
@@ -10456,7 +10580,10 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let mut x = self.cbuffer_dword(h, a);
+                if let Some((width, signed)) = narrow {
+                    x = self.extract_sub(x, a, width, signed);
+                }
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

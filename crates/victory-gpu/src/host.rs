@@ -213,6 +213,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+        // Dropped here directly without boxing into `Retired` when reaper is off.
         if !reaper_on() {
             drop(object);
             return;
@@ -227,6 +228,70 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
+/// Whether descriptor slots written again with the object they already
+/// held let the old reference go at once instead of retiring it, and
+/// [`bury`] partitions what it drops outside the lock (`VICTORY_RETIRE_LEAN=1`;
+/// `alt`: twenty seconds with, twenty without, in turn, each change said in
+/// the log). Off by default.
+pub(crate) fn retire_lean() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_RETIRE_LEAN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "descriptor slots written again with the same object let the old reference go at once from now (VICTORY_RETIRE_LEAN=alt): {}",
+                    if on { "ON" } else { "off, retired as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Descriptor slots written since the start (`HostHeap::keep`): with an
+/// object where they held one, and of those the ones that held the same
+/// object; and the old references let go at once for that
+/// ([`retire_lean`]). Said every 2^20 writes of the first kind.
+pub(crate) static SLOT_REWRITES: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Counts a slot write that replaced `old` by `new` and says whether the
+/// old reference may go at once (the same object, [`retire_lean`] on).
+pub(crate) fn slot_rewritten(old: &ID3D12Resource, new: Option<&ID3D12Resource>) -> bool {
+    slot_rewritten_with(old, new, retire_lean())
+}
+
+fn slot_rewritten_with(old: &ID3D12Resource, new: Option<&ID3D12Resource>, lean_on: bool) -> bool {
+    let same = new.is_some_and(|new| new.as_raw() == old.as_raw());
+    let before = SLOT_REWRITES[0].fetch_add(1, Ordering::Relaxed);
+    if same {
+        SLOT_REWRITES[1].fetch_add(1, Ordering::Relaxed);
+    }
+    let lean = same && lean_on;
+    if lean {
+        SLOT_REWRITES[2].fetch_add(1, Ordering::Relaxed);
+    }
+    if (before + 1).is_multiple_of(1 << 20) {
+        tracing::info!(
+            "descriptor slots written over an object they held: {} so far, {} of them with the same object; {} old references let go at once (VICTORY_RETIRE_LEAN), the rest retired",
+            before + 1,
+            SLOT_REWRITES[1].load(Ordering::Relaxed),
+            SLOT_REWRITES[2].load(Ordering::Relaxed)
+        );
+    }
+    lean
+}
+
 /// Submissions started and finished so far ([`STARTED`], [`FINISHED`]): a
 /// heap map's pool slot given back while submission n may run is handed
 /// out again once n has finished (`descriptor::slot_map`), as [`retire`]
@@ -237,6 +302,25 @@ pub(crate) fn submissions() -> (u64, u64) {
 
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
+    bury_with(finished, retire_lean());
+}
+
+fn bury_with(finished: u64, lean: bool) {
+    if lean {
+        // Taken out whole, sorted with no lock held, what still waits put
+        // back (beside what was retired meanwhile; the order means nothing).
+        let all = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+        if all.is_empty() {
+            return;
+        }
+        let (done, keep): (Vec<(u64, Retired)>, Vec<(u64, Retired)>) =
+            all.into_iter().partition(|(at, _)| *at <= finished);
+        if !keep.is_empty() {
+            RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(keep);
+        }
+        reap(done.into_iter().map(|(_, object)| object).collect());
+        return;
+    }
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
@@ -8013,7 +8097,15 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        let total_bytes: usize = self
+            .refreshes
+            .iter()
+            .map(|(_, from, to)| to.saturating_sub(*from))
+            .sum();
+        if wide_refresh()
+            && (self.refreshes.len() >= 4
+                || (self.refreshes.len() >= 2 && total_bytes >= 256 * 1024))
+        {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -9888,5 +9980,75 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    #[test]
+    fn retire_lean_rewrites_and_bury_partition_outside_lock() {
+        let Some(host) = super::host() else { return };
+        let make_buf = || {
+            let mut buf: Option<super::ID3D12Resource> = None;
+            let heap = super::D3D12_HEAP_PROPERTIES {
+                Type: super::D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            };
+            let desc = super::D3D12_RESOURCE_DESC {
+                Dimension: super::D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: super::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: super::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            // SAFETY: valid upload buffer description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        super::D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        super::D3D12_RESOURCE_STATE_GENERIC_READ,
+                        None,
+                        &mut buf,
+                    )
+                    .unwrap();
+            }
+            buf.unwrap()
+        };
+
+        let a = make_buf();
+        let b = make_buf();
+        let before = [0, 1, 2].map(|i| super::SLOT_REWRITES[i].load(super::Ordering::Relaxed));
+
+        assert!(super::slot_rewritten_with(&a, Some(&a), true));
+        assert!(!super::slot_rewritten_with(&a, Some(&a), false));
+        assert!(!super::slot_rewritten_with(&a, Some(&b), true));
+        assert!(!super::slot_rewritten_with(&a, None, true));
+
+        let after = [0, 1, 2].map(|i| super::SLOT_REWRITES[i].load(super::Ordering::Relaxed));
+        assert_eq!(after[0] - before[0], 4);
+        assert_eq!(after[1] - before[1], 2);
+        assert_eq!(after[2] - before[2], 1);
+
+        // Verify `bury_with(..., true)` partitions `RETIRED` outside the lock without dropping newer entries.
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Flag(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        {
+            let mut retired = super::RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+            retired.push((10, super::Retired(Box::new(Flag(dropped.clone())))));
+            retired.push((u64::MAX, super::Retired(Box::new(Flag(dropped.clone())))));
+        }
+        super::bury_with(10, true);
+        assert_eq!(dropped.load(super::Ordering::Relaxed), 1);
+        let mut retired = super::RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let len_before = retired.len();
+        retired.retain(|(at, _)| *at != u64::MAX);
+        assert!(retired.len() < len_before);
     }
 }

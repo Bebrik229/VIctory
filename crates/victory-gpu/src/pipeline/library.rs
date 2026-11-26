@@ -73,6 +73,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The folder holding the pipeline library, if one was set.
+pub(super) fn folder() -> Option<&'static PathBuf> {
+    DIR.get()
+}
+
 /// How long another process's staging file is left alone: the folder is
 /// shared, and a running instance may be writing it.
 const STAGING_KEPT: std::time::Duration = std::time::Duration::from_secs(10 * 60);

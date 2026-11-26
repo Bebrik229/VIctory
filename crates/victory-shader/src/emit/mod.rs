@@ -31,6 +31,8 @@
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
 //!   a heap sampler it uses must be a comparison sampler on the host.
+//!   When uniform control flow chooses an immediate sampler, sampling runs
+//!   with each distinct sampler and the incoming edge selects the result.
 //! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
@@ -111,6 +113,8 @@ mod shader;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
+#[cfg(all(test, windows))]
+mod sampler_phi_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]

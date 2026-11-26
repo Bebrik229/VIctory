@@ -192,6 +192,9 @@ pub(crate) struct Shader {
     pub samplers: u32,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
+    /// Primary handle, i32 selector, and alternate handles in selector order.
+    /// An operation on the primary runs on every handle.
+    pub sampler_choices: Vec<(V, V, Vec<V>)>,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
@@ -252,6 +255,7 @@ impl Shader {
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
+            sampler_choices: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
@@ -297,7 +301,31 @@ impl Shader {
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
-        self.m.call(block, f, all)
+        let choice = self
+            .sampler_choices
+            .iter()
+            .find(|(a, _, _)| args.contains(a));
+        let Some((primary, selector, handles)) = choice else {
+            return self.m.call(block, f, all);
+        };
+        let r = self.m.call(block, f, all.clone());
+        let others = handles
+            .iter()
+            .map(|&handle| {
+                let args = all
+                    .iter()
+                    .map(|&arg| if arg == *primary { handle } else { arg })
+                    .collect();
+                self.m.call(block, f, args)
+            })
+            .collect::<Vec<_>>();
+        if ret == self.t.res_ret {
+            // Drivers miscompile a select of the result structure (AMD
+            // read zeros): its fields are chosen where they are read.
+            self.m.chosen.insert(r, (*selector, others));
+            return r;
+        }
+        self.m.select_indexed(block, *selector, r, &others)
     }
 
     /// The handle of the user-data constant buffer, made in the entry block.

@@ -25,6 +25,47 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
+fn parse_fps_cap(raw: Option<&str>, title_interval: Duration) -> Duration {
+    let Some(raw) = raw else {
+        return title_interval;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return title_interval;
+    }
+    if trimmed.eq_ignore_ascii_case("0")
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("unlimited")
+    {
+        return Duration::from_micros(1);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => Duration::from_micros(1),
+        Ok(fps) => Duration::from_micros((1_000_000u64 / fps.max(1)).max(1)),
+        Err(_) => title_interval,
+    }
+}
+
+fn fps_cap_interval(title_interval: Duration) -> Duration {
+    parse_fps_cap(
+        std::env::var("VICTORY_FPS_CAP").ok().as_deref(),
+        title_interval,
+    )
+}
+
+fn log_fps_cap_override(title_interval: Duration, interval: Duration) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        let cap = std::env::var("VICTORY_FPS_CAP").unwrap_or_default();
+        tracing::info!(
+            cap = cap.trim(),
+            ?title_interval,
+            ?interval,
+            "VICTORY_FPS_CAP overrides frame interval"
+        );
+    });
+}
+
 struct Clock {
     start: Instant,
     interval: Duration,
@@ -49,10 +90,14 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let title_interval = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
+    let interval = fps_cap_interval(title_interval);
+    if interval != title_interval {
+        log_fps_cap_override(title_interval, interval);
+    }
     tracing::info!(?interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
@@ -97,10 +142,16 @@ fn last(kind: u32) -> &'static AtomicU64 {
 /// let the next one end on the same tick), and how long until it.
 fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
-    let c = clock.get_or_insert_with(|| Clock {
-        start: Instant::now(),
-        interval: SIXTIETH,
-        first: 0,
+    let c = clock.get_or_insert_with(|| {
+        let interval = fps_cap_interval(SIXTIETH);
+        if interval != SIXTIETH {
+            log_fps_cap_override(SIXTIETH, interval);
+        }
+        Clock {
+            start: Instant::now(),
+            interval,
+            first: 0,
+        }
     });
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
@@ -242,5 +293,32 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
+    }
+
+    #[test]
+    fn fps_cap_interval_parses_env_values() {
+        let title = Duration::from_micros(16_667);
+        if std::env::var_os("VICTORY_FPS_CAP").is_none() {
+            assert_eq!(fps_cap_interval(title), title);
+        }
+        assert_eq!(parse_fps_cap(None, title), title);
+        assert_eq!(parse_fps_cap(Some(""), title), title);
+        assert_eq!(parse_fps_cap(Some("   "), title), title);
+        assert_eq!(parse_fps_cap(Some("invalid"), title), title);
+        assert_eq!(parse_fps_cap(Some("0"), title), Duration::from_micros(1));
+        assert_eq!(parse_fps_cap(Some("off"), title), Duration::from_micros(1));
+        assert_eq!(parse_fps_cap(Some(" OFF "), title), Duration::from_micros(1));
+        assert_eq!(
+            parse_fps_cap(Some("unlimited"), title),
+            Duration::from_micros(1)
+        );
+        assert_eq!(
+            parse_fps_cap(Some("60"), title),
+            Duration::from_micros(1_000_000 / 60)
+        );
+        assert_eq!(
+            parse_fps_cap(Some("120"), title),
+            Duration::from_micros(1_000_000 / 120)
+        );
     }
 }

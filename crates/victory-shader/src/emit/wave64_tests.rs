@@ -849,3 +849,183 @@ fn apply_disturb_input_layout_probe() {
         eprintln!("user_data index={} slot={} root={:?} dword={}", u.index, u.slot, u.root, u.dword);
     }
 }
+
+/// Half-local cross-lane operations (`ds_bpermute_b32`, `ds_swizzle_b32` group-of-32,
+/// `v_permlanex16_b32`, DPP8, and DPP16 rows including asymmetric `row_mask`) stay inside
+/// their own 32-lane half, so a wave64 program lowers to 32-lane host waves and matches
+/// RDNA2 lane-for-lane across all 64 lanes.
+#[test]
+fn half_local_cross_lane_ops_of_wave64_match_rdna2_on_a_wave32_host() {
+    let lane_v1 = |l: u32| 0x1000_0001 + l;
+    let lane_v2_old = |l: u32| 0xDEAD_0000 + l;
+    let ref_wave64 = |src: fn(u32) -> u32| -> [u32; 64] {
+        std::array::from_fn(|l| lane_v1(src(l as u32)))
+    };
+    let ref_wave64_even = |src: fn(u32) -> u32, inactive: fn(u32) -> u32| -> [u32; 64] {
+        std::array::from_fn(|l| {
+            let l = l as u32;
+            if l & 1 != 0 {
+                return lane_v2_old(l);
+            }
+            let s = src(l);
+            if s & 1 == 0 { lane_v1(s) } else { inactive(l) }
+        })
+    };
+    let dpp16 = |vdst: u8, vsrc0: u8, ctrl: u16, row_mask: u8, fi: bool| -> [u32; 2] {
+        [
+            0x7E00_02FA | (u32::from(vdst) << 17),
+            (u32::from(row_mask) << 28)
+                | (0xF << 24)
+                | (u32::from(fi) << 18)
+                | (u32::from(ctrl) << 8)
+                | u32::from(vsrc0),
+        ]
+    };
+    let dpp8_rev = |vdst: u8, vsrc0: u8| -> [u32; 2] {
+        let sel: u32 = [7u32, 6, 5, 4, 3, 2, 1, 0]
+            .iter()
+            .enumerate()
+            .fold(0, |a, (i, &x)| a | (x << (3 * i)));
+        [
+            0x7E00_02E9 | (u32::from(vdst) << 17),
+            (sel << 8) | u32::from(vsrc0),
+        ]
+    };
+    let ds_swizzle = |vdst: u8, vaddr: u8, offset: u16| -> [u32; 2] {
+        [
+            (0x36 << 26) | (0x35 << 18) | u32::from(offset),
+            (u32::from(vdst) << 24) | u32::from(vaddr),
+        ]
+    };
+    let ds_bpermute = |vdst: u8, vaddr: u8, vdata: u8, offset: u16| -> [u32; 2] {
+        [
+            (0x36 << 26) | (0xB3 << 18) | u32::from(offset),
+            (u32::from(vdst) << 24) | (u32::from(vdata) << 8) | u32::from(vaddr),
+        ]
+    };
+    let build = |op: &[u32], even: bool| -> HostShader {
+        let mut w = vec![
+            0x4A02_00FF,
+            0x1000_0001, // v_add_nc_u32 v1, 0x1000_0001, v0
+            0x4A04_00FF,
+            0xDEAD_0000, // v_add_nc_u32 v2, 0xDEAD_0000, v0
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        ];
+        if even {
+            w.extend_from_slice(&[
+                0x3608_0081, // v_and_b32 v4, 1, v0
+                0xBE8C_047E, // s_mov_b64 s[12:13], exec
+                0x7DA4_0880, // v_cmpx_eq_u32 exec, 0, v4
+            ]);
+            w.extend_from_slice(op);
+            w.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+        } else {
+            w.extend_from_slice(op);
+        }
+        w.extend_from_slice(&[
+            0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+            0xE070_1000,
+            0x8002_0205, // buffer_store_dword v2, v5, s[8:11], 0 offen
+        ]);
+        let native = native(&w);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let shader = lowered_on(&native, &p, &HashSet::new(), 32).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        shader
+    };
+
+    let mut row0_only: [u32; 64] = std::array::from_fn(|l| lane_v2_old(l as u32));
+    for l in 0..16 {
+        row0_only[l] = if l == 0 { lane_v2_old(0) } else { lane_v1(l as u32 - 1) };
+    }
+    let mut row0_and_2: [u32; 64] = std::array::from_fn(|l| lane_v2_old(l as u32));
+    for base in [0usize, 32] {
+        for l in 0..16 {
+            row0_and_2[base + l] = if l == 0 {
+                lane_v2_old((base + l) as u32)
+            } else {
+                lane_v1((base + l - 1) as u32)
+            };
+        }
+    }
+
+    let items: [(&str, HostShader, [u32; 64]); 9] = [
+        (
+            "dpp16 row_ror:4",
+            build(&dpp16(2, 1, 0x124, 0xF, true), false),
+            ref_wave64(|l| (l & !15) | ((l + 12) & 15)),
+        ),
+        (
+            "dpp16 row_mirror",
+            build(&dpp16(2, 1, 0x140, 0xF, true), false),
+            ref_wave64(|l| l ^ 15),
+        ),
+        (
+            "dpp16 row_share:3",
+            build(&dpp16(2, 1, 0x153, 0xF, true), false),
+            ref_wave64(|l| (l & !15) | 3),
+        ),
+        (
+            "dpp16 row_shr:1 row_mask:0x5",
+            build(&dpp16(2, 1, 0x111, 0x5, false), false),
+            row0_and_2,
+        ),
+        (
+            "dpp16 row_shr:1 row_mask:0x1",
+            build(&dpp16(2, 1, 0x111, 0x1, false), false),
+            row0_only,
+        ),
+        (
+            "dpp8 [7,6,5,4,3,2,1,0]",
+            build(&dpp8_rev(2, 1), false),
+            ref_wave64(|l| l ^ 7),
+        ),
+        (
+            "ds_swizzle_b32 bitmode SWAP(16)",
+            build(&ds_swizzle(2, 1, 0x401F), false),
+            ref_wave64(|l| l ^ 16),
+        ),
+        (
+            "ds_bpermute_b32 lane + 1 within the half",
+            build(&ds_bpermute(2, 3, 1, 4), false),
+            ref_wave64(|l| (l & 32) | ((l + 1) & 31)),
+        ),
+        (
+            "ds_bpermute_b32 lane + 1, even lanes active (odd sources read 0)",
+            build(&ds_bpermute(2, 3, 1, 4), true),
+            ref_wave64_even(|l| (l & 32) | ((l + 1) & 31), |_| 0),
+        ),
+    ];
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    for (label, shader, expected) in &items {
+        let Ok((root, pso)) = host.compute_pipeline(shader) else {
+            eprintln!("the hardware device does not take {label}; not run");
+            return;
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0][..64], expected[..], "{label}");
+        eprintln!("[PASS] {label}");
+    }
+}

@@ -2463,12 +2463,14 @@ impl HostHeap {
     }
 
     /// [`HostHeap::keep`] of slots `first..` in one go across [`KEPT_PIECES`]
-    /// shards: what they kept goes once the work in flight has run.
+    /// shards: what they kept goes once the work in flight has run (or at
+    /// once when `slot_rewritten` allows).
     fn keep_run(&self, first: u32, mut resources: Vec<Kept>) {
         if resources.is_empty() {
             return;
         }
         let mut retired = Vec::new();
+        let mut dropped = Vec::new();
         {
             let _one = (!heap_locks()).then(|| self.kept_one.lock().unwrap_or_else(|e| e.into_inner()));
             let touch = resources.len().min(KEPT_PIECES as usize);
@@ -2481,14 +2483,22 @@ impl HostHeap {
                     let at = (dst / KEPT_PIECES) as usize;
                     if let Some(slot) = kept.get_mut(at) {
                         let resource = resources[k].take();
+                        let lean = slot
+                            .as_ref()
+                            .is_some_and(|old| crate::host::slot_rewritten(old, resource.as_ref()));
                         if let Some(old) = std::mem::replace(slot, resource) {
-                            retired.push(old);
+                            if lean {
+                                dropped.push(old);
+                            } else {
+                                retired.push(old);
+                            }
                         }
                     }
                     k += KEPT_PIECES as usize;
                 }
             }
         }
+        drop(dropped);
         for old in retired {
             crate::host::retire(old);
         }
@@ -2557,18 +2567,28 @@ impl HostHeap {
         let piece = &self.kept[(index % KEPT_PIECES) as usize];
         let at = (index / KEPT_PIECES) as usize;
         if heap_locks() {
-            let old = {
+            let (old, lean) = {
                 let mut kept = piece.lock().unwrap_or_else(|e| e.into_inner());
                 match kept.get_mut(at) {
-                    Some(slot) => std::mem::replace(slot, resource),
-                    None => None,
+                    Some(slot) => {
+                        let lean = slot
+                            .as_ref()
+                            .is_some_and(|old| crate::host::slot_rewritten(old, resource.as_ref()));
+                        (std::mem::replace(slot, resource), lean)
+                    }
+                    None => (None, false),
                 }
             };
             // A running submission may still read the old resource through
             // this slot. (Outside the lock: letting go takes another lock,
-            // or frees a host resource.)
+            // or frees a host resource.) The same object written again is
+            // held by the slot's new reference: the old one goes now.
             if let Some(old) = old {
-                crate::host::retire(old);
+                if lean {
+                    drop(old);
+                } else {
+                    crate::host::retire(old);
+                }
             }
             return;
         }
@@ -2576,10 +2596,18 @@ impl HostHeap {
         let _one = self.kept_one.lock().unwrap_or_else(|e| e.into_inner());
         let mut kept = piece.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(at) {
+            let lean = slot
+                .as_ref()
+                .is_some_and(|old| crate::host::slot_rewritten(old, resource.as_ref()));
             // A running submission may still read the old resource through
-            // this slot.
+            // this slot (the same object written again: held by the new
+            // reference, the old one goes now).
             if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
+                if lean {
+                    drop(old);
+                } else {
+                    crate::host::retire(old);
+                }
             }
         }
     }
@@ -2797,10 +2825,32 @@ impl HostHeap {
         (true, total, mirrored, tabled)
     }
 
+    /// Initializes `self.copied` before [`sync_heaps`] fans out across worker
+    /// threads so workers never contend on `OnceLock` initialization.
+    pub(crate) fn copied_begin(&self) -> &[AtomicU64] {
+        let mirrored_limit = self.mirrored_count();
+        self.copied
+            .get_or_init(|| (0..mirrored_limit as usize).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    /// Whether slot `index` was made from no record (holds no host view):
+    /// empty/non-view records in such slots need no [`HostHeap::mirror`].
+    pub(crate) fn shows_none(&self, index: u32) -> bool {
+        if let Some(fast) = self.made_fast.get(index as usize) {
+            return fast.load(std::sync::atomic::Ordering::Acquire) == 0;
+        }
+        self.made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .host(index)
+            .is_none()
+    }
+
     /// Inner hot loop for [`HostHeap::sync_copied_page`]: walks `slice` holding
     /// `step`-byte records for title slots `first..last`, skips tabled slots,
     /// compares each untabled slot's 12-byte key against `self.copied`, and
-    /// mirrors only changed keys. Returns `(mirrored, tabled_skipped)`.
+    /// mirrors only changed keys (skipping empty records whose slot already shows none).
+    /// Returns `(mirrored, tabled_skipped)`.
     fn mirror_copied_slice(
         &self,
         first: u32,
@@ -2811,10 +2861,7 @@ impl HostHeap {
         skip_tabled: bool,
         now: u32,
     ) -> (u64, u64) {
-        let mirrored_limit = self.mirrored_count();
-        let copied = self
-            .copied
-            .get_or_init(|| (0..mirrored_limit as usize).map(|_| AtomicU64::new(0)).collect());
+        let copied = self.copied_begin();
         let copied_slice = &copied[first as usize..last as usize];
         let tabled_slice = if skip_tabled {
             let end = (last as usize).min(self.tabled.len());
@@ -2878,6 +2925,9 @@ impl HostHeap {
                 }
                 seen_slot.store(key, Relaxed);
                 let index = first + off as u32;
+                if key == 0 && self.shows_none(index) {
+                    continue;
+                }
                 let handle = start + u64::from(index) * step_u64;
                 self.mirror(index, handle, false);
                 mirrored += 1;
@@ -2909,6 +2959,9 @@ impl HostHeap {
                 }
                 seen_slot.store(key, Relaxed);
                 let index = first + off as u32;
+                if key == 0 && self.shows_none(index) {
+                    continue;
+                }
                 let handle = start + u64::from(index) * step_u64;
                 self.mirror(index, handle, false);
                 mirrored += 1;
@@ -2961,6 +3014,9 @@ impl HostHeap {
             }
             seen_slot.store(key, Relaxed);
             let index = first + off as u32;
+            if key == 0 && self.shows_none(index) {
+                continue;
+            }
             let handle = start + u64::from(index) * step;
             self.mirror(index, handle, false);
             mirrored += 1;
@@ -5362,6 +5418,18 @@ mod tests {
         );
         assert!(!mixed.made(5), "zeroed slot 5 must be cleared");
         assert!(mixed.made(7), "unchanged slot 7 stays made");
+
+        // Empty-slot fast-path: if `copied[4]` had a non-zero key (e.g. a deferred
+        // buffer view written with `for_draw = false`) while `shows_none(4)` is
+        // true, a subsequent zeroing updates `copied[4]` to 0 without mirroring.
+        assert!(mixed.shows_none(4));
+        mixed.copied_begin()[4].store(0x1234_5678, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            mixed.sync_copied_page(0, 16, start, TITLE_SLOT_BYTES, frame, &mut page_bytes),
+            (true, 16, 0, 13)
+        );
+        assert_eq!(mixed.copied_begin()[4].load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(!mixed.made(4));
     }
 
     #[test]

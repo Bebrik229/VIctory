@@ -166,6 +166,10 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Pages [`sync_heaps`] gives a worker thread at a time.
+#[cfg(windows)]
+const SYNC_PAGES: usize = 8;
+
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.
@@ -187,56 +191,114 @@ pub(crate) fn sync_heaps() {
     thread_local! {
         static PAGE_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    PAGE_BYTES.with(|cell| {
-        let mut page_bytes = cell.borrow_mut();
-        if page_bytes.len() < crate::watch::PAGE {
-            page_bytes.resize(crate::watch::PAGE, 0);
-        }
-        let frame = crate::frame::current();
-        let _syncing = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
-        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-        for &(start, end, at) in heaps.iter() {
-            // SAFETY: registered heaps are live (removed when dropped).
-            let heap = unsafe { &*(at as *const Heap) };
-            let (Some(Some(host)), Some(written), Some(step)) =
-                (heap.host.get(), &heap.written, increment(heap.desc.kind))
-            else {
-                continue;
-            };
-            let step = u64::from(step);
-            // Capped host heaps without a heap map have no counterparts for the
-            // title slots past `count`; with a heap map, every title slot has one.
-            let mirrored_count = heap.desc.count.min(host.mirrored_count());
-            // With `VICTORY_HEAP_SYNC_CUT`: only the pages that hold slots the
-            // host heap has mirrored counterparts for are taken and read ([`sync_cut`]).
-            let looked_end = if sync_cut() {
-                (start as usize)
-                    .saturating_add(mirrored_count as usize * step as usize)
-                    .min(end as usize)
-            } else {
-                end as usize
-            };
-            for (range_from, range_end) in written.take(start as usize, looked_end) {
-                let mut page = range_from & !(crate::watch::PAGE - 1);
-                while page < range_end {
-                    let from = page.max(range_from);
-                    let to = (page + crate::watch::PAGE).min(range_end);
-                    let slots = whole_slots(from, to, start as usize, step, mirrored_count);
-                    if !slots.is_empty() {
-                        let (page_ok, page_looked, page_mirrored, page_tabled) =
-                            host.sync_copied_page(slots.start, slots.end, start, step, frame, &mut page_bytes);
-                        if page_ok {
-                            pages += 1;
-                            looked += page_looked;
-                            mirrored += page_mirrored;
-                            tabled += page_tabled;
-                        }
-                    }
-                    page += crate::watch::PAGE;
+    let frame = crate::frame::current();
+    let _syncing = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(start, end, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(written), Some(step)) =
+            (heap.host.get(), &heap.written, increment(heap.desc.kind))
+        else {
+            continue;
+        };
+        let step = u64::from(step);
+        // Capped host heaps without a heap map have no counterparts for the
+        // title slots past `count`; with a heap map, every title slot has one.
+        let mirrored_count = heap.desc.count.min(host.mirrored_count());
+        // With `VICTORY_HEAP_SYNC_CUT`: only the pages that hold slots the
+        // host heap has mirrored counterparts for are taken and read ([`sync_cut`]).
+        let looked_end = if sync_cut() {
+            (start as usize)
+                .saturating_add(mirrored_count as usize * step as usize)
+                .min(end as usize)
+        } else {
+            end as usize
+        };
+        let mut parts: Vec<(u32, u32)> = Vec::new();
+        for (range_from, range_end) in written.take(start as usize, looked_end) {
+            let mut page = range_from & !(crate::watch::PAGE - 1);
+            while page < range_end {
+                let from = page.max(range_from);
+                let to = (page + crate::watch::PAGE).min(range_end);
+                let slots = whole_slots(from, to, start as usize, step, mirrored_count);
+                if !slots.is_empty() {
+                    parts.push((slots.start, slots.end));
                 }
+                page += crate::watch::PAGE;
             }
         }
-    });
+        if parts.is_empty() {
+            continue;
+        }
+        host.copied_begin();
+        if parts.len() <= SYNC_PAGES {
+            PAGE_BYTES.with(|cell| {
+                let mut page_bytes = cell.borrow_mut();
+                if page_bytes.len() < crate::watch::PAGE {
+                    page_bytes.resize(crate::watch::PAGE, 0);
+                }
+                for (slot_start, slot_end) in parts {
+                    let (page_ok, page_looked, page_mirrored, page_tabled) =
+                        host.sync_copied_page(slot_start, slot_end, start, step, frame, &mut page_bytes);
+                    if page_ok {
+                        pages += 1;
+                        looked += page_looked;
+                        mirrored += page_mirrored;
+                        tabled += page_tabled;
+                    }
+                }
+            });
+        } else {
+            let chunks: Vec<&[(u32, u32)]> = parts.chunks(SYNC_PAGES).collect();
+            let workers = std::thread::available_parallelism()
+                .map_or(4, |n| n.get().min(8))
+                .min(chunks.len());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let (p, l, m, t) = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(workers);
+                for _ in 0..workers {
+                    handles.push(s.spawn(|| {
+                        let mut page_bytes = vec![0u8; crate::watch::PAGE];
+                        let (mut p, mut l, mut m, mut t) = (0u64, 0u64, 0u64, 0u64);
+                        loop {
+                            let idx = next.fetch_add(1, Relaxed);
+                            let Some(&chunk) = chunks.get(idx) else {
+                                break;
+                            };
+                            for &(slot_start, slot_end) in chunk {
+                                let (page_ok, page_looked, page_mirrored, page_tabled) = host.sync_copied_page(
+                                    slot_start,
+                                    slot_end,
+                                    start,
+                                    step,
+                                    frame,
+                                    &mut page_bytes,
+                                );
+                                if page_ok {
+                                    p += 1;
+                                    l += page_looked;
+                                    m += page_mirrored;
+                                    t += page_tabled;
+                                }
+                            }
+                        }
+                        (p, l, m, t)
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .fold((0u64, 0u64, 0u64, 0u64), |acc, h| {
+                        let (p, l, m, t) = h.join().unwrap_or((0, 0, 0, 0));
+                        (acc.0 + p, acc.1 + l, acc.2 + m, acc.3 + t)
+                    })
+            });
+            pages += p;
+            looked += l;
+            mirrored += m;
+            tabled += t;
+        }
+    }
     if tabled > 0 {
         host::COPIED_TABLED.fetch_add(tabled, Relaxed);
     }
@@ -1506,6 +1568,69 @@ mod tests {
             assert!(!host.made(5));
             sync_heaps();
             assert!(host.made(5));
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// A placed shader-visible heap spanning more than `SYNC_PAGES` pages
+    /// fans out across worker threads in `sync_heaps` and mirrors descriptors
+    /// copied across every chunk.
+    #[cfg(windows)]
+    #[test]
+    fn sync_heaps_processes_many_pages_in_parallel() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let pages = SYNC_PAGES * 2;
+        let bytes = pages * crate::watch::PAGE;
+        let count = (bytes / 16) as u32;
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                bytes,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory as u64,
+            size: u64::from(count) * 16,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut elsewhere = [0u64; 2];
+            let source = elsewhere.as_mut_ptr() as u64;
+            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            create_sampler(std::ptr::null(), &sampler, source);
+            let slots_per_page = (crate::watch::PAGE / 16) as u32;
+            for p in 0..pages as u32 {
+                let idx = p * slots_per_page + 3;
+                // SAFETY: `idx` lies within `count` 16-byte sampler slots.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source as *const u8,
+                        memory.cast::<u8>().add(idx as usize * 16),
+                        16,
+                    )
+                };
+                assert!(!host.made(idx));
+            }
+            sync_heaps();
+            for p in 0..pages as u32 {
+                let idx = p * slots_per_page + 3;
+                assert!(host.made(idx), "parallel sync_heaps missed page {p} slot {idx}");
+            }
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
