@@ -220,9 +220,16 @@ extern "system" fn create_queue(
 
 /// The title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    static FLOOR_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let floor = *FLOOR_MB.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256)
+    }) << 20;
+    tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = u64::from(size).max(floor);
     }
     S_OK
 }
@@ -1953,5 +1960,16 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn set_staging_buffer_size_honors_256_mib_floor() {
+        let sched = scheduler().unwrap();
+        let prev = sched.lock().staging;
+        let set_size: extern "system" fn(*mut c_void, u32) -> HRESULT = call(factory(), 0x40);
+        assert_eq!(set_size(factory(), 32 << 20), S_OK);
+        let actual = sched.lock().staging;
+        sched.lock().staging = prev;
+        assert_eq!(actual, 256 << 20);
     }
 }

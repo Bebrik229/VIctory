@@ -30,6 +30,8 @@ pub(crate) struct Pending {
     /// Pass over the screen (no vertex inputs, no depth/stencil): fills
     /// lighting/LUT tables once, so it jumps the queue and gets its own budget.
     screen: bool,
+    scene_input: bool,
+    left_out: Option<&'static str>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
@@ -51,6 +53,61 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+fn bvh_builder() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+fn rt_resolve_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        bvh_builder() || std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "1")
+    })
+}
+
+fn activate_rays_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let env = std::env::var_os("VICTORY_ACTIVATE_RAYS");
+        if bvh_builder() {
+            env.is_none_or(|v| v != "0")
+        } else {
+            env.is_some_and(|v| v == "1")
+        }
+    })
+}
+
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !rt_resolve_on() && named(shaders, b"CS_RaytracingResolve") {
+        return Some("CS_RaytracingResolve");
+    }
+    if !activate_rays_on() && named(shaders, b"CS_ScreenProbes_ActivateRays") {
+        return Some("CS_ScreenProbes_ActivateRays");
+    }
+    None
+}
+
+fn scene_input(shaders: &[Arc<Shader>]) -> bool {
+    const PRODUCERS: [&str; 6] = [
+        "970c4fbb3b017c0e",
+        "068c90badc86f1fd",
+        "e4a7e088c7780ce8",
+        "ebe4e53f031f5249",
+        "2cc4c197ee29e291",
+        "369cbe906ea72764",
+    ];
+    shaders.iter().any(|s| {
+        PRODUCERS.contains(&s.hash.as_str())
+            || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
+    })
+}
+
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
@@ -61,13 +118,19 @@ impl Pending {
         if let Some(g) = &graphics {
             let _ = g.write_description(&mut super::Blake3Writer(&mut key));
         }
-        let screen = graphics.as_ref().is_some_and(|g| g.screen_pass());
+        let scene_input = scene_input(&shaders);
+        let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
+            && shaders.iter().all(|s| s.stage != "mesh"))
+            || scene_input;
+        let left_out = left_out(&shaders);
         Pending {
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             shaders,
             graphics,
             screen,
+            scene_input,
+            left_out,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -374,6 +437,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -444,6 +510,9 @@ fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) ->
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -451,9 +520,12 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_some() {
+        return;
+    }
+    if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        start(p, if p.scene_input { REQUESTED } else { EARLY });
     }
 }
 
@@ -841,5 +913,19 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &early_depth));
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &early_normal));
         assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn left_out_skips_raytracing_resolve_by_default() {
+        let rt_resolve = super::super::shader("compute", b"prefix CS_RaytracingResolve suffix");
+        let regular = super::super::shader("compute", b"prefix CS_RegularCompute suffix");
+
+        let skipped = Arc::new(Pending::new(vec![rt_resolve], None));
+        let kept = Arc::new(Pending::new(vec![regular], None));
+
+        assert_eq!(skipped.left_out, Some("CS_RaytracingResolve"));
+        assert!(ready(&skipped).is_none());
+        assert!(!now(&skipped));
+        assert_eq!(kept.left_out, None);
     }
 }

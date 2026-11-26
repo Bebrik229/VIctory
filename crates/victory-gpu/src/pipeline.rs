@@ -181,6 +181,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) tables: crate::draw::TablePlan,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
@@ -259,9 +260,11 @@ fn translate(full_hash: &[u8; 32], container: &[u8]) -> Result<Translated, Strin
         Ok((used, stores, address_stores))
     })?;
     let host = crate::shader_cache::host_shader(container)?;
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
     Ok(Translated {
         host,
         used,
+        tables,
         stores,
         address_stores,
     })

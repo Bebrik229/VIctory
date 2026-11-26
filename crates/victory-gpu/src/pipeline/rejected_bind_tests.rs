@@ -88,6 +88,7 @@ fn compute_pipeline(used: &[UsedResource]) -> HostPipeline {
                 root_indexed_views: Vec::new(),
             },
             used: used.to_vec(),
+            tables: crate::draw::TablePlan::new(used, &[]),
             stores: false,
             address_stores: false,
         })

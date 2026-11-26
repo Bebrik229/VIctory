@@ -719,6 +719,8 @@ impl Written {
                 at.cast::<u32>().write_unaligned(value as u32);
             } else {
                 at.cast::<u64>().write_unaligned(value);
+                #[cfg(windows)]
+                windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
             }
         }
     }

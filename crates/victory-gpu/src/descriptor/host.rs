@@ -185,6 +185,10 @@ pub(crate) struct HostHeap {
     /// A capped heap's views of the title's slots past `count`, for fresh
     /// tables to copy from ([`HostHeap::copy_overflow`]).
     overflow: Option<Overflow>,
+    /// Per-heap buffer sweep cache (16-bucket amortized view ranges + merged
+    /// shadow spans) and per-heap unwatched-buffer last-refresh frame map,
+    /// released automatically when this [`HostHeap`] is dropped.
+    pub(crate) buffer_sweep: crate::draw::BufferSweep,
 }
 
 #[cfg(test)]
@@ -1479,6 +1483,7 @@ impl HostHeap {
                 spans
             },
             overflow,
+            buffer_sweep: crate::draw::BufferSweep::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
