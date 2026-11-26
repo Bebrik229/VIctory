@@ -147,6 +147,10 @@ const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 
+/// The sampler heap we bind when the title binds none (a value no title heap
+/// address takes, distinct from `usize::MAX` in `host_state_lost`).
+const SAMPLERS_OURS: usize = usize::MAX - 1;
+
 thread_local! {
     /// While a draw is prepared (`State::bind`, then its targets' states):
     /// the depth target the draw only tests (0: none, or one it writes),
@@ -1831,6 +1835,22 @@ impl State {
         }
     }
 
+    /// The heaps a list must have bound before a root signature that indexes
+    /// them directly is set: the title's of each kind, and ours for a sampler
+    /// heap if it binds none — D3D12 requires a sampler heap to be bound
+    /// before such a signature (the debug layer's id 1419), and breaking that
+    /// rule removes the device on NVIDIA. Compute lists that only read views
+    /// are the case: they bind no sampler heap, and every signature we make
+    /// says its sampler heap is indexed directly.
+    fn wanted(title: [usize; 2]) -> [usize; 2] {
+        let sampler = if title[1] != 0 {
+            title[1]
+        } else {
+            SAMPLERS_OURS
+        };
+        [title[0], sampler]
+    }
+
     /// [`State::bind`] before a rejection's slots are given back.
     fn bind_attempt(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
@@ -1841,11 +1861,24 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
+        let want = Self::wanted(self.heaps);
+        if self.host_heaps != want {
             let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
             let mut n = 0;
-            for &h in &self.heaps {
-                if h != 0
+            for &h in &want {
+                if h == SAMPLERS_OURS {
+                    match crate::descriptor::fallback_samplers() {
+                        Some(host_heap) => {
+                            tracing::debug!("the title binds no sampler heap: binding ours");
+                            list.keep(&host_heap.heap);
+                            heaps[n] = Some(host_heap.heap.clone());
+                            n += 1;
+                        }
+                        None => {
+                            once!("no sampler heap of ours to bind");
+                        }
+                    }
+                } else if h != 0
                     && let Some(host_heap) = crate::descriptor::heap(h as This).host()
                 {
                     list.keep(&host_heap.heap);
@@ -1855,7 +1888,7 @@ impl State {
             }
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps[..n]) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = want;
             self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
@@ -4899,6 +4932,21 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A root signature that indexes the heaps directly needs a sampler heap
+    /// bound before it is set: our sampler heap stands in for a title that
+    /// binds none, which a compute list that only reads views does.
+    #[test]
+    fn a_list_without_a_sampler_heap_gets_ours() {
+        // The title binds both: nothing of ours.
+        assert_eq!(State::wanted([0x10, 0x20]), [0x10, 0x20]);
+        // Views only: our sampler heap after them.
+        assert_eq!(State::wanted([0x10, 0]), [0x10, SAMPLERS_OURS]);
+        // Neither: our sampler heap is still bound.
+        assert_eq!(State::wanted([0, 0]), [0, SAMPLERS_OURS]);
+        // A title sampler heap stays whatever the views are.
+        assert_eq!(State::wanted([0, 0x20]), [0, 0x20]);
+    }
 
     /// With a heap map, a table whose entries lie below the identity window
     /// is read in place, and one whose entries reach past it (its title

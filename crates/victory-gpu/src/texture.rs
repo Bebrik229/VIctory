@@ -72,6 +72,8 @@ pub(crate) struct Staging {
     /// Cached watch kind for `memory`: `0 = unknown`, `1 = write-watched`,
     /// `2 = view-guarded` (skips doomed `guarded = false` checks).
     watch_kind: std::sync::atomic::AtomicU8,
+    /// Pooled upload buffer size (`0` when not pooled).
+    pooled: u64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -226,7 +228,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    // An upload from title memory can have already used this view. Only
+    // a copy from the same GPU source can satisfy this read.
+    list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -241,7 +246,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -402,11 +407,97 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+struct Spare(ID3D12Resource, usize);
+// SAFETY: D3D12 upload buffers and their persistent mapped pointers are
+// free-threaded; ownership moves once through `SPARE`.
+unsafe impl Send for Spare {}
+
+static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
+pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn staging_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0"))
+}
+
+fn spare_most() -> u64 {
+    if crate::host::available_physical_ram().is_some_and(|avail| avail < 2 << 30) {
+        SPARE_MOST.1
+    } else {
+        SPARE_MOST.0
+    }
+}
+
+fn staging_buffer(
+    host: &crate::host::Host,
+    total: u64,
+) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let size = total.max(64 << 10).next_power_of_two();
+    if size > SPARE_MOST.1 || !staging_pool() {
+        SPARE_STATS[1].fetch_add(1, Relaxed);
+        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
+    }
+    let spare = {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let (spare, empty) = match all.0.get_mut(&size) {
+            Some(list) => (list.pop(), list.is_empty()),
+            None => (None, false),
+        };
+        if empty {
+            all.0.remove(&size);
+        }
+        if spare.is_some() {
+            all.1 -= size;
+        }
+        spare
+    };
+    if let Some(Spare(buffer, data)) = spare {
+        SPARE_STATS[0].fetch_add(1, Relaxed);
+        // SAFETY: `buffer` is an unshared staging upload mapping of `size >= total` bytes.
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
+        return Some((buffer, data as *mut u8, size));
+    }
+    SPARE_STATS[1].fetch_add(1, Relaxed);
+    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
+}
+
+pub(crate) fn spare_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let hits = SPARE_STATS[0].swap(0, Relaxed) as f64 / frames;
+    let misses = SPARE_STATS[1].swap(0, Relaxed) as f64 / frames;
+    if hits + misses > 0.0 {
+        let (kept, bytes) = {
+            let all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            (all.0.values().map(Vec::len).sum::<usize>(), all.1)
+        };
+        tracing::info!(
+            "texture staging buffers per frame (VICTORY_STAGING_POOL=1: now {}): {hits:.1} reused, {misses:.1} new ({kept} kept, {} MiB)",
+            if staging_pool() { "on" } else { "off" },
+            bytes >> 20
+        );
+    }
+}
+
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        if self.pooled != 0 {
+            let limit = spare_most();
+            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            if all.1 + self.pooled <= limit {
+                all.0
+                    .entry(self.pooled)
+                    .or_default()
+                    .push(Spare(self.buffer.clone(), self.data as usize));
+                all.1 += self.pooled;
+            }
+        }
     }
 }
 
@@ -1486,7 +1577,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, pooled) = staging_buffer(host, total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1516,6 +1607,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         watch_kind: std::sync::atomic::AtomicU8::new(0),
+        pooled,
     });
     map.insert(resource as usize, s.clone());
     Some(s)

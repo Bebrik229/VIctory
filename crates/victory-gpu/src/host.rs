@@ -2828,6 +2828,8 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Last GPU source copied into each aliased host texture in this list.
+    texture_aliases: FastMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -3442,6 +3444,15 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// First interval `(a, b)` in `written` where `a < to && b > from`.
+fn first_touch(written: &[(usize, usize)], from: usize, to: usize) -> Option<(usize, usize)> {
+    if from >= to {
+        return None;
+    }
+    let at = written.partition_point(|r| r.1 <= from);
+    written.get(at).copied().filter(|&(a, b)| a < to && b > from)
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -3449,34 +3460,72 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     if written.is_empty() {
         return None;
     }
+    static READ_DIAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for list in runs {
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    let hit = first_touch(written, src, src.saturating_add(len))
+                        .or_else(|| first_touch(written, dst, dst.saturating_add(len)));
+                    if let Some((w_from, w_to)) = hit {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            let n = READ_DIAG.fetch_add(1, Ordering::Relaxed);
+                            if n < 16 || n.is_multiple_of(256) {
+                                tracing::info!(
+                                    kind = "copy",
+                                    src = format_args!("{src:#x}"),
+                                    len,
+                                    dst = format_args!("{dst:#x}"),
+                                    w_from = format_args!("{w_from:#x}"),
+                                    w_to = format_args!("{w_to:#x}"),
+                                    hit = n,
+                                    "WHY_READ blocked flight settle"
+                                );
+                            }
                         }
                         return Some(WHY_READ);
                     }
                 }
                 Step::Fill(_) | Step::Fills(_) => {
-                    if step
-                        .fills()
-                        .iter()
-                        .any(|f| touches(written, f.src, f.src.saturating_add(f.len)))
-                    {
+                    if let Some((f, (w_from, w_to))) = step.fills().iter().find_map(|f| {
+                        first_touch(written, f.src, f.src.saturating_add(f.len)).map(|w| (f, w))
+                    }) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            let n = READ_DIAG.fetch_add(1, Ordering::Relaxed);
+                            if n < 16 || n.is_multiple_of(256) {
+                                tracing::info!(
+                                    kind = "fill",
+                                    src = format_args!("{:#x}", f.src),
+                                    len = f.len,
+                                    w_from = format_args!("{w_from:#x}"),
+                                    w_to = format_args!("{w_to:#x}"),
+                                    hit = n,
+                                    "WHY_READ blocked flight settle"
+                                );
+                            }
                         }
                         return Some(WHY_READ);
                     }
                 }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
-                    if touches(written, at, at + len) {
+                    if let Some((w_from, w_to)) = first_touch(written, at, at.saturating_add(len)) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            let n = READ_DIAG.fetch_add(1, Ordering::Relaxed);
+                            if n < 16 || n.is_multiple_of(256) {
+                                tracing::info!(
+                                    kind = "texture",
+                                    at = format_args!("{at:#x}"),
+                                    len,
+                                    w_from = format_args!("{w_from:#x}"),
+                                    w_to = format_args!("{w_to:#x}"),
+                                    hit = n,
+                                    "WHY_READ blocked flight settle"
+                                );
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -5027,12 +5076,18 @@ fn sync_batched() -> bool {
                             }
                             list.SetComputeRootShaderResourceView(1, w.shadow.buffer.GetGPUVirtualAddress());
                             list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            let joins = rehash_runs();
                             let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, w.shadow)) {
                                 vec![w.shadow.card_run(0, usize::MAX)]
                             } else {
-                                w.ranges.iter().map(|&(a, b)| w.shadow.card_run(a, b)).collect()
+                                // (The ranges are in order: the next one in the same
+                                // pieces, of the tens of thousands there are, says
+                                // nothing new, and is joined as the runs are built.
+                                // Belobug 30f7859.)
+                                let runs = w.ranges.iter().map(|&(a, b)| w.shadow.card_run(a, b));
+                                if joins { crate::shadow::piece_runs_in_order(runs) } else { runs.collect() }
                             };
-                            let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                            let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
                             CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                             CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                             let hashed = w.shadow.card_hashed().unwrap_or(w.size) as u32;
@@ -5060,10 +5115,15 @@ fn sync_batched() -> bool {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
+                        // The ranges are in order and joined where they overlap or
+                        // touch (`crate::shadow::card_dirty`): each is a copy of
+                        // bytes that changed and of no other.
                         for &(a, b) in ranges {
                             list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
-                            crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
+                        // (Counted once a copy, not once a range.)
+                        let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
+                        crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         synced.push(Synced { shadow, ranges, before, size });
                         if !batched {
@@ -7060,7 +7120,10 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        let old = std::mem::take(&mut *self.deferred());
+        if reaper_on() {
+            reap_one(Retired::Any(Box::new(old)));
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -8050,6 +8113,12 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
@@ -9061,6 +9130,7 @@ impl Meter {
         crate::shadow::back_line(frames);
         crate::shadow::placed_line();
         crate::plaincopy::line(frames);
+        crate::texture::spare_line(frames);
         {
             static MADE_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let made = LISTS[0].load(Ordering::Relaxed);

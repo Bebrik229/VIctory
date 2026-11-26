@@ -15,7 +15,10 @@
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
 //! garbage records cannot run for seconds either.
 //!
-//! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
+//! A draw record of 2^23 vertices or indices an instance, or more, is not a
+//! draw of the title's but what a stale window left there: it runs empty.
+//!
+//! shortcut: the bounds (2^23 vertices a draw, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
@@ -52,6 +55,8 @@ RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 static const uint CAP = BUDGET + 1u;
+// The vertices or indices an instance from which a draw record runs empty.
+static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 groupshared uint s_cost[64];
@@ -87,6 +92,18 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gtid : SV
             uint count = min(asked.x, 1u << 24);
             uint instances = min(asked.y, (1u << 26) / max(count, 1u));
             cost = count * instances;
+            // A record that asks for MOST_DRAW vertices or indices an
+            // instance or more is no draw of the title's (no mesh of a
+            // console title has 2.8 million triangles): it runs empty and
+            // charges nothing. fxceless's window check found one list with
+            // 90 draws of 2^24 vertices, one instance each: a window's
+            // records are charged once however often they are drawn, so all
+            // 90 ran, in the runs that lost the device.
+            if (count >= MOST_DRAW) {
+                count = 0;
+                instances = 0;
+                cost = 0;
+            }
             draw_counts = uint2(count, instances);
         } else if (kind == 2) {
             uint3 asked = src_args.Load3(src_at);
@@ -1816,9 +1833,11 @@ void main() {
 
         let mut initial_src = vec![0u8; total_bytes];
         for i in 0..RECORDS as usize {
+            // The first record is no draw (2^24 indices): it runs empty
+            // and charges nothing.
             let words: [u32; 6] = [
-                u32::MAX,                    // IndexCount -> clamps to 1 << 24
-                u32::MAX,                    // InstanceCount -> clamps to 4 (cost = 1 << 26)
+                if i == 0 { 1 << 24 } else { 1 << 22 }, // IndexCount
+                if i == 0 { 1 } else { u32::MAX }, // InstanceCount -> clamps to 16 (cost = 1 << 26)
                 1000 + i as u32,             // StartIndexLocation
                 (-200i32 + i as i32) as u32, // BaseVertexLocation
                 5000 + i as u32,             // StartInstanceLocation
@@ -1887,7 +1906,10 @@ void main() {
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
-            if rec[0] == (1 << 24) && rec[1] == 4 {
+            if rec[0] == (1 << 22) && rec[1] == 16 {
+                // Groups charge in the order they run: the first two real
+                // draws of whichever of the two groups came first.
+                assert!(matches!(i, 1 | 2 | 64 | 65), "record {i} is not a group's first");
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
@@ -1899,6 +1921,159 @@ void main() {
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+    }
+
+    /// A draw record of 2^23 vertices or indices an instance, or more, is no
+    /// draw of the title's: it runs empty and charges nothing, however it is
+    /// clamped (on its own, ahead of its draw, gathered). One just under is
+    /// left as it is.
+    #[test]
+    fn warp_draw_records_of_the_most_vertices_run_empty() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const MOST: u32 = 1 << 23;
+        // The count and instances a record asks for, and as clamped.
+        let cases: [([u32; 2], [u32; 2]); 5] = [
+            ([MOST, 1], [0, 0]),
+            ([MOST - 1, 1], [MOST - 1, 1]),
+            ([1 << 24, 1], [0, 0]),
+            ([u32::MAX, 3], [0, 0]),
+            ([3, 2], [3, 2]),
+        ];
+        let charged = (MOST - 1) + 3 * 2;
+        // The records `stride` bytes apart; two words after the counts.
+        let source = |stride: u32| {
+            let mut bytes = vec![0u8; cases.len() * stride as usize];
+            for (i, (asked, _)) in cases.iter().enumerate() {
+                let words = [asked[0], asked[1], 100 + i as u32, 200 + i as u32];
+                for (w, word) in words.into_iter().enumerate() {
+                    let at = i * stride as usize + w * 4;
+                    bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            bytes
+        };
+        let check = |out: &[u32], stride: u32, how: &str| {
+            for (i, (_, clamped)) in cases.iter().enumerate() {
+                let at = i * stride as usize / 4;
+                let expected = [clamped[0], clamped[1], 100 + i as u32, 200 + i as u32];
+                assert_eq!(out[at..at + 4], expected, "record {i}, {how}");
+            }
+        };
+        // Draws (16 bytes a record) and indexed draws (20).
+        for (kind, stride) in [(0u32, 16u32), (1, 20)] {
+            for ahead in [false, true] {
+                let src = source(stride);
+                let total = src.len();
+                let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+                let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+                let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
+                let dst_buf = warp.default_uav(total as u64);
+                // SAFETY: mapped buffers of these sizes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+                    std::ptr::write_bytes(budget_ptr, 0, 256);
+                    std::ptr::write_bytes(readback_ptr, 0, total);
+                }
+                assert!(record_clamp_as(
+                    &warp.clamp,
+                    &warp.list,
+                    &dst_buf,
+                    budget_gpu,
+                    (&src_buf, 0),
+                    None,
+                    (kind, stride, cases.len() as u32),
+                    ahead,
+                ));
+                done_on(&warp.list, &dst_buf);
+                // SAFETY: an open list; the scratch buffer is copied for the check.
+                unsafe {
+                    warp.list.ResourceBarrier(&[transition(
+                        &dst_buf,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+                    warp.list.ResourceBarrier(&[transition(
+                        &dst_buf,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+                warp.submit_and_wait();
+                // SAFETY: the work is done; mapped buffers.
+                let (spent, out) = unsafe {
+                    (
+                        (budget_ptr as *const u32).read_volatile(),
+                        std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4)
+                            .to_vec(),
+                    )
+                };
+                let how = format!("kind {kind}, ahead {ahead}");
+                check(&out, stride, &how);
+                assert_eq!(spent, charged, "empty records charge nothing ({how})");
+            }
+        }
+
+        // Gathered: the same indexed draws, each read from its own offset.
+        const STRIDE: u32 = 20;
+        let src = source(STRIDE);
+        let total = src.len();
+        let (src_buf, src_ptr, _) = warp.shared_buffer(4096);
+        let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(u64::from(GATHER_MOST) * 4);
+        let (budget_buf, budget_ptr, _) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(512);
+        let scratch = warp.default_uav(64 << 10);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0, 4096);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0, 512);
+        }
+        let mut set = GatherSet::new(
+            src_buf.clone(),
+            1,
+            (1, STRIDE),
+            scratch.clone(),
+            (table_gpu, table_ptr),
+        );
+        for i in 0..cases.len() as u32 {
+            assert_eq!(set.slot(i * STRIDE), Some(i));
+        }
+        let l2 = warp.list.cast::<ID3D12GraphicsCommandList2>().unwrap();
+        assert!(record_gathers_with(
+            &warp.clamp,
+            &warp.list,
+            &l2,
+            &[set.plan()],
+            &budget_buf,
+        ));
+        // SAFETY: an open list; the scratch buffer is copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &scratch,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &scratch, 0, total as u64);
+            warp.list.ResourceBarrier(&[transition(
+                &scratch,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (spent, out) = unsafe {
+            (
+                (budget_ptr as *const u32).read_volatile(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec(),
+            )
+        };
+        check(&out, STRIDE, "gathered");
+        assert_eq!(spent, charged, "empty records charge nothing (gathered)");
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
@@ -2247,16 +2422,20 @@ void main() {
         write_u32(&mut src, 32, &[11, 1, 1]);
 
         // Three huge indexed draws at src offsets 256, 320, 384 (each asks for
-        // 1<<24 * 4 = 1<<26 = BUDGET/2): with mode-7 serialization, draw A (1<<26)
+        // 1<<22 * 16 = 1<<26 = BUDGET/2): with mode-7 serialization, draw A (1<<26)
         // fits, draw B (1<<26) saturates BUDGET (actually mesh window already
         // spent (7+11)*128 = 2304, so draw A fits and draw B exceeds remaining
         // BUDGET and is deterministically zeroed, as is draw C!).
-        // Make draw A ask for (1<<24, 2) = 1<<25, draw B ask for (1<<24, 4) = 1<<26,
-        // draw C ask for (1<<24, 4) = 1<<26 -> A + B = 3<<25 + 2304 < 2^27 (BOTH
+        // Make draw A ask for (1<<22, 8) = 1<<25, draw B ask for (1<<22, 16) = 1<<26,
+        // draw C ask for (1<<22, 16) = 1<<26 -> A + B = 3<<25 + 2304 < 2^27 (BOTH
         // KEEP!), C pushes past 2^27 (DETERMINISTICALLY ZEROED!).
-        write_u32(&mut src, 256, &[1 << 24, 2, 101, 102, 103]);
-        write_u32(&mut src, 320, &[1 << 24, 4, 201, 202, 203]);
-        write_u32(&mut src, 384, &[1 << 24, 4, 301, 302, 303]);
+        write_u32(&mut src, 256, &[1 << 22, 8, 101, 102, 103]);
+        write_u32(&mut src, 320, &[1 << 22, 16, 201, 202, 203]);
+        write_u32(&mut src, 384, &[1 << 22, 16, 301, 302, 303]);
+        // Draw D at src offset 448, clamped before the others, is no draw
+        // (2^23 indices an instance): it runs empty and charges nothing, so
+        // A and B fit as they do without it.
+        write_u32(&mut src, 448, &[1 << 23, 1, 401, 402, 403]);
 
         // SAFETY: mapped buffers of sufficient capacity.
         unsafe {
@@ -2283,8 +2462,8 @@ void main() {
             .expect("mesh window bindings");
         record_hoisted_clamp(&warp.clamp, &warp.list, &b_mesh, chunk_gpu, &budget_buf, budget_gpu, true, true);
 
-        // Dispatches 2, 3, 4: indexed draws A, B, C at chunk offsets 64, 96, 128.
-        for (src_off, dst_off) in [(256u64, 64u64), (320, 96), (384, 128)] {
+        // Dispatches 2 to 5: indexed draws D, A, B, C at chunk offsets 160, 64, 96, 128.
+        for (src_off, dst_off) in [(448u64, 160u64), (256, 64), (320, 96), (384, 128)] {
             let b = prepare_clamp_bindings((&src_buf, src_off), None, (KIND_INDEXED, 20, 20, 1), false, false)
                 .expect("indexed draw bindings");
             record_hoisted_clamp(
@@ -2312,7 +2491,7 @@ void main() {
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            warp.list.CopyBufferRegion(&readback_buf, 0, &chunk_buf, 0, 160);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &chunk_buf, 0, 192);
             warp.list.ResourceBarrier(&[transition(
                 &chunk_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -2325,7 +2504,7 @@ void main() {
         let (spent, words) = unsafe {
             (
                 (budget_ptr as *const u32).read_volatile(),
-                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), 40).to_vec(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), 48).to_vec(),
             )
         };
         // Mesh window packed tightly at chunk offset 0 (dwords 0..12):
@@ -2334,11 +2513,13 @@ void main() {
         assert_eq!(&words[6..9], &[0, 0, 0], "unfilled mesh tail 2 zeroed");
         assert_eq!(&words[9..12], &[0, 0, 0], "unfilled mesh tail 3 zeroed");
         // Draw A at offset 64 (dword 16): kept.
-        assert_eq!(&words[16..21], &[1 << 24, 2, 101, 102, 103]);
+        assert_eq!(&words[16..21], &[1 << 22, 8, 101, 102, 103]);
         // Draw B at offset 96 (dword 24): kept.
-        assert_eq!(&words[24..29], &[1 << 24, 4, 201, 202, 203]);
+        assert_eq!(&words[24..29], &[1 << 22, 16, 201, 202, 203]);
         // Draw C at offset 128 (dword 32): deterministically zeroed past BUDGET.
         assert_eq!(&words[32..37], &[0, 0, 301, 302, 303]);
+        // Draw D at offset 160 (dword 40): no draw, empty though the budget had room.
+        assert_eq!(&words[40..45], &[0, 0, 401, 402, 403]);
         assert_eq!(spent, BUDGET_CAP, "budget saturated cleanly without wraparound");
     }
 
