@@ -25,6 +25,24 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
+fn parse_interval_ms(raw: Option<&str>) -> Option<Duration> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let ms = trimmed.parse::<f64>().ok()?;
+    if !ms.is_finite() {
+        return None;
+    }
+    if ms == 0.0 {
+        Some(Duration::from_micros(1))
+    } else if ms > 0.0 && ms <= 1000.0 {
+        Some(Duration::from_secs_f64(ms / 1000.0))
+    } else {
+        None
+    }
+}
+
 fn parse_fps_cap(raw: Option<&str>, title_interval: Duration) -> Duration {
     let Some(raw) = raw else {
         return title_interval;
@@ -46,11 +64,69 @@ fn parse_fps_cap(raw: Option<&str>, title_interval: Duration) -> Duration {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntervalSource {
+    Title,
+    FrameIntervalMs,
+    FpsCap,
+}
+
+fn resolve_interval(
+    interval_ms_raw: Option<&str>,
+    fps_cap_raw: Option<&str>,
+    title_interval: Duration,
+) -> (Duration, IntervalSource) {
+    if let Some(interval) = parse_interval_ms(interval_ms_raw) {
+        return (interval, IntervalSource::FrameIntervalMs);
+    }
+    let capped = parse_fps_cap(fps_cap_raw, title_interval);
+    if capped != title_interval {
+        return (capped, IntervalSource::FpsCap);
+    }
+    (title_interval, IntervalSource::Title)
+}
+
+#[cfg(test)]
 fn fps_cap_interval(title_interval: Duration) -> Duration {
     parse_fps_cap(
         std::env::var("VICTORY_FPS_CAP").ok().as_deref(),
         title_interval,
     )
+}
+
+fn configured_interval(title_interval: Duration) -> Duration {
+    let interval_ms_env = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok();
+    let fps_cap_env = std::env::var("VICTORY_FPS_CAP").ok();
+    let (interval, source) = resolve_interval(
+        interval_ms_env.as_deref(),
+        fps_cap_env.as_deref(),
+        title_interval,
+    );
+    match source {
+        IntervalSource::FrameIntervalMs => {
+            if interval != title_interval {
+                log_interval_ms_override(title_interval, interval);
+            }
+        }
+        IntervalSource::FpsCap => {
+            log_fps_cap_override(title_interval, interval);
+        }
+        IntervalSource::Title => {}
+    }
+    interval
+}
+
+fn log_interval_ms_override(title_interval: Duration, interval: Duration) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        let ms = std::env::var("VICTORY_FRAME_INTERVAL_MS").unwrap_or_default();
+        tracing::info!(
+            ms = ms.trim(),
+            ?title_interval,
+            ?interval,
+            "VICTORY_FRAME_INTERVAL_MS overrides frame interval"
+        );
+    });
 }
 
 fn log_fps_cap_override(title_interval: Duration, interval: Duration) {
@@ -94,10 +170,7 @@ pub(crate) extern "system" fn set_interval(
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    let interval = fps_cap_interval(title_interval);
-    if interval != title_interval {
-        log_fps_cap_override(title_interval, interval);
-    }
+    let interval = configured_interval(title_interval);
     tracing::info!(?interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
@@ -143,10 +216,7 @@ fn last(kind: u32) -> &'static AtomicU64 {
 fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| {
-        let interval = fps_cap_interval(SIXTIETH);
-        if interval != SIXTIETH {
-            log_fps_cap_override(SIXTIETH, interval);
-        }
+        let interval = configured_interval(SIXTIETH);
         Clock {
             start: Instant::now(),
             interval,
@@ -319,6 +389,61 @@ mod tests {
         assert_eq!(
             parse_fps_cap(Some("120"), title),
             Duration::from_micros(1_000_000 / 120)
+        );
+    }
+
+    #[test]
+    fn interval_ms_parses_and_takes_precedence_over_fps_cap() {
+        let title = Duration::from_micros(33_333);
+        assert_eq!(parse_interval_ms(None), None);
+        assert_eq!(parse_interval_ms(Some("")), None);
+        assert_eq!(parse_interval_ms(Some("   ")), None);
+        assert_eq!(parse_interval_ms(Some("-1")), None);
+        assert_eq!(parse_interval_ms(Some("1000.1")), None);
+        assert_eq!(parse_interval_ms(Some("NaN")), None);
+        assert_eq!(parse_interval_ms(Some("inf")), None);
+        assert_eq!(parse_interval_ms(Some("fast")), None);
+        assert_eq!(parse_interval_ms(Some("0")), Some(Duration::from_micros(1)));
+        assert_eq!(
+            parse_interval_ms(Some(" 0.0 ")),
+            Some(Duration::from_micros(1))
+        );
+        assert_eq!(
+            parse_interval_ms(Some("16.667")),
+            Some(Duration::from_secs_f64(16.667 / 1000.0))
+        );
+        assert_eq!(
+            parse_interval_ms(Some("1000")),
+            Some(Duration::from_secs(1))
+        );
+
+        // VICTORY_FRAME_INTERVAL_MS overrides VICTORY_FPS_CAP when both are set.
+        assert_eq!(
+            resolve_interval(Some("16.667"), Some("0"), title),
+            (
+                Duration::from_secs_f64(16.667 / 1000.0),
+                IntervalSource::FrameIntervalMs
+            )
+        );
+        assert_eq!(
+            resolve_interval(Some("0"), Some("30"), title),
+            (Duration::from_micros(1), IntervalSource::FrameIntervalMs)
+        );
+        // Malformed or unset VICTORY_FRAME_INTERVAL_MS falls back to VICTORY_FPS_CAP.
+        assert_eq!(
+            resolve_interval(None, Some("60"), title),
+            (Duration::from_micros(1_000_000 / 60), IntervalSource::FpsCap)
+        );
+        assert_eq!(
+            resolve_interval(Some("invalid"), Some("120"), title),
+            (
+                Duration::from_micros(1_000_000 / 120),
+                IntervalSource::FpsCap
+            )
+        );
+        assert_eq!(
+            resolve_interval(None, None, title),
+            (title, IntervalSource::Title)
         );
     }
 }

@@ -47,6 +47,10 @@ pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]
+mod port;
+#[cfg(windows)]
+pub mod port_descriptors;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;

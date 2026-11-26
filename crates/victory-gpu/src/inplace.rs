@@ -168,6 +168,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// Counts a window or title buffer placed in memory of its own outside
+/// this module ([`crate::port`]).
+pub(crate) fn counted(window: bool, bytes: u64) {
+    let at = if window { 0 } else { 2 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// What [`place_for`] or [`place_section_window`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64, section: bool) {
     let at = if window { 0 } else { 2 };
@@ -376,6 +384,7 @@ pub(crate) fn place_section_window(
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -855,6 +864,50 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views_read().views, at, len)
 }
 
+fn stretch_in(
+    views: &BTreeMap<usize, (usize, usize, u64)>,
+    at: usize,
+    len: usize,
+) -> Option<(usize, usize, usize, u64)> {
+    let end = at.checked_add(len.max(1))?;
+    let (&base, &(bytes, section, offset)) = views
+        .range(..=at)
+        .next_back()
+        .filter(|(b, view)| *b + view.0 > at)?;
+    let mut run_start = base;
+    let mut run_end = base.checked_add(bytes)?;
+    let mut run_offset = offset;
+    while let Some(&(nbytes, ns, noff)) = views.get(&run_end) {
+        if ns == section && noff == run_offset + (run_end - run_start) as u64 {
+            run_end = run_end.checked_add(nbytes)?;
+        } else {
+            break;
+        }
+    }
+    if run_end < end {
+        return None;
+    }
+    while let Some((&pbase, &(pbytes, ps, poff))) = views.range(..run_start).next_back() {
+        if ps == section
+            && pbase.checked_add(pbytes) == Some(run_start)
+            && poff.checked_add(pbytes as u64) == Some(run_offset)
+        {
+            run_start = pbase;
+            run_offset = poff;
+        } else {
+            break;
+        }
+    }
+    Some((run_start, run_end - run_start, section, run_offset))
+}
+
+/// If `[at, at + len)` is one run of one section, returns the maximal
+/// contiguous stretch of views around it that follow one another in that
+/// section: `(first_address, total_bytes, section, section_offset)`.
+pub(crate) fn stretch(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    stretch_in(&views_read().views, at, len)
+}
+
 /// Whether `[at, at + len)` is private memory, all committed and
 /// read-write: what [`From::Part`] takes. One question to Windows (it
 /// walks the page tables to the end of the pages that share the first
@@ -881,7 +934,7 @@ fn hr<T>(result: &windows::core::Result<T>) -> String {
 
 /// A queue, a list and a fence of the probe's own on `device`: nothing of
 /// the host's submissions is touched.
-struct Rig {
+pub(crate) struct Rig {
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
@@ -901,7 +954,7 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
+    pub(crate) fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
         // SAFETY: plain creation of objects of our own.
         unsafe {
             let queue: ID3D12CommandQueue =
@@ -946,7 +999,7 @@ impl Rig {
     }
 
     /// What the GPU reads of `size` bytes of `resource` from `offset`.
-    fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
+    pub(crate) fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
         let back = self.committed(D3D12_HEAP_TYPE_READBACK, size as u64, D3D12_RESOURCE_STATE_COPY_DEST)?;
         // SAFETY: two live buffers, the range inside both.
         self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) })?;
@@ -961,7 +1014,7 @@ impl Rig {
     }
 
     /// The GPU writes `bytes` at `offset` of `resource` (a copy).
-    fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
+    pub(crate) fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
         let up = self.committed(D3D12_HEAP_TYPE_UPLOAD, bytes.len() as u64, D3D12_RESOURCE_STATE_GENERIC_READ)?;
         let mut data = std::ptr::null_mut();
         // SAFETY: the mapping holds the buffer's bytes until unmapped.
@@ -1528,7 +1581,7 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over
@@ -1551,6 +1604,22 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    #[test]
+    fn a_stretch_is_the_views_around_a_run_that_follow_in_the_section() {
+        let mut views = BTreeMap::new();
+        let at = 0x7_0000_0000usize;
+        views.insert(at, (4 * K64, 9, 16 * K64 as u64));
+        views.insert(at + 4 * K64, (2 * K64, 9, 20 * K64 as u64));
+        views.insert(at + 6 * K64, (K64, 9, 3 * K64 as u64));
+        views.insert(at + 8 * K64, (K64, 9, 4 * K64 as u64));
+        assert_eq!(stretch_in(&views, at + K64, 2 * K64), Some((at, 6 * K64, 9, 16 * K64 as u64)));
+        assert_eq!(stretch_in(&views, at + 4 * K64, K64), Some((at, 6 * K64, 9, 16 * K64 as u64)));
+        assert_eq!(stretch_in(&views, at + 6 * K64, K64), Some((at + 6 * K64, K64, 9, 3 * K64 as u64)));
+        assert_eq!(stretch_in(&views, at, 7 * K64), None);
+        assert_eq!(stretch_in(&views, at + 6 * K64, 3 * K64), None);
+        assert_eq!(stretch_in(&views, at + 7 * K64, K64), None);
     }
 
     /// What the runtime forgets when memory is mapped anew.

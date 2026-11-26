@@ -147,6 +147,33 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    if victory_hle::port_descriptors::on() {
+        use victory_loader::descriptor_sites::{Hooked, SITES, apply};
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, nothing of it has run yet, and the marks are a static.
+        let done = unsafe {
+            apply(
+                image.base(),
+                size,
+                victory_hle::port_descriptors::marks_address(),
+                &SITES,
+            )
+        };
+        let patched = done.iter().filter(|d| **d == Hooked::Done).count();
+        println!(
+            "renderer port 2: {patched} of {} descriptor record stores of the title patched",
+            SITES.len()
+        );
+        victory_hle::port_descriptors::hooked(image.base(), size, patched);
+    }
+    {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and no thread runs its code yet.
+        unsafe {
+            victory_loader::resolution::apply_asked(image.base(), size);
+            victory_loader::frame_rate::apply_asked(image.base(), size);
+        }
+    }
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main

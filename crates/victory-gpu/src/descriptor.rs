@@ -158,6 +158,7 @@ fn mirror(handle: u64) {
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
+    crate::port_descriptors::mark(handle);
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -420,6 +421,123 @@ pub(crate) fn sync_heaps() {
         } else {
             end as usize
         };
+        if crate::port_descriptors::adopted(start) {
+            let max_slots = (crate::watch::PAGE / step as usize).max(1) as u32;
+            let mut parts: Vec<(u32, u32)> = Vec::new();
+            for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
+                let mut cur = first.min(mirrored_count);
+                let stop = first.saturating_add(n).min(mirrored_count);
+                while cur < stop {
+                    let chunk_end = cur.saturating_add(max_slots).min(stop);
+                    parts.push((cur, chunk_end));
+                    cur = chunk_end;
+                }
+            }
+            if crate::port_descriptors::ask_due(frame) {
+                let taken = written.take(start as usize, looked_end);
+                crate::port_descriptors::asked(&taken);
+            }
+            let check_pages = crate::port_descriptors::to_check(frame);
+            let mut check_parts: Vec<(u32, u32)> = Vec::new();
+            for page in check_pages {
+                let from = page.max(start as usize);
+                let to = (page + crate::watch::PAGE).min(looked_end);
+                let slots = whole_slots(from, to, start as usize, step, mirrored_count);
+                if !slots.is_empty() {
+                    check_parts.push((slots.start, slots.end));
+                }
+            }
+            if parts.is_empty() && check_parts.is_empty() {
+                continue;
+            }
+            host.copied_begin();
+            PAGE_BYTES.with(|cell| {
+                let mut page_bytes = cell.borrow_mut();
+                if page_bytes.len() < crate::watch::PAGE {
+                    page_bytes.resize(crate::watch::PAGE, 0);
+                }
+                if !parts.is_empty() {
+                    if parts.len() <= SYNC_PAGES {
+                        for &(slot_start, slot_end) in &parts {
+                            let (page_ok, page_looked, page_mirrored, page_tabled) =
+                                host.sync_copied_page(slot_start, slot_end, start, step, frame, &mut page_bytes);
+                            if page_ok {
+                                pages += 1;
+                                looked += page_looked;
+                                mirrored += page_mirrored;
+                                tabled += page_tabled;
+                            }
+                        }
+                    } else {
+                        let (p, l, m, t) =
+                            SyncPool::get().run(host, &parts, start, step, frame, &mut page_bytes);
+                        pages += p;
+                        looked += l;
+                        mirrored += m;
+                        tabled += t;
+                    }
+                }
+                if !check_parts.is_empty() {
+                    let check_started = std::time::Instant::now();
+                    let copied = host.copied_begin();
+                    let mut before_keys = Vec::new();
+                    for (slot_start, slot_end) in check_parts {
+                        before_keys.clear();
+                        before_keys.extend(
+                            copied[slot_start as usize..slot_end as usize]
+                                .iter()
+                                .map(|s| s.load(Relaxed)),
+                        );
+                        let (page_ok, page_looked, page_mirrored, page_tabled) =
+                            host.sync_copied_page(slot_start, slot_end, start, step, frame, &mut page_bytes);
+                        if !page_ok {
+                            continue;
+                        }
+                        pages += 1;
+                        looked += page_looked;
+                        mirrored += page_mirrored;
+                        tabled += page_tabled;
+                        let byte_len = (slot_end - slot_start) as usize * step as usize;
+                        if page_tabled > 0
+                            && !crate::host::read_into(
+                                (start + u64::from(slot_start) * step) as *const u8,
+                                &mut page_bytes[..byte_len],
+                            )
+                        {
+                            continue;
+                        }
+                        let samplers = heap.samplers();
+                        for (off, record) in page_bytes[..byte_len]
+                            .chunks_exact(step as usize)
+                            .enumerate()
+                        {
+                            let tag = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+                            let key = if tag == VIEW_TAG {
+                                u64::from_le_bytes([
+                                    record[4], record[5], record[6], record[7],
+                                    record[8], record[9], record[10], record[11],
+                                ])
+                            } else {
+                                0
+                            };
+                            if key != before_keys[off] {
+                                let index = slot_start + off as u32;
+                                let is_tabled = copied[index as usize].load(Relaxed) != key;
+                                crate::port_descriptors::missed(
+                                    index,
+                                    start + u64::from(index) * step,
+                                    !samplers && tag == VIEW_TAG,
+                                    is_tabled,
+                                );
+                            }
+                        }
+                    }
+                    crate::port_descriptors::CHECKED[4]
+                        .fetch_add(check_started.elapsed().as_nanos() as u64, Relaxed);
+                }
+            });
+            continue;
+        }
         let mut parts: Vec<(u32, u32)> = Vec::new();
         for (span_from, span_to) in
             host.untabled_watch_spans(start as usize, looked_end, step, mirrored_count, frame)
@@ -630,6 +748,7 @@ fn sync_cut() -> bool {
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    crate::port_descriptors::line(frames);
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if pages == 0 {
         return;
@@ -739,6 +858,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
+        crate::port_descriptors::let_go(self.start);
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
@@ -957,7 +1077,7 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
 });
-const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
 /// them as one 64-bit key per slot). The top two bits of `generation` say
@@ -1726,6 +1846,9 @@ pub(crate) extern "system" fn create_heap(
     });
     #[cfg(windows)]
     if visible {
+        if placed && desc.kind == VIEWS_KIND {
+            crate::port_descriptors::adopt(start, desc.count);
+        }
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));

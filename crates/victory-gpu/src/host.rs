@@ -8175,6 +8175,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -8186,6 +8187,9 @@ impl HostList {
                     #[cfg(not(feature = "diagnostics"))]
                     let started = std::time::Instant::now();
                     let fills = step.fills();
+                    for fill in fills {
+                        crate::port::filled(fill.src, fill.len);
+                    }
                     let bytes = run_fills(fills, fill_workers());
                     #[cfg(feature = "diagnostics")]
                     {
@@ -9129,6 +9133,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         crate::shadow::placed_line();
+        crate::port::log(frames);
         crate::plaincopy::line(frames);
         crate::texture::spare_line(frames);
         {

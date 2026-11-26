@@ -1442,6 +1442,11 @@ fn query_writes_as<T>(
         crate::copystat::add(crate::copystat::C::WatchKnownView, 1);
         return None;
     }
+    if !guarded && crate::inplace::is_view_at(start) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WatchKnownView, 1);
+        return None;
+    }
     // Miss path: hold `WATCH_ASK` across both the syscall and the brief
     // `JOURNAL.write()` commit so overlapping misses cannot race on
     // `WRITE_WATCH_FLAG_RESET` or `guard()`, while `JOURNAL` remains unlocked
@@ -3129,6 +3134,8 @@ fn install() {
                     g.hot_pins.retain(|_, &mut until| until > epoch);
                 }
             }
+            drop(g);
+            crate::port_descriptors::faulted(at, r.ExceptionAddress as usize);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {

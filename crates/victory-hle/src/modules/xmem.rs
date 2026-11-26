@@ -10,7 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
@@ -103,6 +103,11 @@ pub extern "system" fn XMemVirtualAlloc(
     )
 }
 
+/// 32-bit uncommitted reservations `(address, bytes)` recorded by
+/// `XMemVirtualAlloc` so `VICTORY_PORT_CONSTANTS=1` can arrange physical
+/// slices in address order when mapped into them.
+static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
 fn virtual_alloc(
     base: *mut c_void,
     size: usize,
@@ -189,6 +194,12 @@ fn virtual_alloc(
         // caller's last byte can be in the next 64 KiB watch block.
         let start = if base.is_null() { at } else { base };
         on_commit(start as usize, size);
+    }
+    if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
+        LOW_RESERVATIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((at as usize, size));
     }
     at
 }
@@ -370,7 +381,29 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE, bool);
+struct Section {
+    handle: HANDLE,
+    sec_committed: bool,
+    pages: usize,
+    /// Per-slice bitset tracking whether each slice has ever been mapped or
+    /// committed; unmapped slices remain fresh untouched zeros even when
+    /// `VICTORY_XMEM_COMMIT=1`.
+    committed: Vec<AtomicU64>,
+}
+
+impl Section {
+    fn mark_mapped(&self, first: usize, count: usize) {
+        for idx in first..first.saturating_add(count).min(self.pages) {
+            self.committed[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
+        }
+    }
+
+    fn is_mapped(&self, index: usize) -> bool {
+        self.committed
+            .get(index / 64)
+            .is_some_and(|w| (w.load(Ordering::Acquire) & (1u64 << (index % 64))) != 0)
+    }
+}
 
 /// Whether physical sections should be pre-committed with `SEC_COMMIT`.
 /// Defaults to `on_wine()`, overridable with `VICTORY_XMEM_COMMIT=1|0`.
@@ -391,7 +424,7 @@ unsafe impl Sync for Section {}
 impl Drop for Section {
     fn drop(&mut self) {
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -539,7 +572,12 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, committed);
-    let section = Arc::new(Section(handle, committed));
+    let section = Arc::new(Section {
+        handle,
+        sec_committed: committed,
+        pages: n,
+        committed: (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+    });
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -589,7 +627,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -600,7 +638,11 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len, slice.section.1).then_some(view)
+        if !commit(at.Value as usize, len, slice.section.sec_committed) {
+            return None;
+        }
+        slice.section.mark_mapped(slice.index, n);
+        Some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -756,6 +798,94 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     }
 }
 
+fn port_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// When `VICTORY_PORT_CONSTANTS=1` and `pages` are mapped into a 32-bit
+/// uncommitted reservation from [`LOW_RESERVATIONS`], reorders unmapped
+/// slices of their backing section so `[base, base + pages.len() * PAGE)`
+/// maps consecutive slices in address order.
+fn arrange(base: usize, pages: &[usize]) {
+    arrange_in(&mut physical(), base, pages);
+}
+
+fn arrange_in(physical: &mut Physical, base: usize, pages: &[usize]) {
+    if pages.is_empty() {
+        return;
+    }
+    let Some(span) = pages.len().checked_mul(PAGE) else {
+        return;
+    };
+    let Some(end) = base.checked_add(span) else {
+        return;
+    };
+    let reservation = {
+        let low = LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        low.iter()
+            .rev()
+            .copied()
+            .find(|&(at, size)| base >= at && end <= at.saturating_add(size))
+    };
+    let Some((res_base, bytes)) = reservation else {
+        return;
+    };
+    if !(base - res_base).is_multiple_of(PAGE) {
+        return;
+    }
+    let first_slot = (base - res_base) / PAGE;
+    let Some(section) = physical.pages.get(&pages[0]).map(|s| s.section.clone()) else {
+        return;
+    };
+    if section.pages * PAGE < bytes || first_slot + pages.len() > section.pages {
+        return;
+    }
+    let mut already = true;
+    let mut seen = std::collections::HashSet::with_capacity(pages.len());
+    for (k, page) in pages.iter().enumerate() {
+        let Some(slice) = physical.pages.get(page) else {
+            return;
+        };
+        if !Arc::ptr_eq(&slice.section, &section)
+            || section.is_mapped(slice.index)
+            || !seen.insert(*page)
+        {
+            return;
+        }
+        if slice.index != first_slot + k {
+            already = false;
+        }
+    }
+    if already {
+        return;
+    }
+    let mut by_index: HashMap<usize, usize> = HashMap::with_capacity(section.pages);
+    for (&page, slice) in &physical.pages {
+        if Arc::ptr_eq(&slice.section, &section) {
+            by_index.insert(slice.index, page);
+        }
+    }
+    for k in 0..pages.len() {
+        let target = first_slot + k;
+        if section.is_mapped(target) || !by_index.contains_key(&target) {
+            return;
+        }
+    }
+    for (k, &page) in pages.iter().enumerate() {
+        let target = first_slot + k;
+        let cur = physical.pages[&page].index;
+        if cur == target {
+            continue;
+        }
+        let other = by_index[&target];
+        physical.pages.get_mut(&page).unwrap().index = target;
+        physical.pages.get_mut(&other).unwrap().index = cur;
+        by_index.insert(target, page);
+        by_index.insert(cur, other);
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -785,6 +915,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    if port_on() {
+        arrange_in(&mut physical, base, pages);
+    }
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
@@ -893,7 +1026,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     let replace = || unsafe {
         // SAFETY: maps the section over a matching placeholder range.
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -933,15 +1066,16 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len, slice.section.1) {
+    if !commit(base, len, slice.section.sec_committed) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    slice.section.mark_mapped(slice.index, len.div_ceil(PAGE));
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
@@ -1798,6 +1932,69 @@ mod tests {
             assert_eq!(view.Value.cast::<u8>().read(), 0x5a);
             assert_ne!(UnmapViewOfFile(view), 0);
             assert_ne!(CloseHandle(handle), 0);
+        }
+    }
+
+    #[test]
+    fn the_32_bit_heap_gets_its_slices_in_address_order() {
+        let res = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            GRAPHICS | ADDRESS_32BIT,
+            PAGE_NOACCESS,
+        );
+        assert!(!res.is_null() && (res as usize) + 4 * PAGE <= 1usize << 32);
+        let base = res as usize;
+        assert!(
+            LOW_RESERVATIONS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|&(at, size)| at == base && size == 4 * PAGE)
+        );
+        let pages = allocate(4);
+        // Smaller section than the reservation is left unchanged.
+        let small = allocate(2);
+        let small_idx0 = physical().pages[&small[0]].index;
+        arrange(base, &small);
+        assert_eq!(physical().pages[&small[0]].index, small_idx0);
+        assert_eq!(XMemFreePhysicalPages(2, small.as_ptr()), 1);
+
+        // Map pages[0..2] into the second half of the reservation, then
+        // pages[2..4] into the first half; `arrange` swaps unmapped slices
+        // so both views end up consecutive in address order in the section.
+        let hi = base + 2 * PAGE;
+        arrange(hi, &pages[0..2]);
+        assert_eq!(physical().pages[&pages[0]].index, 2);
+        assert_eq!(physical().pages[&pages[1]].index, 3);
+        assert_eq!(XMemMapPhysicalPages(hi as *mut c_void, 2, pages[0..2].as_ptr()) as usize, hi);
+
+        arrange(base, &pages[2..4]);
+        assert_eq!(physical().pages[&pages[2]].index, 0);
+        assert_eq!(physical().pages[&pages[3]].index, 1);
+        assert_eq!(XMemMapPhysicalPages(res, 2, pages[2..4].as_ptr()), res);
+
+        {
+            let p = physical();
+            let v0 = &p.views[&base];
+            let v1 = &p.views[&hi];
+            assert_eq!(v0.0, 2 * PAGE);
+            assert_eq!(v0.1.index, 0);
+            assert_eq!(v1.0, 2 * PAGE);
+            assert_eq!(v1.1.index, 2);
+            assert!(Arc::ptr_eq(&v0.1.section, &v1.1.section));
+            assert!(v0.1.section.is_mapped(0));
+            assert!(v0.1.section.is_mapped(2));
+        }
+
+        // Unmap and clean up.
+        assert_eq!(XMemMapPhysicalPages(res, 4, std::ptr::null()), res);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        // SAFETY: `res` was split into two placeholders when mapped; release each.
+        unsafe {
+            assert_ne!(VirtualFree(res, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(hi as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 }
