@@ -77,6 +77,8 @@ pub(crate) struct Usage {
     pub doubles: bool,
     /// Pull-model / `attributeAtVertex` barycentric interpolation.
     pub barycentrics: bool,
+    /// Native 16-bit floats or integers.
+    pub native16: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -1003,6 +1005,7 @@ impl Module {
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
         let is_double = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Double;
+        let narrow = |ty: Ty| matches!(self.types[ty.0 as usize], TypeDef::Half | TypeDef::Int(16));
         // The first field of a handle's annotation: its kind, with the UAV
         // bit; the second: the component type and count.
         let annotation = |h: V| -> Option<(i64, i64)> {
@@ -1032,10 +1035,12 @@ impl Module {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
                 u.doubles |= is_double(inst.ty);
+                u.native16 |= narrow(inst.ty);
                 for_each_operand(&inst.op, |v| {
                     let ty = self.type_of(v);
                     u.int64 |= wide(ty);
                     u.doubles |= is_double(ty);
+                    u.native16 |= narrow(ty);
                 });
                 let Op::Call(f, args) = &inst.op else {
                     continue;

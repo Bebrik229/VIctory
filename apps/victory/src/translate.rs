@@ -539,7 +539,9 @@ fn translate_programs(container: &Container, hash: &str, programs: Vec<NativePro
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
                     // (by its hash, as at run time: the per-program switches, `VICTORY_WAVE_WHY`)
-                    match emit::for_program(hash, || emit::emit(container, &p, &program, &s, &i, &r)) {
+                    // f16 arithmetic in f32, as on any host (`--warm` translates as this host does).
+                    let options = emit::Options { native16: false };
+                    match emit::for_program(hash, || emit::emit_with(container, &p, &program, &s, &i, &r, options)) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;

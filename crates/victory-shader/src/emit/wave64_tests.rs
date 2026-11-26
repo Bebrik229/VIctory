@@ -119,6 +119,7 @@ fn lowered_on(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        native16: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
@@ -552,6 +553,7 @@ fn lowered_with_stats(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        native16: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     let l = l?;

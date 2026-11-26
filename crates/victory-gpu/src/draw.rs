@@ -239,11 +239,12 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
-    /// What the host list has: pipeline, root signature, heaps.
+    /// What the host list has: pipeline, root signature, heaps, targets.
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    host_targets: HostTargets,
     /// Host pipelines and root signatures already kept on the current host list
     /// (`list.keep` / `list.used_pipeline`), cleared only when the host list
     /// resets or switches (`State::reset` / `State::replay`).
@@ -272,6 +273,45 @@ pub(crate) struct State {
     bind_made: Vec<BindMade>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+}
+
+/// One render target or depth view currently bound on the host list: keeps the
+/// host texture alive while cached so its COM pointer cannot be reused for a
+/// different resource (`None` for a typed null RT).
+struct BoundTarget {
+    texture: Option<ID3D12Resource>,
+    desc: Option<[u32; 6]>,
+}
+
+impl BoundTarget {
+    fn same(&self, other: &Self) -> bool {
+        self.texture.as_ref().map(ID3D12Resource::as_raw)
+            == other.texture.as_ref().map(ID3D12Resource::as_raw)
+            && self.desc == other.desc
+    }
+}
+
+/// The render targets and depth view currently bound on the host list.
+struct BoundTargets {
+    rtvs: Vec<BoundTarget>,
+    dsv: Option<BoundTarget>,
+}
+
+/// Host-side render-target binding cache for one command list.
+#[derive(Default)]
+struct HostTargets {
+    /// Currently bound views (`None` until set, or after reset/replay/external).
+    bound: Option<BoundTargets>,
+    /// Reused across calls so cache hits allocate nothing; always empty
+    /// outside [`State::set_targets`].
+    scratch: Vec<BoundTarget>,
+    /// Counters of actual host binds and descriptor ring allocations (tests).
+    #[cfg(test)]
+    binds: u32,
+    #[cfg(test)]
+    rtv_creates: u32,
+    #[cfg(test)]
+    dsv_creates: u32,
 }
 
 /// An entry a bind added to one of [`State`]'s per-list slot maps.
@@ -406,6 +446,17 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
+/// Per host heap, for [`State::heap_buffers`]: bucketed host copies and ranges
+/// each slot's buffer view reads (at module level so the marked pass can have
+/// this one start anew: [`State::heap_buffers_marked`]).
+static RANGES: std::sync::Mutex<
+    Option<std::collections::HashMap<usize, HeapBufferCache<std::sync::Arc<crate::shadow::Shadow>>>>,
+> = std::sync::Mutex::new(None);
+/// Per host heap, for [`State::heap_buffers_marked`]: what the marked pass
+/// keeps (`VICTORY_HEAP_PASS_MARKED`; nothing while that is unset).
+type Marked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
+static MARKED: std::sync::Mutex<Option<std::collections::HashMap<usize, Marked>>> =
+    std::sync::Mutex::new(None);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Where the pass over textures picked by index records its uploads: into
 /// a list of the title's, or into lists of the thread that runs it ahead.
@@ -1125,19 +1176,32 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Others recorded into the host list (`crate::external`): its heaps,
+    /// root signatures, pipeline and render targets are set again before the
+    /// next draw, dispatch or target bind.
+    #[allow(dead_code)]
+    pub(crate) fn host_state_lost(&mut self) {
+        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        self.host_targets.bound = None;
+    }
+
+    /// Render targets and depth, set on the host list at once (skipped when the
+    /// host list already has the same resolved host textures and view
+    /// descriptions).
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        if self.target_handles.as_slice() != handles {
+            self.target_handles.clear();
+            self.target_handles.extend_from_slice(handles);
+        }
+        self.depth_handle = depth;
+        self.targets_set = true;
         let Some(host) = crate::host::host() else {
             return;
         };
-        self.target_handles.clear();
-        self.target_handles.extend_from_slice(handles);
-        self.depth_handle = depth;
-        self.targets_set = true;
         self.targets.clear();
+        self.host_targets.scratch.clear();
         // The formats of the host views, for the draws' pipelines.
         let mut formats = [0; 9];
-        let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1153,32 +1217,40 @@ impl State {
                 // targets.
                 // shortcut: a view without a description or a format has no
                 // null view to stand for it and is left out, as before.
-                let null = record
-                    .desc()
-                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
-                if let Some(desc) = null {
-                    if rtvs.len() < 8 {
-                        formats[rtvs.len()] = desc.Format.0 as u32;
+                if let Some(words) = record.rtv_words().filter(|w| w[0] != 0 && w[1] != 0) {
+                    if self.host_targets.scratch.len() < 8 {
+                        formats[self.host_targets.scratch.len()] = words[0];
                     }
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    self.host_targets.scratch.push(BoundTarget {
+                        texture: None,
+                        desc: Some(words),
+                    });
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            let desc = record.desc();
-            if rtvs.len() < 8 {
-                formats[rtvs.len()] = bound_format(texture, desc.as_ref().map(|d| d.Format));
+            let words = record.rtv_words();
+            if self.host_targets.scratch.len() < 8 {
+                let format = words
+                    .map(crate::descriptor::RtvRecord::cast_desc::<D3D12_RENDER_TARGET_VIEW_DESC>)
+                    .map(|d| d.Format);
+                formats[self.host_targets.scratch.len()] = bound_format(texture, format);
             }
-            rtvs.push(host.rtv(Some(texture), desc.as_ref()));
+            self.host_targets.scratch.push(BoundTarget {
+                texture: Some(texture.clone()),
+                desc: words,
+            });
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let resolved_dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
-            let desc = record.depth_desc();
+            let words = record.dsv_words();
+            let desc = words
+                .map(crate::descriptor::RtvRecord::cast_desc::<D3D12_DEPTH_STENCIL_VIEW_DESC>);
             self.depth_state = depth_state(texture, desc.as_ref());
             formats[8] = bound_format(texture, desc.as_ref().map(|d| d.Format));
             if crate::resource::depth_and_unordered(record.resource) {
@@ -1186,9 +1258,50 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, desc.as_ref()))
+            Some(BoundTarget {
+                texture: Some(texture.clone()),
+                desc: words,
+            })
         });
         self.target_formats = formats;
+        if self.host_targets.bound.as_ref().is_some_and(|bound| {
+            bound.rtvs.len() == self.host_targets.scratch.len()
+                && bound
+                    .rtvs
+                    .iter()
+                    .zip(&self.host_targets.scratch)
+                    .all(|(a, b)| a.same(b))
+                && match (&bound.dsv, &resolved_dsv) {
+                    (Some(a), Some(b)) => a.same(b),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }) {
+            self.host_targets.scratch.clear();
+            return;
+        }
+        let mut rtvs = Vec::with_capacity(self.host_targets.scratch.len());
+        for t in &self.host_targets.scratch {
+            let desc = t
+                .desc
+                .map(crate::descriptor::RtvRecord::cast_desc::<D3D12_RENDER_TARGET_VIEW_DESC>);
+            rtvs.push(host.rtv(t.texture.as_ref(), desc.as_ref()));
+            #[cfg(test)]
+            {
+                self.host_targets.rtv_creates += 1;
+            }
+        }
+        let dsv = resolved_dsv.as_ref().and_then(|t| {
+            let texture = t.texture.as_ref()?;
+            let desc = t
+                .desc
+                .map(crate::descriptor::RtvRecord::cast_desc::<D3D12_DEPTH_STENCIL_VIEW_DESC>);
+            #[cfg(test)]
+            {
+                self.host_targets.dsv_creates += 1;
+            }
+            Some(host.dsv(texture, desc.as_ref()))
+        });
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1198,6 +1311,24 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        #[cfg(test)]
+        {
+            self.host_targets.binds += 1;
+        }
+        match &mut self.host_targets.bound {
+            Some(bound) => {
+                std::mem::swap(&mut bound.rtvs, &mut self.host_targets.scratch);
+                self.host_targets.scratch.clear();
+                bound.dsv = resolved_dsv;
+            }
+            None => {
+                let rtvs = std::mem::take(&mut self.host_targets.scratch);
+                self.host_targets.bound = Some(BoundTargets {
+                    rtvs,
+                    dsv: resolved_dsv,
+                });
+            }
+        }
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -1264,6 +1395,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_targets.bound = None;
         self.kept_pipelines.clear();
         self.kept_roots.clear();
         self.window = None;
@@ -2059,6 +2191,17 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
+        // `VICTORY_HEAP_PASS_MARKED` (off unless set): the pass that looks
+        // only at marked slots, in place of everything below.
+        if crate::heap_pass::marked() {
+            self.heap_buffers_marked(list, heap, host, frame);
+            return Some(gpu);
+        }
+        // (`alt`, the marked pass's turn just over: the host copies it
+        // kept are let go.)
+        if crate::heap_pass::marked_paused() {
+            *MARKED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, partitioned into 16 buckets matching `HostHeap::buffers`.
@@ -2066,9 +2209,6 @@ impl State {
         // bucket, keeping unchanged slots on a batched lock-free/single-lock
         // fast path instead of re-mirroring and calling `shadow::find` per
         // slot, and incrementally maintaining per-bucket shadow spans.
-        static RANGES: std::sync::Mutex<
-            Option<std::collections::HashMap<usize, HeapBufferCache<std::sync::Arc<crate::shadow::Shadow>>>>,
-        > = std::sync::Mutex::new(None);
         let forget_epoch = crate::descriptor::forget_epoch();
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let cache = kept
@@ -2260,6 +2400,181 @@ impl State {
             );
         }
         Some(gpu)
+    }
+
+    /// [`State::heap_buffers`]' pass with `VICTORY_HEAP_PASS_MARKED`
+    /// (`crate::heap_pass`, after fork pull request #523): a slot is looked
+    /// at again only when its view was written, the table entry its record
+    /// names was freed, its record in title memory is not the one seen at
+    /// its last look, or it found no host copy (every 16 passes); every slot
+    /// every 256 passes. A copy's span is worked out again only when one of
+    /// its slots went.
+    fn heap_buffers_marked(
+        &self,
+        list: &HostList,
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+        frame: u64,
+    ) {
+        let started = std::time::Instant::now();
+        let mut kept = MARKED.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = kept.get_or_insert_with(Default::default);
+        // `alt`, back from the other pass's turn: what is kept here is from
+        // before it, and it took the heap's changes meanwhile. Both start
+        // anew: this one now, the other at its next turn.
+        if crate::heap_pass::RESUMED.swap(false, Ordering::Relaxed) {
+            heaps.clear();
+            *RANGES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        // One list of freed table entries for all heaps: each heap's pass is told.
+        let forgotten = crate::descriptor::take_forgotten();
+        for picked in heaps.values_mut() {
+            picked.note_forgotten(forgotten.as_deref());
+        }
+        let ranges = heaps
+            .entry(std::ptr::from_ref(host) as usize)
+            .or_insert_with(|| Marked::new(false));
+        let changed = host.buffer_changes();
+        let record = |index: u32| heap.handle(index).map(crate::descriptor::record_at);
+        let slots = ranges.plan(
+            changed,
+            || {
+                let mut all = Vec::new();
+                for bucket in 0..BUFFER_SWEEP_BUCKETS {
+                    all.extend(host.buffer_slots_bucket(bucket));
+                }
+                all.sort_unstable();
+                all
+            },
+            record,
+            crate::descriptor::record_entry,
+        );
+        // Whether the device was there before the pass: a view that removes
+        // it is named below.
+        static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let mut alive = !GONE.load(Ordering::Relaxed)
+            && crate::descriptor::host::device_removed().is_none();
+        HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        // Of the slots looked at, those whose record is the one seen at
+        // their last look (a view written again as it was).
+        let mut same = 0u64;
+        for (n, &index) in slots.iter().enumerate() {
+            let Some(handle) = heap.handle(index) else {
+                ranges.forget(index);
+                continue;
+            };
+            // Read before the slot is made: a write after it is seen next pass.
+            let record = crate::descriptor::record_at(handle);
+            let entry = crate::descriptor::record_entry(record);
+            same += u64::from(ranges.record_of(index) == Some(record));
+            ranges.forget(index);
+            let Some(view) = host.mirror(index, handle, true) else {
+                continue;
+            };
+            // Every 64 views while the device lives (a cheap query).
+            if alive
+                && n % 64 == 63
+                && let Some(why) = crate::descriptor::host::device_removed()
+            {
+                alive = false;
+                GONE.store(true, Ordering::Relaxed);
+                let last: Vec<String> = slots[n - 63..=n]
+                    .iter()
+                    .filter_map(|&i| {
+                        crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}"))
+                    })
+                    .map(|s| s.chars().take(200).collect())
+                    .collect();
+                tracing::error!(
+                    why,
+                    slot = index,
+                    "the host device went while buffer views of the heap were made; one of: {last:#?}"
+                );
+                crate::host::log_removal_context();
+            }
+            // The copy the slot shows (`buffer_copy`), not the one the
+            // view's range alone would find.
+            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                // A buffer view whose memory has no host copy (yet): tried
+                // again every 16 passes. (Other views: left out until
+                // written, as in the other pass.)
+                if crate::descriptor::host::buffer_range(&view).is_some_and(|(_, len)| len > 0) {
+                    ranges.orphan(index, record, entry);
+                }
+                continue;
+            };
+            #[cfg(feature = "diagnostics")]
+            if host.shows(index, &shadow.buffer) == Some(false) {
+                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+            }
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            ranges.keep(index, key, &shadow, address, address + len, record, entry);
+        }
+        let views = ranges.views() as u32;
+        // Per host copy, the span its picked views cover.
+        let spans = ranges.spans();
+        drop(kept);
+        let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
+        // Memory that is not write-watched is copied whole by every refresh
+        // (see the other pass).
+        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
+            std::sync::Mutex::new(None);
+        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+        let whole = whole.get_or_insert_with(Default::default);
+        for (shadow, from, to) in &spans {
+            if shadow.unwatched() {
+                let key = shadow.id() as usize;
+                // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
+                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let every = *EVERY.get_or_init(|| {
+                    std::env::var("VICTORY_UNWATCHED_FRAMES")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1)
+                });
+                match whole.get(&key) {
+                    Some(&last) if frame < last + every => continue,
+                    _ => {
+                        whole.insert(key, frame);
+                    }
+                }
+            }
+            shadow.refresh(list, *from, *to - *from);
+        }
+        let textures_began = std::time::Instant::now();
+        if !crate::heap_worker::kick(heap) {
+            Self::heap_textures(Into::List(list), heap, host);
+        }
+        HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
+        HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Every 256 passes: how many of the slots looked at held the record
+        // of their last look (what a further cut could leave alone).
+        static SEEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+        SEEN[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        SEEN[2].fetch_add(same, Ordering::Relaxed);
+        if SEEN[0].fetch_add(1, Ordering::Relaxed) % 256 == 255 {
+            tracing::info!(
+                "the marked pass over the heap's buffer views (VICTORY_HEAP_PASS_MARKED), its last 256 passes: {} slots looked at, {} of them held the record seen at their last look; {} views kept now",
+                SEEN[1].swap(0, Ordering::Relaxed),
+                SEEN[2].swap(0, Ordering::Relaxed),
+                views,
+            );
+        }
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        // The first pass and every growth of the set by half.
+        let seen = LOGGED.load(Ordering::Relaxed);
+        if u64::from(views) > seen + seen / 2 {
+            LOGGED.store(u64::from(views), Ordering::Relaxed);
+            tracing::info!(
+                slots = slots.len(),
+                views,
+                copies = spans.len(),
+                mb = bytes >> 20,
+                ms = started.elapsed().as_millis(),
+                "buffer views of the heap made ready for shaders that pick them by index (the marked pass)"
+            );
+        }
     }
 
     /// Runs the pass that uploads textures picked by index
@@ -3499,23 +3814,36 @@ impl State {
             // `sync_heaps` leaves per-draw table slots to their draws.
             let title_first = heap.index(table).filter(|first| first + n <= host.mirrored_count());
             // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
+            // used-resource list names (descriptor arrays). Copied from the
+            // views of the title's slots past the host's where the heap
+            // keeps them, made one by one otherwise.
+            let mut copied = heap
+                .index(table)
+                .and_then(|index| host.copy_overflow(first, index, n, table))
+                .map(|(_, views)| views.into_iter());
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                // The views the overflow copy looked up, else each looked up.
+                let view = match copied.as_mut() {
+                    Some(views) => views.next().flatten(),
+                    None => crate::descriptor::view(table + u64::from(k) * 32),
+                };
+                match view {
                     Some(View::Constant(address, size)) => {
                         if let Some(title) = title_first {
                             host.texture_slot_tabled(title + k, false);
                         }
                         if let Some(shadow) = direct_cbv_shadow(address, size) {
                             let aligned = u64::from(size).next_multiple_of(256);
-                            host.constant_at_kept(
-                                index,
-                                shadow.gpu(address),
-                                size,
-                                Some(shadow.buffer.clone()),
-                            );
+                            if copied.is_none() {
+                                host.constant_at_kept(
+                                    index,
+                                    shadow.gpu(address),
+                                    size,
+                                    Some(shadow.buffer.clone()),
+                                );
+                            }
                             shadow.refresh(list, address, aligned);
                             continue;
                         }
@@ -3526,7 +3854,9 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        if copied.is_none() {
+                            host.make_at(index, &view);
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -3550,7 +3880,9 @@ impl State {
                         if let Some(title) = title_first {
                             host.texture_slot_tabled(title + k, false);
                         }
-                        host.make_null(index);
+                        if copied.is_none() {
+                            host.make_null(index);
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
@@ -4786,5 +5118,743 @@ mod tests {
             assert!(state.kept_roots.is_empty());
             list.close();
         }
+    }
+
+    /// Creates a committed title buffer for `draw::tests`.
+    fn test_buffer(bytes: u64) -> This {
+        let desc: [u32; 14] = [
+            1, // D3D12_RESOURCE_DIMENSION_BUFFER
+            0,
+            0,
+            0,
+            bytes as u32,
+            (bytes >> 32) as u32,
+            1,
+            1 | (1 << 16),
+            0,
+            1,
+            0,
+            1, // ROW_MAJOR
+            0,
+            0,
+        ];
+        let properties = [2u32, 0, 0, 0, 0]; // UPLOAD
+        let mut out = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let made = crate::resource::create_committed(
+            std::ptr::null(),
+            properties.as_ptr().cast(),
+            0,
+            desc.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut out,
+        );
+        assert_eq!(made, crate::object::S_OK);
+        out
+    }
+
+    /// Unaligned root CBVs reuse the same 256-byte-aligned scratch upload in
+    /// one list until a title-memory copy intervenes, after which a fresh
+    /// scratch fill delivers the updated constants without clobbering earlier
+    /// draws in the same submission.
+    #[test]
+    fn unaligned_root_cbv_caches_scratch_and_refreshes_after_title_copy() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SOURCE: &str = r#"
+#define RS "CBV(b0), RootConstants(num32BitConstants=1, b1), UAV(u0)"
+cbuffer Data : register(b0) { uint4 v; }
+cbuffer Slot : register(b1) { uint slot; }
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void cs() {
+    dst.Store4(slot * 16, v);
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: static shader source and entry names outlive the call.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("cbv_scratch"),
+                None,
+                None,
+                s!("cs"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        // SAFETY: live compiled shader blob with embedded root signature.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.GetBufferPointer(),
+                    BytecodeLength: code.GetBufferSize(),
+                },
+                ..Default::default()
+            };
+            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        };
+
+        let cb_buf = test_buffer(1024);
+        let (cb_base, _) = crate::resource::buffer_bytes(cb_buf).unwrap();
+        let unaligned = cb_base as u64 + 16;
+        let initial: [u32; 4] = [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+        let updated: [u32; 4] = [0xaaaa_aaaa, 0xbbbb_bbbb, 0xcccc_cccc, 0xdddd_dddd];
+        // SAFETY: inside our 1024-byte title buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                initial.as_ptr().cast::<u8>(),
+                unaligned as *mut u8,
+                size_of_val(&initial),
+            );
+        }
+
+        let (out, out_data) = host.shared_buffer(256).unwrap();
+        // SAFETY: inside the mapped output buffer.
+        unsafe { std::ptr::write_bytes(out_data, 0, 256) };
+        // SAFETY: live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+
+        let list = host.new_list().unwrap();
+        let cbv1 = root_view(&list, unaligned, false).expect("first unaligned CBV");
+        let cbv2 = root_view(&list, unaligned, false).expect("cached unaligned CBV");
+        assert_eq!(cbv1 % 256, 0);
+        assert_eq!(cbv2, cbv1, "same unaligned root CBV reuses scratch copy");
+
+        let dispatch = |cbv: u64, slot: u32| {
+            // SAFETY: open list and live host objects.
+            unsafe {
+                let l = &list.list;
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetComputeRootConstantBufferView(0, cbv);
+                l.SetComputeRoot32BitConstant(1, slot, 0);
+                l.SetComputeRootUnorderedAccessView(2, out_gpu);
+                l.Dispatch(1, 1, 1);
+            }
+        };
+        dispatch(cbv1, 0);
+        dispatch(cbv2, 1);
+
+        // A title-memory copy updates the constant buffer mid-list: the cache
+        // must invalidate so the third draw reads `updated` while draws 0 and 1
+        // still read `initial` from the earlier scratch copy.
+        list.defer_copy(
+            unaligned as *mut u8,
+            updated.as_ptr().cast::<u8>(),
+            size_of_val(&updated),
+        );
+        let cbv3 = root_view(&list, unaligned, false).expect("refreshed unaligned CBV");
+        assert_eq!(cbv3 % 256, 0);
+        assert_ne!(cbv3, cbv1, "title copy invalidates cached scratch copy");
+        dispatch(cbv3, 2);
+
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: inside the mapped output buffer after GPU completion.
+        let read = |slot: usize| unsafe { *(out_data.add(slot * 16) as *const [u32; 4]) };
+        assert_eq!(read(0), initial, "draw 0 reads initial constants");
+        assert_eq!(read(1), initial, "draw 1 reads cached initial constants");
+        assert_eq!(
+            read(2),
+            updated,
+            "draw 2 reads updated constants after title copy"
+        );
+        assert_eq!(host.log_messages(), None, "no D3D12 debug errors");
+    }
+
+    /// Creates a committed 2D title texture for render-target bind cache tests.
+    fn target_texture(width: u32, height: u32, mips: u32, format: u32, flags: u32) -> This {
+        let desc: [u32; 14] = [
+            3, // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            0,
+            0,
+            0,
+            width,
+            0,
+            height,
+            1 | (mips << 16),
+            format,
+            1,
+            0,
+            0,
+            flags,
+            0,
+        ];
+        let properties = [1u32, 0, 0, 0, 0];
+        let mut out = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let made = crate::resource::create_committed(
+            std::ptr::null(),
+            properties.as_ptr().cast(),
+            0,
+            desc.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut out,
+        );
+        assert_eq!(made, crate::object::S_OK);
+        out
+    }
+
+    /// Repeated `State::set_targets` calls with the same resolved host
+    /// textures and view descriptions skip descriptor ring allocation and
+    /// `OMSetRenderTargets`; any target, descriptor, depth, empty-bind,
+    /// external-recording, segment-cut, or reset change invalidates the cache.
+    #[test]
+    fn redundant_set_targets_reuses_binding_and_invalidates_on_any_change() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const R8G8B8A8_UNORM: u32 = 28;
+        const D32_FLOAT: u32 = 40;
+        const ALLOW_RT: u32 = 0x1;
+        const ALLOW_DS: u32 = 0x2;
+        const RTV_TEX2D: u32 = 4;
+        const DSV_TEX2D: u32 = 3;
+
+        let tex_a = target_texture(4, 4, 2, R8G8B8A8_UNORM, ALLOW_RT);
+        let tex_b = target_texture(4, 4, 1, R8G8B8A8_UNORM, ALLOW_RT);
+        let depth_tex = target_texture(4, 4, 1, D32_FLOAT, ALLOW_DS);
+
+        // Four 128-byte descriptor slots matching title RTV/DSV handle spacing.
+        let mut slots = [[0u8; 128]; 4];
+        let h_a = slots[0].as_mut_ptr() as u64;
+        let h_a_dup = slots[1].as_mut_ptr() as u64;
+        let h_b = slots[2].as_mut_ptr() as u64;
+        let h_dsv = slots[3].as_mut_ptr() as u64;
+
+        let rtv_mip0: [u32; 6] = [R8G8B8A8_UNORM, RTV_TEX2D, 0, 0, 0, 0];
+        let rtv_mip1: [u32; 6] = [R8G8B8A8_UNORM, RTV_TEX2D, 1, 0, 0, 0];
+        let dsv_rw: [u32; 6] = [D32_FLOAT, DSV_TEX2D, 0, 0, 0, 0];
+        let dsv_ro: [u32; 6] = [D32_FLOAT, DSV_TEX2D, 1, 0, 0, 0];
+
+        crate::descriptor::create_rtv(std::ptr::null(), tex_a, &rtv_mip0, h_a);
+        crate::descriptor::create_rtv(std::ptr::null(), tex_a, &rtv_mip0, h_a_dup);
+        crate::descriptor::create_rtv(std::ptr::null(), tex_b, &rtv_mip0, h_b);
+        crate::descriptor::create_dsv(std::ptr::null(), depth_tex, &dsv_rw, h_dsv);
+
+        let list1 = host.new_list().unwrap();
+        let list2 = host.new_list().unwrap();
+        let list3 = host.new_list().unwrap();
+        let mut state = State::default();
+        let counts = |s: &State| {
+            (
+                s.host_targets.binds,
+                s.host_targets.rtv_creates,
+                s.host_targets.dsv_creates,
+            )
+        };
+
+        // Initial bind misses.
+        state.set_targets(&list1, &[h_a], h_dsv);
+        assert_eq!(counts(&state), (1, 1, 1));
+        assert_eq!(state.targets, [tex_a as usize]);
+        assert_eq!(state.depth, depth_tex as usize);
+        assert_eq!(state.target_formats[0], R8G8B8A8_UNORM);
+        assert_eq!(state.target_formats[8], D32_FLOAT);
+        assert!(state.host_targets.scratch.is_empty());
+
+        // Redundant binds with the exact same handles hit and allocate nothing.
+        for _ in 0..5 {
+            state.set_targets(&list1, &[h_a], h_dsv);
+        }
+        assert_eq!(counts(&state), (1, 1, 1));
+        assert_eq!(state.targets, [tex_a as usize]);
+        assert_eq!(state.depth, depth_tex as usize);
+
+        // Distinct handle resolving to the same host texture and desc still hits,
+        // while updating `target_handles` with the latest handle.
+        state.set_targets(&list1, &[h_a_dup], h_dsv);
+        assert_eq!(counts(&state), (1, 1, 1));
+        assert_eq!(state.target_handles, [h_a_dup]);
+        assert_eq!(state.depth_handle, h_dsv);
+
+        // Switching render target misses.
+        state.set_targets(&list1, &[h_b], h_dsv);
+        assert_eq!(counts(&state), (2, 2, 2));
+        assert_eq!(state.targets, [tex_b as usize]);
+
+        // Switch back to h_a (mip 0), then overwrite h_a in place to mip 1:
+        // same handle address must still miss because the view description changed.
+        state.set_targets(&list1, &[h_a], h_dsv);
+        assert_eq!(counts(&state), (3, 3, 3));
+        crate::descriptor::create_rtv(std::ptr::null(), tex_a, &rtv_mip1, h_a);
+        state.set_targets(&list1, &[h_a], h_dsv);
+        assert_eq!(
+            counts(&state),
+            (4, 4, 4),
+            "in-place RTV desc edit must miss"
+        );
+        state.set_targets(&list1, &[h_a], h_dsv);
+        assert_eq!(counts(&state), (4, 4, 4), "repeat after mip 1 edit hits");
+
+        // Unbinding depth misses; re-binding misses; editing DSV flags in place misses.
+        state.set_targets(&list1, &[h_a], 0);
+        assert_eq!(counts(&state), (5, 5, 4));
+        assert_eq!(state.depth, 0);
+        assert_eq!(state.depth_state, DEPTH_WRITE);
+        state.set_targets(&list1, &[h_a], h_dsv);
+        assert_eq!(counts(&state), (6, 6, 5));
+        assert_eq!(state.depth, depth_tex as usize);
+        crate::descriptor::create_dsv(std::ptr::null(), depth_tex, &dsv_ro, h_dsv);
+        state.set_targets(&list1, &[h_a], h_dsv);
+        assert_eq!(
+            counts(&state),
+            (7, 7, 6),
+            "in-place DSV flags edit must miss"
+        );
+        assert_eq!(state.depth_state, DEPTH_READ);
+
+        // Empty binding: first misses, repeat hits.
+        state.set_targets(&list1, &[], 0);
+        assert_eq!(counts(&state), (8, 7, 6));
+        assert!(state.targets.is_empty() && state.depth == 0);
+        state.set_targets(&list1, &[], 0);
+        assert_eq!(counts(&state), (8, 7, 6));
+
+        // Restore a real target, then simulate external recording (`host_state_lost`).
+        state.set_targets(&list1, &[h_a], h_dsv);
+        assert_eq!(counts(&state), (9, 8, 7));
+        state.host_state_lost();
+        state.set_targets(&list1, &[h_a], h_dsv);
+        assert_eq!(
+            counts(&state),
+            (10, 9, 8),
+            "host_state_lost must invalidate"
+        );
+
+        // Segment cut (`replay`) replays targets onto `list2` (miss), and a repeat on `list2` hits.
+        state.replay(&list2);
+        assert_eq!(
+            counts(&state),
+            (11, 10, 9),
+            "replay must rebind on new host list"
+        );
+        state.set_targets(&list2, &[h_a], h_dsv);
+        assert_eq!(counts(&state), (11, 10, 9), "repeat after replay hits");
+
+        // Reset clears the cache (and counters) so the first bind misses again.
+        state.reset(std::ptr::null());
+        state.set_targets(&list3, &[h_a], h_dsv);
+        assert_eq!(counts(&state), (1, 1, 1), "reset must invalidate");
+        assert!(state.host_targets.scratch.is_empty());
+
+        list1.close();
+        list2.close();
+        list3.close();
+    }
+
+    /// End-to-end GPU draw and pixel readback verifying that cached target
+    /// binds, in-place descriptor overwrites at the same handle, and segment
+    /// `replay()` replays all render into the right textures.
+    #[test]
+    fn cached_render_targets_render_expected_pixels_across_redundant_binds_and_cut() {
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0)"
+cbuffer Color : register(b0) { float4 c; }
+[RootSignature(RS)]
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 p = float2((id == 2) ? 3.0 : -1.0, (id == 1) ? 3.0 : -1.0);
+    return float4(p, 0.0, 1.0);
+}
+float4 ps() : SV_Target { return c; }
+"#;
+        let blob = |entry: windows::core::PCSTR, target: windows::core::PCSTR| {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: static shader source and entry names outlive the call.
+            unsafe {
+                D3DCompile(
+                    SOURCE.as_ptr().cast(),
+                    SOURCE.len(),
+                    s!("rt_cache"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+            }
+            .unwrap();
+            code.unwrap()
+        };
+        let (vs, ps) = (blob(s!("vs"), s!("vs_5_1")), blob(s!("ps"), s!("ps_5_1")));
+        // SAFETY: live compiled blobs.
+        let bytes = |b: &ID3DBlob| unsafe {
+            D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.GetBufferPointer(),
+                BytecodeLength: b.GetBufferSize(),
+            }
+        };
+        // SAFETY: embedded root signature in compiled VS blob.
+        let root: ID3D12RootSignature = unsafe {
+            host.device.CreateRootSignature(
+                0,
+                std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize()),
+            )
+        }
+        .unwrap();
+        let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: borrowed for PSO creation.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            VS: bytes(&vs),
+            PS: bytes(&ps),
+            SampleMask: u32::MAX,
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        // SAFETY: complete PSO description.
+        let pso: ID3D12PipelineState =
+            unsafe { host.device.CreateGraphicsPipelineState(&desc) }.unwrap();
+
+        const R8G8B8A8_UNORM: u32 = 28;
+        const ALLOW_RT: u32 = 0x1;
+        let tex_a = target_texture(4, 4, 1, R8G8B8A8_UNORM, ALLOW_RT);
+        let tex_b = target_texture(4, 4, 1, R8G8B8A8_UNORM, ALLOW_RT);
+        let host_a = crate::resource::host_resource(tex_a).unwrap().clone();
+        let host_b = crate::resource::host_resource(tex_b).unwrap().clone();
+
+        let mut slots = [[0u8; 128]; 2];
+        let h_a = slots[0].as_mut_ptr() as u64;
+        let h_b = slots[1].as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(std::ptr::null(), tex_a, std::ptr::null(), h_a);
+        crate::descriptor::create_rtv(std::ptr::null(), tex_b, std::ptr::null(), h_b);
+
+        let draw_color = |list: &HostList, rgba: [f32; 4]| {
+            // SAFETY: open list with bound render target, viewport, and scissor.
+            unsafe {
+                let l = &list.list;
+                l.SetGraphicsRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                l.SetGraphicsRoot32BitConstants(0, 4, rgba.as_ptr().cast(), 0);
+                l.DrawInstanced(3, 1, 0, 0);
+            }
+        };
+
+        let list1 = host.new_list().unwrap();
+        let list2 = host.new_list().unwrap();
+        let mut state = State::default();
+        let vp = [D3D12_VIEWPORT {
+            Width: 4.0,
+            Height: 4.0,
+            MaxDepth: 1.0,
+            ..Default::default()
+        }];
+        let sc = [RECT {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        }];
+        state.set_viewports(&list1, &vp);
+        state.set_scissors(&list1, &sc);
+
+        const RENDER_TARGET: u32 = 0x4;
+        const COPY_SOURCE: u32 = 0x800;
+        crate::list::ensure_state(&list1, tex_a, RENDER_TARGET);
+        crate::list::ensure_state(&list1, tex_b, RENDER_TARGET);
+
+        // 1. Bind tex_a with redundant repeats, then draw red.
+        state.set_targets(&list1, &[h_a], 0);
+        state.set_targets(&list1, &[h_a], 0);
+        state.set_targets(&list1, &[h_a], 0);
+        assert_eq!(state.host_targets.binds, 1);
+        draw_color(&list1, [1.0, 0.0, 0.0, 1.0]);
+
+        // 2. Switch to tex_b with redundant repeat, draw green.
+        state.set_targets(&list1, &[h_b], 0);
+        state.set_targets(&list1, &[h_b], 0);
+        assert_eq!(state.host_targets.binds, 2);
+        draw_color(&list1, [0.0, 1.0, 0.0, 1.0]);
+
+        // 3. Switch back to h_a (tex_a), then overwrite h_a in place to point
+        //    to tex_b and bind the same handle `h_a`: must miss and draw blue
+        //    into tex_b, leaving tex_a red so far.
+        state.set_targets(&list1, &[h_a], 0);
+        assert_eq!(state.host_targets.binds, 3);
+        crate::descriptor::create_rtv(std::ptr::null(), tex_b, std::ptr::null(), h_a);
+        state.set_targets(&list1, &[h_a], 0);
+        assert_eq!(state.host_targets.binds, 4);
+        draw_color(&list1, [0.0, 0.0, 1.0, 1.0]);
+
+        // 4. Point h_a back at tex_a, bind, then `replay` into list2 and draw
+        //    yellow on list2 (relying on `replay` invalidating and rebinding).
+        crate::descriptor::create_rtv(std::ptr::null(), tex_a, std::ptr::null(), h_a);
+        state.set_targets(&list1, &[h_a], 0);
+        assert_eq!(state.host_targets.binds, 5);
+        list1.close();
+
+        state.replay(&list2);
+        assert_eq!(state.host_targets.binds, 6);
+        state.set_targets(&list2, &[h_a], 0);
+        assert_eq!(state.host_targets.binds, 6, "repeat after replay hits");
+        crate::list::ensure_state(&list2, tex_a, RENDER_TARGET);
+        draw_color(&list2, [1.0, 1.0, 0.0, 1.0]);
+
+        // Copy both textures out for pixel verification.
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: live host texture description.
+        let tex_desc = unsafe { host_a.GetDesc() };
+        // SAFETY: valid outputs for one subresource.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &tex_desc,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut total),
+            );
+        }
+        let (buf_a, data_a) = host.shared_buffer(total).unwrap();
+        let (buf_b, data_b) = host.shared_buffer(total).unwrap();
+        crate::list::ensure_state(&list2, tex_a, COPY_SOURCE);
+        crate::list::ensure_state(&list2, tex_b, COPY_SOURCE);
+        for (src, dst) in [(&host_a, &buf_a), (&host_b, &buf_b)] {
+            // SAFETY: open list, textures in COPY_SOURCE, mapped readback buffers.
+            unsafe {
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(dst),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: footprint,
+                    },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(src),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                list2.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+        }
+        list2.close();
+        host.execute(&[&list1, &list2]);
+
+        // SAFETY: mapped readback buffers after GPU execution completed.
+        let px_a = unsafe { *(data_a.add(footprint.Offset as usize) as *const [u8; 4]) };
+        // SAFETY: as above.
+        let px_b = unsafe { *(data_b.add(footprint.Offset as usize) as *const [u8; 4]) };
+        assert_eq!(px_a, [255, 255, 0, 255], "tex_a got yellow draw after replay");
+        assert_eq!(
+            px_b,
+            [0, 0, 255, 255],
+            "tex_b got blue draw after in-place handle overwrite"
+        );
+        assert_eq!(host.log_messages(), None, "no D3D12 debug errors");
+    }
+
+    /// A texture fed from title memory, read through an overflow table and
+    /// then evicted (`HostHeap::evict`): the overflow slot lets go of it, so
+    /// the next copy makes its view again, reading the title's new bytes.
+    #[test]
+    fn an_overflow_table_reads_a_texture_given_up_as_made_again() {
+        use crate::descriptor::host::TEST_TITLE_SLOTS;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null: This = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 16, 1, 0, 0, 0, 0, 0];
+        let mut guest_heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        TEST_TITLE_SLOTS.set(4);
+        let made_heap =
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut guest_heap);
+        let title_heap = crate::descriptor::heap(guest_heap);
+        let heap = title_heap.host().expect("a host view heap");
+        TEST_TITLE_SLOTS.set(0);
+        assert_eq!(made_heap, crate::object::S_OK);
+        assert_eq!(heap.count(), 4);
+
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+Texture2D<float4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void cs() {
+    float4 px = src.Load(int3(0, 0, 0));
+    dst.Store4(0, asuint(px));
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: static shader source and entry names outlive the call.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("overflow_evict"),
+                None,
+                None,
+                s!("cs"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        // SAFETY: live compiled shader blob with embedded root signature.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.GetBufferPointer(),
+                    BytecodeLength: code.GetBufferSize(),
+                },
+                ..Default::default()
+            };
+            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        };
+
+        let (out, data) = host.shared_buffer(64).unwrap();
+        // SAFETY: live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+        let layout = std::alloc::Layout::from_size_align(64 * 64 * 4, 1 << 16).unwrap();
+        // SAFETY: non-zero 64 KiB-aligned allocation for title texture memory.
+        let mem = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!mem.is_null());
+        let address = mem as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | (1 << 16), 28, 1, 0, 0x100, 0, 0];
+        let object = crate::resource::texture_at(address, &words, false).unwrap();
+        let host_tex = crate::resource::host_resource(object).unwrap();
+        // SAFETY: the texture's memory, 256-byte rows of 64 texels.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        // Title slot 8: past the host's title slots.
+        let slot = title_heap.start + 8 * 32;
+        crate::descriptor::create_srv(null, object, &desc, slot);
+        let view = crate::descriptor::view(slot).unwrap();
+        let copied = heap.dynamic(1).unwrap();
+        let copy_and_read = || {
+            let (made, _) = heap
+                .copy_overflow(copied, 8, 1, slot)
+                .expect("an overflow table");
+            let list = host.new_list().unwrap();
+            readable(&list, ResourceType::Srv, &view);
+            // SAFETY: no submission runs; the mapped output.
+            unsafe { data.cast::<[f32; 4]>().write([0.0; 4]) };
+            // SAFETY: open list, live heap/root/pso, valid descriptor table and UAV.
+            unsafe {
+                let l = &list.list;
+                l.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetComputeRootDescriptorTable(0, heap.gpu_handle(copied));
+                l.SetComputeRootUnorderedAccessView(1, out_gpu);
+                l.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the dispatch wrote its first texel there and has run.
+            (made, unsafe { data.cast::<[f32; 4]>().read() }[0])
+        };
+
+        let (made, texel) = copy_and_read();
+        assert_eq!(made, 1);
+        assert!((texel - 64.0 / 255.0).abs() < 1e-6, "{texel}");
+        let (made_cached, texel_cached) = copy_and_read();
+        assert_eq!(made_cached, 0, "unchanged slot reused from overflow");
+        assert!((texel_cached - 64.0 / 255.0).abs() < 1e-6, "{texel_cached}");
+
+        let mut evicted = std::collections::HashSet::new();
+        evicted.insert(host_tex.as_raw() as usize);
+        heap.evict(&evicted);
+        crate::texture::unstage(object);
+        // SAFETY: the texture's memory: the title writes new bytes.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x80, 64 * 64 * 4) };
+        let (made, texel) = copy_and_read();
+        assert_eq!(made, 1, "made again: its texture was evicted");
+        assert!(
+            (texel - 128.0 / 255.0).abs() < 1e-6,
+            "the new bytes, through the texture made again: {texel}"
+        );
+        heap.release(copied, 1);
+        type Release = extern "system" fn(This) -> u32;
+        crate::object::slot::<Release>(guest_heap, 0x10)(guest_heap);
+        // SAFETY: no submission or resource uses `mem` after release and host.execute.
+        unsafe { std::alloc::dealloc(mem, layout) };
+        assert_eq!(host.log_messages(), None, "no D3D12 debug errors");
     }
 }

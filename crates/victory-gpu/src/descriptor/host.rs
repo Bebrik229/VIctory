@@ -178,6 +178,99 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// A capped heap's views of the title's slots past `count`, for fresh
+    /// tables to copy from ([`HostHeap::copy_overflow`]).
+    overflow: Option<Overflow>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the title slots a view heap this thread makes from now on
+    /// keeps, fewer than the title's (0: all, as the host takes). Per
+    /// thread, so tests running meanwhile make their heaps as before.
+    pub(crate) static TEST_TITLE_SLOTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a capped heap keeps views of the title's slots past its own
+/// (`VICTORY_OVERFLOW_VIEWS`, on unless `0`); else fresh tables make every
+/// view each time, as before.
+fn overflow_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| overflow_views_from(std::env::var_os("VICTORY_OVERFLOW_VIEWS").as_deref()))
+}
+
+/// [`overflow_views`] for a value of the switch.
+fn overflow_views_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+/// Views of the title's slots past a capped heap's title slots, in a
+/// CPU-only heap (not under the host's limit on shader-visible ones), one
+/// per title slot: made from the title's record where a fresh table uses
+/// the slot, and again only when the slot's record changes, as title slots
+/// are made when the title writes them. Fresh tables copy them. Each keeps
+/// what its view needs alive, as a title slot does.
+struct Overflow {
+    /// Held for its slots: only their CPU handles are used.
+    _heap: ID3D12DescriptorHeap,
+    cpu: usize,
+    step: u32,
+    len: u32,
+    /// The slots, [`SHARD`] to a lock: lists recording at once take
+    /// different ones.
+    shards: Vec<Mutex<Vec<Over>>>,
+}
+
+/// Overflow slots per lock.
+const SHARD: u32 = 1024;
+
+/// An overflow slot: the record it was made from ([`Over::NULL`] for a
+/// null view, 0 for none made), and what it keeps alive.
+#[derive(Clone, Default)]
+struct Over {
+    key: u64,
+    kept: Kept,
+}
+
+impl Over {
+    const NULL: u64 = u64::MAX;
+}
+
+impl Overflow {
+    fn new(device: &ID3D12Device, len: u32, step: u32) -> Option<Self> {
+        // SAFETY: plain heap creation.
+        let made = unsafe {
+            device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: len,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            })
+        };
+        let heap = match made {
+            Ok(heap) => heap,
+            Err(e) => {
+                tracing::warn!(error = %e, len, "no overflow view heap: fresh tables make their views each time");
+                return None;
+            }
+        };
+        tracing::info!(
+            slots = len,
+            descriptor_bytes = step,
+            mb = f64::from(len) * f64::from(step) / 1e6,
+            "overflow view heap (CPU memory) for the title's slots past the capped heap's (VICTORY_OVERFLOW_VIEWS)"
+        );
+        // SAFETY: a live heap.
+        let cpu = unsafe { heap.GetCPUDescriptorHandleForHeapStart().ptr };
+        let shards = (0..len.div_ceil(SHARD))
+            .map(|s| Mutex::new(vec![Over::default(); SHARD.min(len - s * SHARD) as usize]))
+            .collect();
+        Some(Overflow { _heap: heap, cpu, step, len, shards })
+    }
+
+    fn cpu(&self, at: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.cpu + at as usize * self.step as usize }
+    }
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1197,6 +1290,8 @@ impl HostHeap {
         };
         let extra = if sampler { 0 } else { DYNAMIC };
         let title_count = count;
+        // The title's slot count, before the host's cap or test limit may leave fewer.
+        let asked = count;
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -1268,6 +1363,17 @@ impl HostHeap {
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
+        // Tests: a heap that keeps fewer title slots than the title has, as a
+        // capped one does (its slots past them are dynamic ones).
+        #[cfg(test)]
+        let count = match TEST_TITLE_SLOTS.get() {
+            0 => count,
+            kept if !sampler => kept.min(count),
+            _ => count,
+        };
+        let overflow = (!sampler && asked > count && overflow_views())
+            .then(|| Overflow::new(&host.device, asked - count, step))
+            .flatten();
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -1359,6 +1465,7 @@ impl HostHeap {
                 }
                 spans
             },
+            overflow,
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2262,6 +2369,169 @@ impl HostHeap {
         }
     }
 
+    /// Makes dynamic slots `first..first + n` what the title's table at
+    /// `table`, its slots `index..index + n` past this heap's title slots,
+    /// holds: overflow slots whose record changed since they were made are
+    /// made again, then all `n` are copied in one go, and each dynamic slot
+    /// keeps as [`HostHeap::make_at`] would. Views of textures the title
+    /// placed itself whose host copy moved are made again; views the host
+    /// could not make are tried again at the next use. Returns how many
+    /// views it made, and the table's views (for the caller's uses); `None`
+    /// without an overflow heap or past its end (the caller makes them one
+    /// by one). Locks are taken once per table: the views', the overflow
+    /// shards the table spans, the kept resources' shards.
+    pub(crate) fn copy_overflow(&self, first: u32, index: u32, n: u32, table: u64) -> Option<(u32, Vec<Option<View>>)> {
+        let o = self.overflow.as_ref()?;
+        let from = index.checked_sub(self.count)?;
+        if n == 0
+            || u64::from(from) + u64::from(n) > u64::from(o.len)
+            || first < self.dynamic_first
+            || first.checked_add(n).is_none_or(|end| end > self.dynamic_first + self.dynamic)
+        {
+            return None;
+        }
+        // The table's records, and their views in one look-up.
+        let records: Vec<[u32; 3]> = (0..n)
+            // SAFETY: descriptor slots in title memory.
+            .map(|k| unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() })
+            .collect();
+        let views = super::views_of(&records);
+        // The shards the table spans, locked in order: what is made there
+        // and copied from stays as it is meanwhile.
+        let (s0, s1) = (from / SHARD, (from + n - 1) / SHARD);
+        let mut shards: Vec<_> = (s0..=s1)
+            .map(|s| o.shards[s as usize].lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        let (mut made, mut retired) = (0, Vec::new());
+        let mut kept = Vec::with_capacity(n as usize);
+        for (k, (view, &[_, i, generation])) in views.iter().zip(&records).enumerate() {
+            let at = from + k as u32;
+            let slot = &mut shards[(at / SHARD - s0) as usize][(at % SHARD) as usize];
+            // Generations start at 1 (and inline kinds use bits 30..32), so a
+            // made view's key is never 0 or Over::NULL.
+            let key = match view {
+                Some(_) => u64::from(generation) << 32 | u64::from(i),
+                None => Over::NULL,
+            };
+            // A placed texture's slot is made again if its host texture
+            // changed under the same record, as `make` upgrades placed textures.
+            let moved = || {
+                view.as_ref().is_some_and(|v| {
+                    let held = slot.kept.as_ref().map(windows::core::Interface::as_raw);
+                    is_placed_texture(v) && held.is_none_or(|held| placed_texture_moved(v, held))
+                })
+            };
+            if slot.key != key || moved() {
+                let (made_kept, key) = match view {
+                    Some(view) => {
+                        let made_kept = make(view, o.cpu(at));
+                        if made_kept.is_none() {
+                            null_for(view, o.cpu(at));
+                        }
+                        // A view the host could not make is tried again at
+                        // the next use.
+                        let key = if made_kept.is_none() { 0 } else { key };
+                        (made_kept.flatten(), key)
+                    }
+                    None => {
+                        null_view(o.cpu(at));
+                        (None, key)
+                    }
+                };
+                // What the old view kept goes once the work in flight has
+                // run, as for a title slot ([`HostHeap::keep`]).
+                if let Some(old) = std::mem::replace(slot, Over { key, kept: made_kept }).kept {
+                    retired.push(old);
+                }
+                made += 1;
+            }
+            kept.push(slot.kept.clone());
+        }
+        if let Some(host) = host() {
+            // SAFETY: `n` slots inside both heaps; the source is CPU-only.
+            unsafe {
+                host.device
+                    .CopyDescriptorsSimple(n, self.cpu(first), o.cpu(from), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            };
+        }
+        drop(shards);
+        for old in retired {
+            crate::host::retire(old);
+        }
+        self.keep_run(first, kept);
+        Some((made, views))
+    }
+
+    /// [`HostHeap::keep`] of slots `first..` in one go across [`KEPT_PIECES`]
+    /// shards: what they kept goes once the work in flight has run.
+    fn keep_run(&self, first: u32, mut resources: Vec<Kept>) {
+        if resources.is_empty() {
+            return;
+        }
+        let mut retired = Vec::new();
+        {
+            let _one = (!heap_locks()).then(|| self.kept_one.lock().unwrap_or_else(|e| e.into_inner()));
+            let touch = resources.len().min(KEPT_PIECES as usize);
+            for offset in 0..touch {
+                let piece_idx = ((first + offset as u32) % KEPT_PIECES) as usize;
+                let mut kept = self.kept[piece_idx].lock().unwrap_or_else(|e| e.into_inner());
+                let mut k = offset;
+                while k < resources.len() {
+                    let dst = first + k as u32;
+                    let at = (dst / KEPT_PIECES) as usize;
+                    if let Some(slot) = kept.get_mut(at) {
+                        let resource = resources[k].take();
+                        if let Some(old) = std::mem::replace(slot, resource) {
+                            retired.push(old);
+                        }
+                    }
+                    k += KEPT_PIECES as usize;
+                }
+            }
+        }
+        for old in retired {
+            crate::host::retire(old);
+        }
+    }
+
+    /// Lets go of descriptors viewing any host texture in `textures` (when
+    /// evicted), walking overflow slots and retiring kept resources after
+    /// dropping shard locks.
+    #[allow(dead_code)]
+    pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
+        self.evict_overflow(textures);
+    }
+
+    /// [`HostHeap::evict`] of the overflow slots: one viewing a texture given
+    /// up lets go of it and is made again at its next use (its key cleared),
+    /// of the texture made again then. Its descriptor is never read by the
+    /// GPU (a CPU-only heap), so it is left as it is until then. What it held
+    /// goes once the work in flight has run, after the shard's lock.
+    /// Lock order: under `SHADER_HEAPS` (`descriptor::evict`), then a shard;
+    /// `copy_overflow` takes shards without `SHADER_HEAPS`.
+    fn evict_overflow(&self, textures: &std::collections::HashSet<usize>) {
+        let Some(o) = &self.overflow else { return };
+        let mut retired = Vec::new();
+        for shard in &o.shards {
+            let mut slots = shard.lock().unwrap_or_else(|e| e.into_inner());
+            for slot in slots.iter_mut() {
+                let given_up = slot
+                    .kept
+                    .as_ref()
+                    .is_some_and(|r| textures.contains(&(windows::core::Interface::as_raw(r) as usize)));
+                if given_up {
+                    if let Some(old) = slot.kept.take() {
+                        retired.push(old);
+                    }
+                    slot.key = 0;
+                }
+            }
+        }
+        for old in retired {
+            crate::host::retire(old);
+        }
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
@@ -2985,6 +3255,27 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     }
 }
 
+/// The format the host makes a typed buffer view in. Translated shaders
+/// declare every typed buffer load and store as 32-bit float
+/// (`victory_shader` `emit/lower.rs`), and a view in a 32-bit integer format
+/// converts between float and integer values on the way: a store of an
+/// integer's bits as a float is written as the integer the float rounds to
+/// (zero for most of them), where the console moves the bits. The float
+/// format of the same width moves them unchanged, and matches what the
+/// shader declares. (The meshlet culling programs append packed meshlet
+/// numbers to an `R32_UINT` list this way.)
+fn bit_exact_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT => {
+            DXGI_FORMAT_R32G32B32A32_FLOAT
+        }
+        DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT => DXGI_FORMAT_R32_FLOAT,
+        other => other,
+    }
+}
+
 /// A buffer view of title memory at `address` on its host copy: the first
 /// element moves by the copy's offset.
 /// Bytes per element of a buffer view.
@@ -3320,6 +3611,7 @@ fn buffer_srv(
             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
         };
     }
+    desc.Format = bit_exact_format(desc.Format);
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -3434,6 +3726,7 @@ fn buffer_uav(
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    desc.Format = bit_exact_format(desc.Format);
     if window.is_some() {
         // (Left out at first: every structured unordered access view was then
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
@@ -3882,6 +4175,34 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
+/// Whether `view` is a view of a texture the title placed in memory itself
+/// whose host texture (or a plane of its twin) is no longer `held`, the
+/// resource a slot made from it keeps: a later unordered or renderable view
+/// upgraded the memory's host texture.
+fn placed_texture_moved(view: &View, held: *mut std::ffi::c_void) -> bool {
+    is_placed_texture(view)
+        && placed_texture(view).is_some_and(|p| {
+            let (View::Shader(r, _) | View::Unordered(r, ..)) = p else {
+                return false;
+            };
+            let r = r as crate::object::This;
+            let same_main = crate::resource::host_copy(r)
+                .is_some_and(|copy| windows::core::Interface::as_raw(&copy.texture) == held);
+            let same_twin = crate::resource::twin(r).is_some_and(|t| {
+                windows::core::Interface::as_raw(&t.colour.texture) == held
+                    || t.plane
+                        .as_ref()
+                        .is_some_and(|p| windows::core::Interface::as_raw(&p.texture) == held)
+            });
+            !(same_main || same_twin)
+        })
+}
+
+/// Whether `view` is a view of a texture the title placed in memory itself.
+fn is_placed_texture(view: &View) -> bool {
+    matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
+}
+
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
@@ -4075,6 +4396,73 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Overflow views are off with `VICTORY_OVERFLOW_VIEWS=0`, on otherwise.
+    #[test]
+    fn overflow_views_are_on_unless_switched_off() {
+        let on = |v: Option<&str>| overflow_views_from(v.map(std::ffi::OsStr::new));
+        assert!(on(None) && on(Some("1")) && !on(Some("0")));
+    }
+
+    /// Typed buffer views of 32-bit integer formats are made in the float
+    /// format of the same width (the shaders' float loads and stores then
+    /// move the bits); every other format is the title's.
+    #[test]
+    fn typed_buffer_views_of_32_bit_integers_move_bits() {
+        for (title, host) in [
+            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_FLOAT),
+            (DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
+        ] {
+            assert_eq!(bit_exact_format(title), host);
+            assert_eq!(
+                crate::resource::element(title.0 as u32),
+                crate::resource::element(host.0 as u32)
+            );
+        }
+        for kept in [
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_R16G16_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ] {
+            assert_eq!(bit_exact_format(kept), kept);
+        }
+    }
+
+    /// `HostHeap::evict_overflow` clears only overflow slots holding an evicted
+    /// texture, resetting their key to 0 so the next `copy_overflow` remakes
+    /// them, and drops the retired COM references after releasing the shard lock.
+    #[test]
+    fn evict_overflow_clears_only_given_up_textures() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        TEST_TITLE_SLOTS.set(4);
+        let heap = HostHeap::new(false, 8);
+        TEST_TITLE_SLOTS.set(0);
+        let heap = heap.expect("view heap");
+        let o = heap.overflow.as_ref().expect("overflow heap");
+        let (buf_a, _) = host.shared_buffer(256).expect("buffer a");
+        let (buf_b, _) = host.shared_buffer(256).expect("buffer b");
+        let raw_a = windows::core::Interface::as_raw(&buf_a) as usize;
+        {
+            let mut shard = o.shards[0].lock().unwrap();
+            shard[0] = Over { key: 11, kept: Some(buf_a) };
+            shard[1] = Over { key: 22, kept: Some(buf_b) };
+        }
+        let mut evicted = std::collections::HashSet::new();
+        evicted.insert(raw_a);
+        heap.evict(&evicted);
+        let shard = o.shards[0].lock().unwrap();
+        assert_eq!(shard[0].key, 0);
+        assert!(shard[0].kept.is_none());
+        assert_eq!(shard[1].key, 22);
+        assert!(shard[1].kept.is_some());
+    }
 
     /// A constant view is made in 256-byte steps and at most 64 KiB, the
     /// most the host takes (a larger size removes the device on NVIDIA); a

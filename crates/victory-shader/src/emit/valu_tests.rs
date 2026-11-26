@@ -106,6 +106,20 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
 /// [`build_cs`] with `vgprs` architected VGPRs (the bytes under test may
 /// name registers past the default 8).
 fn build_cs_vgprs(body: &[u32], threads: u32, lds_bytes: u32, vgprs: u16) -> HostShader {
+    try_build_cs_vgprs(body, threads, lds_bytes, vgprs, false).expect("lower")
+}
+
+fn try_build_valu_cs(body: &[u32], native16: bool) -> Result<HostShader, crate::ShaderError> {
+    try_build_cs_vgprs(body, 1, 0, 8, native16)
+}
+
+fn try_build_cs_vgprs(
+    body: &[u32],
+    threads: u32,
+    lds_bytes: u32,
+    vgprs: u16,
+    native16: bool,
+) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -159,11 +173,10 @@ fn build_cs_vgprs(body: &[u32], threads: u32, lds_bytes: u32, vgprs: u16) -> Hos
         code,
     };
 
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res =
-        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -174,8 +187,8 @@ fn build_cs_vgprs(body: &[u32], threads: u32, lds_bytes: u32, vgprs: u16) -> Hos
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
-    .expect("lower");
+        native16,
+    })?;
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -196,7 +209,7 @@ fn build_cs_vgprs(body: &[u32], threads: u32, lds_bytes: u32, vgprs: u16) -> Hos
         assert_eq!(copy[4..20], ours[..], "container hash mismatch");
     }
 
-    shader
+    Ok(shader)
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
@@ -966,6 +979,8 @@ fn bfe_signed_and_unsigned_match_rdna2() {
         ([0xd2f9_0159, 28, 16, 0], 0xffff_fffd),
         ([0x8000_0000, 31, 4, 0], 0xffff_ffff),
         ([0x7000_0000, 28, 8, 0], 0x0000_0007),
+        // Field ends exactly at bit 31.
+        ([0x8000_0000, 28, 4, 0], 0xffff_fff8),
         // Normal fields inside 32 bits.
         ([0x0000_0080, 4, 4, 0], 0xffff_fff8),
         ([0x0000_0070, 4, 4, 0], 0x0000_0007),
@@ -984,14 +999,6 @@ fn bfe_signed_and_unsigned_match_rdna2() {
         );
     });
     // v_bfe_i32 width is 5-bit (src2[4:0]), so width=32 wraps to 0.
-    run_cases(
-        &v_signed,
-        &[[0x8000_0000, 4, 32, 0]],
-        |backend, _, _, got| {
-            assert_eq!(got, 0, "{backend}: v_bfe_i32 width 32 should mask to 0");
-        },
-    );
-
     // s_bfe_i32 width is 7-bit (src1[22:16]), so width=32 keeps all 32 bits.
     let mut s_cases = signed_cases.to_vec();
     s_cases.push(([0x8000_0000, 4, 32, 0], 0xf800_0000));
@@ -1023,6 +1030,28 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
+    let vector_cases = [
+        // Only the low five bits of both offset and width are used.
+        ([0x8000_0000, 4, 32, 0], [0, 0]),
+        ([0x8000_0000, u32::MAX, 33, 0], [1, u32::MAX]),
+        ([0x0000_0080, 36, 36, 0], [8, 0xffff_fff8]),
+        ([0x8000_0000, 28, 4, 0], [8, 0xffff_fff8]),
+        ([0x8000_0000, 28, 5, 0], [8, 0xffff_fff8]),
+        ([0xffff_ffff, 0, 31, 0], [0x7fff_ffff, u32::MAX]),
+        ([0xffff_ffff, 31, 0, 0], [0, 0]),
+    ];
+    let inputs = vector_cases.map(|(input, _)| input);
+    for (signed, (name, shader)) in [("v_bfe_u32", &v_unsigned), ("v_bfe_i32", &v_signed)]
+        .into_iter()
+        .enumerate()
+    {
+        run_cases(shader, &inputs, |backend, i, input, got| {
+            assert_eq!(
+                got, vector_cases[i].1[signed],
+                "{backend}: {name} {input:x?}"
+            );
+        });
+    }
 }
 
 #[test]
@@ -1557,6 +1586,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        native16: false,
     })
     .expect("lower");
 
@@ -1701,6 +1731,7 @@ fn lower_store_cs(root: RootType, heap: (u32, Option<(u32, u32)>)) -> HostShader
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        native16: false,
     });
     super::shader::TEST_VIEW_HEAP.set(None);
     let lowered = lowered.expect("lower");
@@ -1834,4 +1865,242 @@ fn sdwa_word1_source_is_the_high_half() {
     run_cases(&shader, &[[0, 0, 0, 0]], |label, _, _, got| {
         assert_eq!(got, 48, "{label}: (0x33C00 >> 16) << 4 = 48, got {got:#x}");
     });
+}
+
+/// `v_mad_legacy_f32` as RDNA 2 runs it: fused (`v_fma_legacy_f32`), with
+/// flushed subnormal sources and the legacy zero-factor rule.
+#[test]
+fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
+    let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let cases = [
+        // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46 exactly: kept by one
+        // rounding, lost when the product is rounded before the add.
+        [0x3f80_0001, 0x3f7f_fffe, 0xbf80_0000, 0],
+        // A subnormal source flushes to zero: subnormal * 1.0 + 0.0 == 0.0.
+        [0x0000_0001, 0x3f80_0000, 0x0000_0000, 0],
+        // A flushed subnormal factor triggers the legacy zero-factor rule with +inf.
+        [0x0000_0001, 0x7f80_0000, 0x3f80_0000, 0],
+        // A zero factor gives a +0 product even with an infinite factor.
+        [0, 0x7f80_0000, 0x3f80_0000, 0],
+    ];
+    let want = [0xa880_0000u32, 0x0000_0000, 0x3f80_0000, 0x3f80_0000];
+    if Host::new(false).is_err() && Host::new(true).is_err() {
+        eprintln!("no SM 6.6 host or WARP device; skipped");
+        return;
+    }
+    run_cases(&mad, &cases, |backend, i, _, got| {
+        if backend == "warp" && i == 0 {
+            // WARP rounds the product before the add; hardware's single
+            // rounding is the reference for the fused form.
+            eprintln!("{backend}: fused rounding differs on WARP; skipped");
+            return;
+        }
+        assert_eq!(got, want[i], "{backend}: case {i}");
+    });
+}
+
+fn declares_native16(shader: &HostShader) -> bool {
+    let c = crate::dxbc::Container::parse(&shader.dxil).expect("a container");
+    let sfi0 = c.part(crate::dxbc::FourCC::SFI0).expect("SFI0");
+    u64::from_le_bytes(sfi0.data[..8].try_into().expect("8 bytes")) & 0x4_0000 != 0
+}
+
+const fn vop3p(
+    op: u8,
+    vdst: u8,
+    src: [u16; 3],
+    opsel: u8,
+    opsel_hi: u8,
+    neg: u8,
+    neg_hi: u8,
+    clamp: bool,
+) -> [u32; 2] {
+    [
+        0xCC << 24
+            | (op as u32 & 0x7F) << 16
+            | (clamp as u32) << 15
+            | ((opsel_hi as u32 >> 2 & 1) << 14)
+            | (opsel as u32 & 7) << 11
+            | (neg_hi as u32 & 7) << 8
+            | vdst as u32,
+        (neg as u32 & 7) << 29
+            | (opsel_hi as u32 & 3) << 27
+            | (src[0] as u32 & 0x1FF)
+            | (src[1] as u32 & 0x1FF) << 9
+            | (src[2] as u32 & 0x1FF) << 18,
+    ]
+}
+
+/// The host check `victory-gpu` makes for `Options::native16`: WARP has
+/// native 16-bit operations but rounds a 16-bit `FMad` in f32 first, so it
+/// is refused.
+#[test]
+fn hosts_that_round_f16_fmad_twice_keep_the_f32_path() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(warp) = Host::new(true) {
+        assert_eq!(warp.rounds_f16_fmad_once(), Ok(false), "WARP");
+        assert!(!warp.native16(), "WARP");
+    }
+    if let Ok(hardware) = Host::new(false) {
+        let once = hardware.rounds_f16_fmad_once();
+        eprintln!("hardware adapter rounds a 16-bit FMad once: {once:?}");
+        assert!(once.is_ok(), "the check runs");
+    }
+}
+
+/// Native 16-bit operations are declared exactly where `half` is used:
+/// with `native16`, for the f16 arithmetic, not for conversions.
+#[test]
+fn native_16bit_operations_are_declared_where_used() {
+    let add = [vop2(0x32, 0, vgpr(1), 2)];
+    let pk_fma = vop3p(0x0E, 0, [vgpr(1), vgpr(2), vgpr(3)], 0, 7, 0, 0, false);
+    let cvt = [vop1(0x0A, 0, vgpr(1))];
+    for (body, native) in [(&add[..], true), (&pk_fma[..], true), (&cvt[..], false)] {
+        let f32_path = try_build_valu_cs(body, false).expect("f32 path");
+        assert!(!declares_native16(&f32_path));
+        let n16 = try_build_valu_cs(body, true).expect("native16");
+        assert_eq!(declares_native16(&n16), native);
+    }
+}
+
+/// An f16 sum or product with an output modifier takes the f32 path with
+/// `native16`: both lowerings translate it alike or refuse it alike, and a
+/// translated one declares no native 16-bit operations.
+#[test]
+fn output_modifiers_on_f16_results_take_the_f32_path_natively() {
+    for op in [0x132u16, 0x135] {
+        for omod in 1..=3 {
+            let body = vop3_mod(op, 0, vgpr(1), vgpr(2), 0, 0, 0, omod, false);
+            let f32_path = try_build_valu_cs(&body, false);
+            let native = try_build_valu_cs(&body, true);
+            match (&f32_path, &native) {
+                (Ok(_), Ok(n)) => assert!(!declares_native16(n), "{op:#x} omod={omod}"),
+                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{op:#x} omod={omod}"),
+                (a, b) => panic!("{op:#x} omod={omod}: f32 {:?}, native {:?}", a.is_ok(), b.is_ok()),
+            }
+        }
+    }
+}
+
+/// The inputs #2384 found to tell one rounding of a 16-bit multiply-add
+/// from two: (a, b, c) and the result rounded once.
+#[test]
+fn fused_f16_results_round_once_natively() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware adapter; skipped");
+        return;
+    };
+    if !host.native16() {
+        eprintln!("hardware: no native 16-bit operations rounding FMad once; skipped");
+        return;
+    }
+    const CASES: &[[u32; 4]] = &[
+        [0x3C01, 0x3E00, 0x8001, 0x3E01],
+        [0x3C03, 0x3E00, 0x0001, 0x3E05],
+        [0x3C01, 0x3E00, 0xBE00, 0x1600],
+    ];
+    let run_one = |shader: &HostShader, inputs: [u32; 4]| -> u32 {
+        let (root, pso) = host.compute_pipeline(shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => inputs[u.dword as usize],
+                _ => 0,
+            };
+        }
+        host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch")[0][0]
+    };
+
+    let fma = try_build_valu_cs(&vop3(0x34B, 0, vgpr(1), vgpr(2), vgpr(3)), true).unwrap();
+    let fmac = try_build_valu_cs(&[vop1(0x01, 0, vgpr(3)), vop2(0x36, 0, vgpr(1), 2)], true).unwrap();
+    let pk_fma = try_build_valu_cs(
+        &vop3p(0x0E, 0, [vgpr(1), vgpr(2), vgpr(3)], 0, 7, 0, 0, false),
+        true,
+    )
+    .unwrap();
+    for &[a, b, c, want] in CASES {
+        assert_eq!(run_one(&fma, [a, b, c, 0]) & 0xFFFF, want, "v_fma_f16 {a:04x} {b:04x} {c:04x}");
+        assert_eq!(run_one(&fmac, [a, b, c, 0]) & 0xFFFF, want, "v_fmac_f16 {a:04x} {b:04x} {c:04x}");
+        assert_eq!(
+            run_one(&pk_fma, [a | a << 16, b | b << 16, c | c << 16, 0]),
+            want | want << 16,
+            "v_pk_fma_f16 {a:04x} {b:04x} {c:04x}"
+        );
+    }
+}
+
+/// Native 16-bit add/sub/mul/min/max/med3/clamp and packed equivalents match
+/// RDNA2 rules (including -0/+0 order and clamp turning -0/NaN to +0).
+#[test]
+fn native16_f16_and_pk_operations_match_rdna2() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware adapter; skipped");
+        return;
+    };
+    if !host.native16() {
+        eprintln!("hardware: no native 16-bit operations rounding FMad once; skipped");
+        return;
+    }
+    let dispatch = |shader: &HostShader, inputs: [u32; 4]| -> u32 {
+        let (root, pso) = host.compute_pipeline(shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => inputs[u.dword as usize],
+                _ => 0,
+            };
+        }
+        host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch")[0][0]
+    };
+
+    // v_add_f16 clamp: -0 -> +0, NaN -> +0, 1.5 -> 1.0
+    let add_clamp = try_build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 0, true), true).unwrap();
+    assert_eq!(dispatch(&add_clamp, [0x8000, 0x8000, 0, 0]) & 0xFFFF, 0x0000);
+    assert_eq!(dispatch(&add_clamp, [0x7E00, 0x3C00, 0, 0]) & 0xFFFF, 0x0000);
+    assert_eq!(dispatch(&add_clamp, [0x3E00, 0x3C00, 0, 0]) & 0xFFFF, 0x3C00);
+
+    // v_min_f16 / v_max_f16: -0 < +0
+    let max_f16 = try_build_valu_cs(&vop3(0x139, 0, vgpr(1), vgpr(2), 0), true).unwrap();
+    let min_f16 = try_build_valu_cs(&vop3(0x13A, 0, vgpr(1), vgpr(2), 0), true).unwrap();
+    assert_eq!(dispatch(&min_f16, [0x0000, 0x8000, 0, 0]) & 0xFFFF, 0x8000);
+    assert_eq!(dispatch(&max_f16, [0x8000, 0x0000, 0, 0]) & 0xFFFF, 0x0000);
+
+    // v_med3_f16 with NaN
+    let med3_f16 = try_build_valu_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)), true).unwrap();
+    assert_eq!(dispatch(&med3_f16, [0x7E00, 0x3C00, 0x0000, 0]) & 0xFFFF, 0x0000);
+    assert_eq!(dispatch(&med3_f16, [0x3C00, 0x4000, 0x4200, 0]) & 0xFFFF, 0x4000);
+
+    // v_pk_add_f16 with neg_hi on src0
+    let pk_add = try_build_valu_cs(
+        &vop3p(0x0F, 0, [vgpr(1), vgpr(2), 0], 0, 7, 0, 1, false),
+        true,
+    )
+    .unwrap();
+    // low: 1.0 + 2.0 = 3.0 (0x4200); high: -1.0 + 2.0 = 1.0 (0x3C00)
+    assert_eq!(
+        dispatch(&pk_add, [0x3C00_3C00, 0x4000_4000, 0, 0]),
+        0x3C00_4200
+    );
 }

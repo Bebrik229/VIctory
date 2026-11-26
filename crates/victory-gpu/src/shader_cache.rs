@@ -39,15 +39,20 @@ pub(crate) fn counts() -> (u64, u64) {
 
 /// What identifies the translation, besides the container: the shader
 /// crate's fingerprint (its source, every switch it reads, the host facts the
-/// device gave it, the loop limit, barrier waits and clean-up passes) and
-/// this file's encoding of the result. Not the whole executable any more: a
-/// rebuild that leaves the translator alone keeps its translations (each new
-/// build used to translate the title's thousands of shaders again, which kept
-/// the first minutes of every test run short of pipelines).
-/// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
-/// Worked out per lookup, so a translation made before the device said its
-/// wave size is never filed under the later key.
+/// device gave it, the loop limit, barrier waits, clean-up passes, and whether
+/// f16 arithmetic is native [`options`]) and this file's encoding of the
+/// result, so one path's entries never serve the other. Not the whole
+/// executable any more: a rebuild that leaves the translator alone keeps its
+/// translations (each new build used to translate the title's thousands of
+/// shaders again, which kept the first minutes of every test run short of
+/// pipelines). `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the
+/// executable's hash). Worked out per lookup, so a translation made before
+/// the device said its wave size is never filed under the later key.
 fn build() -> [u8; 32] {
+    build_with(options())
+}
+
+fn build_with(options: victory_shader::emit::Options) -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = victory_shader::emit::loop_limit();
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
@@ -72,15 +77,23 @@ fn build() -> [u8; 32] {
     if let Some(exe) = exe {
         h.update(exe);
     }
-    h.update(&victory_shader::emit::translation_fingerprint());
+    h.update(&victory_shader::emit::translation_fingerprint_with(options));
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
+}
+
+/// How shaders are translated for this host: f16 arithmetic is native `half`
+/// where the host runs native 16-bit operations (`crate::host::native16`).
+pub fn options() -> victory_shader::emit::Options {
+    victory_shader::emit::Options {
+        native16: crate::host::native16(),
+    }
 }
 
 /// The offline warm-up (`victory translate --warm`): `container` is
 /// translated into the cache unless it is there already. `Ok(true)`: it
 /// was translated now. Needs [`use_shader_cache`] and the same host facts
-/// the run will have (`victory_shader::emit::translation_fingerprint`).
+/// the run will have (`victory_shader::emit::translation_fingerprint_with`).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     use victory_shader::emit;
     let cache = CACHE.get().ok_or("no shader cache")?;
@@ -90,12 +103,13 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     // By its hash and under its own key, as at run time ([`host_shader`]):
     // the per-program switches.
     let hash = blake3::hash(container).to_hex()[..16].to_owned();
+    let options = options();
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        emit::for_program(&hash, || emit::translate(c)).map_err(|e| e.to_string())
+        emit::for_program(&hash, || emit::translate_with(c, options)).map_err(|e| e.to_string())
     };
     let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
-    cached(cache, &program_key(&build(), off, container.len()), container, translate)
+    cached(cache, &program_key(&build_with(options), off, container.len()), container, translate)
         .map(|_| ran.load(Ordering::Relaxed))
 }
 
@@ -106,14 +120,17 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     // The hash the log names the shader by (`pipeline.rs`), which the
     // per-program switches take.
     let hash = blake3::hash(container).to_hex()[..16].to_owned();
-    let translate = |c: &[u8]| emit::for_program(&hash, || emit::translate(c)).map_err(|e| e.to_string());
+    let options = options();
+    let translate = |c: &[u8]| {
+        emit::for_program(&hash, || emit::translate_with(c, options)).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => {
             // (`wave64_retried` second: it parses the container, and only a
             // program a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0`
             // any, gets there)
             let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
-            cached(cache, &program_key(&build(), off, container.len()), container, translate)
+            cached(cache, &program_key(&build_with(options), off, container.len()), container, translate)
         }
         None => translate(container),
     }
@@ -522,5 +539,14 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn native16_changes_the_cache_build_key() {
+        use victory_shader::emit::Options;
+        assert_ne!(
+            build_with(Options { native16: false }),
+            build_with(Options { native16: true }),
+        );
     }
 }

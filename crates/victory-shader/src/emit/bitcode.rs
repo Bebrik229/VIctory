@@ -30,6 +30,8 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    /// IEEE binary16 (native 16-bit operations, SM 6.2).
+    Half,
     Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
@@ -226,6 +228,8 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// The module uses native 16-bit types: written with their data layout.
+    pub native16: bool,
 }
 
 impl Module {
@@ -247,6 +251,9 @@ impl Module {
     }
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
+    }
+    pub fn half(&mut self) -> Ty {
+        self.ty(TypeDef::Half)
     }
     pub fn double(&mut self) -> Ty {
         self.ty(TypeDef::Double)
@@ -549,6 +556,89 @@ impl Module {
         live
     }
 
+    /// Instructions (including terminators) that [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_instructions(&self) -> usize {
+        let plan = self.plan();
+        plan.layout
+            .iter()
+            .map(|&b| {
+                let block = &self.blocks[b];
+                block
+                    .phis
+                    .iter()
+                    .chain(&block.body)
+                    .filter(|&&i| plan.live[i as usize])
+                    .count()
+                    + 1
+            })
+            .sum()
+    }
+
+    fn plan(&self) -> Plan {
+        // Phis nothing reads are left out (one register per phi makes many).
+        let live = self.live();
+
+        // Blocks are laid out in reverse postorder, so every block follows
+        // its forward predecessors (drivers take a branch to an earlier
+        // block for a loop's back edge).
+        let succs = |b: usize| successors(self.blocks[b].term);
+        let mut seen = vec![false; self.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        if !self.blocks.is_empty() {
+            seen[0] = true;
+        }
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        let mut pos = vec![u64::MAX; self.blocks.len()];
+        for (n, &b) in post.iter().enumerate() {
+            pos[b] = n as u64;
+        }
+        // An empty latch (only a branch back to its loop header) is folded
+        // into its one predecessor, so the exiting block is the latch as in
+        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for &b in &post {
+            for &s in succs(b).iter() {
+                preds[s].push(b);
+            }
+        }
+        let mut fold = vec![None; self.blocks.len()];
+        let mut folded_edges = std::collections::HashSet::new();
+        for &b in &post {
+            let blk = &self.blocks[b];
+            if let (Some(Term::Br(h)), true, [p]) = (
+                blk.term,
+                blk.phis.is_empty() && blk.body.is_empty(),
+                &preds[b][..],
+            ) && pos[h] < pos[b]
+                && fold[*p].is_none()
+                && fold[h].is_none()
+                && !succs(*p).contains(&h)
+                && folded_edges.insert((*p, h))
+            {
+                fold[b] = Some((*p, h));
+            }
+        }
+        let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
+        Plan { live, layout, fold }
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
@@ -582,6 +672,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Half => w.record(10, &[]),
                 TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
@@ -607,11 +698,15 @@ impl Module {
         w.exit();
 
         w.record(2, &chars("dxil-ms-dx"));
+        // Native 16-bit types are laid out in 16 bits, minimum precision in
+        // 32 (the validator wants the layout that matches the flags).
         w.record(
             3,
-            &chars(
-                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
-            ),
+            &chars(if self.native16 {
+                "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64"
+            } else {
+                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64"
+            }),
         );
         let first_const = (self.globals.len() + self.funcs.len()) as u64;
         for g in &self.globals {
@@ -682,64 +777,7 @@ impl Module {
         }
         w.exit();
 
-        // Phis nothing reads are left out (one register per phi makes many).
-        let live = self.live();
-
-        // Blocks are laid out in reverse postorder, so every block follows
-        // its forward predecessors (drivers take a branch to an earlier
-        // block for a loop's back edge).
-        let succs = |b: usize| successors(self.blocks[b].term);
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match succs(b).get(k) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
-        let mut pos = vec![u64::MAX; self.blocks.len()];
-        for (n, &b) in post.iter().enumerate() {
-            pos[b] = n as u64;
-        }
-        // An empty latch (only a branch back to its loop header) is folded
-        // into its one predecessor, so the exiting block is the latch as in
-        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
-        let mut preds = vec![Vec::new(); self.blocks.len()];
-        for &b in &post {
-            for &s in succs(b).iter() {
-                preds[s].push(b);
-            }
-        }
-        let mut fold = vec![None; self.blocks.len()];
-        let mut folded_edges = std::collections::HashSet::new();
-        for &b in &post {
-            let blk = &self.blocks[b];
-            if let (Some(Term::Br(h)), true, [p]) = (
-                blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
-                &preds[b][..],
-            ) && pos[h] < pos[b]
-                && fold[*p].is_none()
-                && fold[h].is_none()
-                && !succs(*p).contains(&h)
-                && folded_edges.insert((*p, h))
-            {
-                fold[b] = Some((*p, h));
-            }
-        }
-        let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
+        let Plan { live, layout, fold } = self.plan();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in layout.iter().enumerate() {
             pos[b] = n as u64;
@@ -899,6 +937,12 @@ impl Module {
         w.exit();
         w.finish()
     }
+}
+
+struct Plan {
+    live: Vec<bool>,
+    layout: Vec<usize>,
+    fold: Vec<Option<(usize, usize)>>,
 }
 
 const MODULE_BLOCK: u64 = 8;

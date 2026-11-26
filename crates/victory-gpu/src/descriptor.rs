@@ -207,7 +207,16 @@ pub(crate) fn sync_heaps() {
             // Capped host heaps without a heap map have no counterparts for the
             // title slots past `count`; with a heap map, every title slot has one.
             let mirrored_count = heap.desc.count.min(host.mirrored_count());
-            for (range_from, range_end) in written.take(start as usize, end as usize) {
+            // With `VICTORY_HEAP_SYNC_CUT`: only the pages that hold slots the
+            // host heap has mirrored counterparts for are taken and read ([`sync_cut`]).
+            let looked_end = if sync_cut() {
+                (start as usize)
+                    .saturating_add(mirrored_count as usize * step as usize)
+                    .min(end as usize)
+            } else {
+                end as usize
+            };
+            for (range_from, range_end) in written.take(start as usize, looked_end) {
                 let mut page = range_from & !(crate::watch::PAGE - 1);
                 while page < range_end {
                     let from = page.max(range_from);
@@ -241,6 +250,46 @@ pub(crate) fn sync_heaps() {
 /// not the one last seen (mirrored), and the microseconds it took.
 #[cfg(windows)]
 pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether [`sync_heaps`] leaves alone the part of a title view heap the
+/// host heap has no mirrored counterparts for (`VICTORY_HEAP_SYNC_CUT=1`; off
+/// by default; `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log).
+///
+/// On a host that caps view heaps at 1,000,000 without a heap map the host
+/// heap holds the title's slots below 737,855 and the title's heap has
+/// 1,245,184. The records past the host's title slots were never mirrored,
+/// but their pages were asked about and read all the same, and they are the
+/// busiest of the heap: the title keeps its own per-draw tables there and
+/// rewrites them every frame. The layer serves those tables from slots of
+/// its own when a draw names them. With the switch the pass asks the write
+/// watch about, and reads, the mirrored part only: the same records are
+/// mirrored.
+#[cfg(windows)]
+fn sync_cut() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SYNC_CUT").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the pass over the title's view heap leaves the part the host has no title slots for alone from now (VICTORY_HEAP_SYNC_CUT=alt): {}",
+                    if on { "ON" } else { "off, every changed page is read as usual" }
+                );
+            }
+            on
+        }
+    }
+}
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
@@ -347,13 +396,29 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// The render target view description words in the host's layout (with the
+    /// format mapped for the host), or `None` when the host's default view of
+    /// the resource is used.
+    #[cfg(windows)]
+    pub(crate) fn rtv_words(&self) -> Option<[u32; 6]> {
+        const TEXTURE_2D: u32 = 4;
+        self.host_words(TEXTURE_2D)
+    }
+
+    /// The depth view description words in the host's layout, or `None` for
+    /// the host's default view of the resource.
+    #[cfg(windows)]
+    pub(crate) fn dsv_words(&self) -> Option<[u32; 6]> {
+        const TEXTURE_2D: u32 = 3;
+        self.host_words(TEXTURE_2D)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        self.rtv_words().map(Self::cast_desc)
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -361,16 +426,14 @@ impl RtvRecord {
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        self.dsv_words().map(Self::cast_desc)
     }
 
-    /// The description words as a host type, the format as the host has it.
-    /// Without one, a typeless host copy gets a 2D view (`dimension`) in
+    /// The description words in the host's layout, the format as the host has
+    /// it. Without one, a typeless host copy gets a 2D view (`dimension`) in
     /// the title's format, which the host needs spelled out.
     #[cfg(windows)]
-    fn host_desc<T>(&self, dimension: u32) -> Option<T> {
-        assert!(size_of::<T>() <= size_of::<[u32; 6]>());
+    fn host_words(&self, dimension: u32) -> Option<[u32; 6]> {
         let mut words = if self.described != 0 {
             self.desc
         } else {
@@ -385,8 +448,16 @@ impl RtvRecord {
         };
         // A target or depth view: of a target, in its stand-in format.
         words[0] = crate::resource::target_format(crate::resource::pc_format(words[0]));
+        Some(words)
+    }
+
+    /// Reinterprets description words as the matching host D3D12 view
+    /// description (both are 24 bytes in this layout).
+    #[cfg(windows)]
+    pub(crate) fn cast_desc<T>(words: [u32; 6]) -> T {
+        assert!(size_of::<T>() <= size_of::<[u32; 6]>());
         // SAFETY: both host view descriptions are 24 bytes in this layout.
-        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+        unsafe { (&raw const words).cast::<T>().read_unaligned() }
     }
 }
 
@@ -938,12 +1009,94 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        if crate::heap_pass::marked_set() {
+            note_forgotten(i);
+        }
         freed = true;
     }
     #[cfg(windows)]
     if freed {
         FORGET_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// With `VICTORY_HEAP_PASS_MARKED` (`crate::heap_pass`): table entries
+/// freed since the pass over the heap's buffer views last asked
+/// ([`take_forgotten`]): records that name them read nothing now, though no
+/// slot was written. Kept only once a pass has asked.
+static FORGOTTEN: std::sync::Mutex<(bool, bool, Vec<u32>)> =
+    std::sync::Mutex::new((false, false, Vec::new()));
+
+/// More entries than this between two asks: the list is dropped, and the
+/// next ask is told it does not know.
+const FORGOTTEN_MOST: usize = 1 << 20;
+
+fn note_forgotten(i: u32) {
+    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (asked, overflowed, list) = &mut *forgotten;
+    if !*asked || *overflowed {
+        return;
+    }
+    if list.len() >= FORGOTTEN_MOST {
+        *overflowed = true;
+        *list = Vec::new();
+        return;
+    }
+    list.push(i);
+}
+
+/// The table entries freed since the last call (in any order, maybe
+/// twice); `None` on the first call and when too many were to be kept.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn take_forgotten() -> Option<Vec<u32>> {
+    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (asked, overflowed, list) = &mut *forgotten;
+    let known = *asked && !*overflowed;
+    *asked = true;
+    *overflowed = false;
+    let list = std::mem::take(list);
+    known.then_some(list)
+}
+
+/// The record at `handle` (a descriptor slot in title memory): its tag and
+/// two words, read as they are.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn record_at(handle: u64) -> [u32; 3] {
+    // SAFETY: the handle is a descriptor slot in title memory, at least 16
+    // bytes.
+    unsafe { (handle as *const [u32; 3]).read_unaligned() }
+}
+
+/// The view table entry a record names, if it names one (not a view named
+/// whole in its record, not a record of no view).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn record_entry(record: [u32; 3]) -> Option<u32> {
+    let [tag, i, generation] = record;
+    (tag == VIEW_TAG && generation >> KIND_SHIFT == 0).then_some(i)
+}
+
+/// The views of `records` (each a descriptor's first three dwords: tag,
+/// entry, generation), under one look-up.
+#[cfg(windows)]
+pub(crate) fn views_of(records: &[[u32; 3]]) -> Vec<Option<View>> {
+    let views = views_read();
+    records
+        .iter()
+        .map(|&[tag, i, generation]| {
+            if tag != VIEW_TAG {
+                return None;
+            }
+            match generation >> KIND_SHIFT {
+                0 => {
+                    let (view, current) = views.list.get(i as usize)?;
+                    (*current == generation).then(|| view.clone())
+                }
+                CONSTANT => Some(constant_of(i, generation)),
+                PLACED => views.placed_of(i, generation),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// The view the record words `i` and `generation` name: the one they hold

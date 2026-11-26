@@ -25,6 +25,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+mod half;
+
 #[path = "group_uniform.rs"]
 mod group_uniform;
 use group_uniform::{all_group_blocks, all_lane_blocks, lane_regions, lds_meetings};
@@ -66,6 +68,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -88,6 +93,9 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// The host has native 16-bit float operations
+    /// ([`super::Options::native16`]).
+    pub native16: bool,
 }
 
 enum Stop {
@@ -2213,6 +2221,14 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let nonuniform_handles = self.s.nonuniform_handles;
+        #[cfg(test)]
+        let wave_ops = self.s.flags & flags::WAVE_OPS != 0;
+        #[cfg(test)]
+        let (dxil, instructions) = self.s.finish_counted();
+        #[cfg(not(test))]
+        let dxil = self.s.finish();
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2220,14 +2236,16 @@ impl<'a> Lower<'a> {
             root_srvs,
             root_uavs,
             #[cfg(test)]
-            nonuniform_handles: self.s.nonuniform_handles,
+            nonuniform_handles,
             #[cfg(test)]
-            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            instructions,
+            #[cfg(test)]
+            wave_ops,
             #[cfg(test)]
             flat_skips: self.flat_skips.len(),
             #[cfg(test)]
             lds_meetings: self.lds_meetings,
-            dxil: self.s.finish(),
+            dxil,
             user_data,
             samplers: self.samplers,
         })
@@ -3481,6 +3499,36 @@ impl<'a> Lower<'a> {
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
         self.s.m.select(c, z, zero, m)
+    }
+
+    /// Flushes f32 subnormals to signed zero, keeping all other values and
+    /// the sign of zero intact.
+    fn ftz(&mut self, x: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(x);
+        let exp_mask = self.s.m.i32(0x7F80_0000);
+        let sign_mask = self.s.m.i32(0x8000_0000);
+        let zero = self.s.m.i32(0);
+        let exp = self.s.m.bin(c, Bin::And, bits, exp_mask);
+        let sub = self.s.m.cmp(c, pred::EQ, exp, zero);
+        let signed_zero = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let flushed = self.s.m.select(c, sub, signed_zero, bits);
+        self.as_float(flushed)
+    }
+
+    /// A legacy multiply-add as RDNA 2 runs it: fused (`v_fma_legacy_f32`),
+    /// with the legacy rule that a zero factor makes the product a +0 rather
+    /// than turning an infinite or NaN factor into a NaN.
+    fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
+        let cur = self.cur;
+        let fused = self.fmad(a, b, c);
+        let zero = self.s.m.f32(0);
+        let az = self.s.m.cmp(cur, pred::OEQ, a, zero);
+        let bz = self.s.m.cmp(cur, pred::OEQ, b, zero);
+        let z = self.s.m.bin(cur, Bin::Or, az, bz);
+        // +0 + c, so the sign of a zero addend follows the addition.
+        let addend = self.s.m.bin(cur, Bin::Add, zero, c);
+        self.s.m.select(cur, z, addend, fused)
     }
 
     // ---- lane booleans ----
@@ -7224,21 +7272,26 @@ impl<'a> Lower<'a> {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
+                    // On RDNA 2 the legacy encoding decodes as fused
+                    // (`v_fma_legacy_f32`) and flushes its sources; the
+                    // zero-factor rule of the legacy multiply comes with it.
                     _ => {
-                        let m = self.legacy_mul(a, bb);
-                        self.s.m.bin(c, Bin::Add, m, acc)
+                        let (a, bb, acc) = (self.ftz(a), self.ftz(bb), self.ftz(acc));
+                        self.legacy_fmad(a, bb, acc)
                     }
                 };
                 float(self, r)
             }
-            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
+            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
-                } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
-                };
+                let m = self.s.m.bin(c, Bin::Mul, a, bb);
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
+                float(self, r)
+            }
+            "v_mad_legacy_f32" => {
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (a, bb, cc) = (self.ftz(a), self.ftz(bb), self.ftz(cc));
+                let r = self.legacy_fmad(a, bb, cc);
                 float(self, r)
             }
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
@@ -8144,6 +8197,9 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
+        if let Some(r) = self.valu16_native(inst, name, guard) {
+            return r;
+        }
         let c = self.cur;
         let i32t = self.s.t.i32;
         let f32t = self.s.t.f32;
@@ -8194,18 +8250,7 @@ impl<'a> Lower<'a> {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
             let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
                 // The accumulator is the destination's half that is written.
-                let Some(Operand::Vector { reg, .. }) = v.dst else {
-                    return Err("an accumulator");
-                };
-                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let x = if v.opsel >> 3 & 1 != 0 {
-                    let k16 = self.s.m.i32(16);
-                    self.s.m.bin(c, Bin::LShr, x, k16)
-                } else {
-                    x
-                };
-                let m = self.s.m.i32(0xFFFF);
-                let x = self.s.m.bin(c, Bin::And, x, m);
+                let x = self.mac_acc_bits(inst)?;
                 self.s
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
             } else {
@@ -8470,12 +8515,23 @@ impl<'a> Lower<'a> {
         }
         let c = self.cur;
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let native = float && self.native16();
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
             for k in 0..n {
                 let h = self.packed_src(inst, k, high, float)?;
-                if float {
+                if native {
+                    // The sign flipped on the bits, as `half` arithmetic
+                    // reads them.
+                    let neg = if high { v.neg_hi } else { v.neg };
+                    xs.push(if neg >> k & 1 != 0 {
+                        let sign = self.s.m.i32(0x8000);
+                        self.s.m.bin(c, Bin::Xor, h, sign)
+                    } else {
+                        h
+                    });
+                } else if float {
                     let mut f = self
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
@@ -8489,7 +8545,16 @@ impl<'a> Lower<'a> {
                     xs.push(h);
                 }
             }
-            let r = if float {
+            let r = if native {
+                let r = match op {
+                    "add_f16" => self.half_bin(Bin::Add, xs[0], xs[1]),
+                    "mul_f16" => self.half_bin(Bin::Mul, xs[0], xs[1]),
+                    "min_f16" => self.max_min16(false, xs[0], xs[1]),
+                    "max_f16" => self.max_min16(true, xs[0], xs[1]),
+                    _ => self.fma16(xs[0], xs[1], xs[2]),
+                };
+                if v.clamp { self.clamp16(r) } else { r }
+            } else if float {
                 let mut f = match op {
                     "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
                     "mul_f16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
@@ -8656,8 +8721,10 @@ impl<'a> Lower<'a> {
             }
             "v_bfe_u32" | "v_bfe_i32" => {
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let w = m31(self, w);
-                self.bfe(a, off, w, name == "v_bfe_i32")
+                // DXIL's Ibfe and Ubfe already use five bits of width and offset.
+                let op = if name == "v_bfe_i32" { 51 } else { 52 };
+                self.s
+                    .op(c, "tertiary.i32", Attr::ReadNone, self.s.t.i32, op, &[w, off, a])
             }
             "v_bfi_b32" => {
                 let (m, a, b) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -11559,6 +11626,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            native16: false,
         })
         .map(|_| ())
     }
@@ -11609,6 +11677,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            native16: false,
         })
     }
 
@@ -11720,6 +11789,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            native16: false,
         }).unwrap();
 
         let container =
@@ -12001,5 +12071,53 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn vector_bitfield_extract_instruction_count() {
+        let layout = || {
+            vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                root(RootType::Table, 4, 1),
+            ]
+        };
+        let used = || {
+            vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }]
+        };
+        for (name, op) in [("v_bfe_u32", 0x148u32), ("v_bfe_i32", 0x149)] {
+            // Read three runtime inputs from root constants into v1..v3, run
+            // v_bfe_{u,i}32 v0, v1, v2, v3, and store v0 to a UAV.
+            let words = [
+                0xBE85_0380,             // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000,             // s_load_dwordx4 s[8:11], s[4:5], 0
+                0x7E02_0200,             // v_mov_b32 v1, s0
+                0x7E04_0201,             // v_mov_b32 v2, s1
+                0x7E06_0202,             // v_mov_b32 v3, s2
+                0xD400_0000 | op << 16,
+                0x101 | 0x102 << 9 | 0x103 << 18,
+                0xE070_0000,
+                0x8002_0000,             // buffer_store_dword v0, off, s[8:11], 0
+                S_ENDPGM,
+            ];
+            let count = lower_with(&words, layout(), used()).unwrap().instructions;
+            assert!(count <= 24, "{name} DXIL instruction count too high: {count}");
+        }
     }
 }

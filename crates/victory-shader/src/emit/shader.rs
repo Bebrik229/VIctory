@@ -73,12 +73,16 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// 16-bit types are used; with [`NATIVE_LOW_PRECISION`], as native
+    /// 16-bit ones (SM 6.2), not minimum precision.
+    pub const LOW_PRECISION: u64 = 1 << 5;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
+    pub const NATIVE_LOW_PRECISION: u64 = 1 << 23;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
@@ -484,7 +488,18 @@ impl Shader {
     }
 
     /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_inner().0
+    }
+
+    /// [`Self::finish`], together with the number of instructions written to
+    /// the DXIL function body.
+    #[cfg(test)]
+    pub(crate) fn finish_counted(self) -> (Vec<u8>, usize) {
+        self.finish_inner()
+    }
+
+    fn finish_inner(mut self) -> (Vec<u8>, usize) {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -504,12 +519,17 @@ impl Shader {
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
                 (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
+                (
+                    flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION,
+                    used.native16,
+                ),
             ] {
                 if !used {
                     self.flags &= !flag;
                 }
             }
         }
+        self.m.native16 = self.flags & flags::NATIVE_LOW_PRECISION != 0;
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -836,6 +856,9 @@ impl Shader {
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
         }
+        if self.flags & flags::NATIVE_LOW_PRECISION != 0 {
+            features |= 0x4_0000;
+        }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
         }
@@ -879,7 +902,11 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        #[cfg(test)]
+        let count = self.m.written_instructions();
+        #[cfg(not(test))]
+        let count = 0;
+        (container::build(&parts), count)
     }
 
     /// The user-data buffer's annotation carries its size, known only now.

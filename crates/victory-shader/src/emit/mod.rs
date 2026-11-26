@@ -60,6 +60,14 @@
 //!   for 32-bit operations and R32G32_UINT for 64-bit operations. The latter
 //!   require SM 6.6 atomic support on typed and descriptor-heap resources.
 //!
+//! * **16-bit floats** (native `half` with [`Options::native16`]; added
+//!   2026-11-25). Without it, an f16 operation is done in f32 on its
+//!   widened sources and the result rounded to f16 in integer code (or the
+//!   host's conversion). With it, `v_add/sub/subrev/mul_f16`,
+//!   `v_fma/fmac_f16`, `v_min/max/min3/max3/med3_f16` and the packed
+//!   `v_pk_add/mul/fma/min/max_f16` are `half` arithmetic (SM 6.2 16-bit
+//!   types, flagged as native low precision).
+//!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
 //! earlier stages already run). The root constants of each stage must
@@ -203,6 +211,11 @@ pub fn shader_opt() -> u32 {
 /// this instead of on the whole executable, so a rebuild that leaves the
 /// translator alone keeps its translations. Call it after the device is made.
 pub fn translation_fingerprint() -> Vec<u8> {
+    translation_fingerprint_with(Options::default())
+}
+
+/// [`translation_fingerprint`] including caller/host [`Options`].
+pub fn translation_fingerprint_with(options: Options) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
@@ -231,6 +244,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.push(u8::from(options.native16));
     out
 }
 
@@ -314,6 +328,18 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// Settings that vary with the caller or host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Options {
+    /// The host runs native 16-bit float operations (D3D12
+    /// `Native16BitShaderOpsSupported`; SM 6.2 and up, which the
+    /// translation needs anyway) and rounds a 16-bit `FMad` once
+    /// (`host::Host::native16` checks both): f16 arithmetic is done in
+    /// `half` (module notes, "16-bit floats"), not in f32 with each result
+    /// rounded in integer code.
+    pub native16: bool,
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -324,15 +350,20 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    match translate_plain(container) {
+    translate_with(container, Options::default())
+}
+
+/// [`translate`] with [`Options`].
+pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    match translate_plain(container, options) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
-            lower::with_first_half_pairs(|| translate_plain(container))
+            lower::with_first_half_pairs(|| translate_plain(container, options))
         }
         other => other,
     }
 }
 
-fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
+fn translate_plain(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let native = main_program(&c)?;
     let p = crate::spill::build(&native)?;
@@ -342,7 +373,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
 /// The program of a container that [`translate`] translates: its vertex,
@@ -374,9 +405,22 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_with(c, native, p, st, io, res, Options::default())
+}
+
+/// [`emit`] with [`Options`].
+pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
-    let original = emit_program(c, native, p, st, io, res);
+    let original = emit_program(c, native, p, st, io, res, options);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -438,7 +482,7 @@ pub fn emit(
         ];
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
-                let again = emit_program(c, native, p, st, io, res);
+                let again = emit_program(c, native, p, st, io, res, options);
                 report(name, &again);
                 if done(&again) {
                     return again.map(|(shader, _)| shader);
@@ -451,6 +495,10 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
+        // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
+        // the programs the approximate forms already take keep their barrier-free form.
+        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -468,7 +516,7 @@ pub fn emit(
                 }
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
-                    let again = emit_program(c, native, p, st, io, res);
+                    let again = emit_program(c, native, p, st, io, res, options);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
@@ -485,7 +533,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, why, options);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -503,7 +551,7 @@ pub fn emit(
                 if let Some((p, st, io, res)) = f
                     && idiom(p, st) == exact
                 {
-                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res, options));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
                         return local.map(|(shader, _)| shader);
@@ -511,7 +559,7 @@ pub fn emit(
                 }
             }
             if idiom(p, st) == exact {
-                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res, options));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
@@ -523,17 +571,34 @@ pub fn emit(
             if !strict {
                 for (name, f) in &forms {
                     if let Some((p, st, io, res)) = f {
-                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res, options));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
                             return local.map(|(shader, _)| shader);
                         }
                     }
                 }
-                let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res, options));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        if wide_last {
+            let deep_on = deep_skips_allowed(program.as_deref());
+            let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why, options);
+                report("wave-wide branches (last)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }
@@ -547,10 +612,10 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), options);
             match again {
                 Ok(_) => again,
-                Err(_) => emit_program(c, native, p, st, io, res),
+                Err(_) => emit_program(c, native, p, st, io, res, options),
             }
         }
         other => other,
@@ -569,7 +634,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res, options).map(|(shader, _)| shader)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -584,6 +649,7 @@ fn widen(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    options: Options,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -607,7 +673,7 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = emit_program(c, native, p, &st, &io, &res, options);
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
@@ -643,6 +709,7 @@ fn emit_program(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    options: Options,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -711,6 +778,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        native16: options.native16,
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -856,6 +924,18 @@ mod tests {
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn fingerprint_covers_new_switches_and_native16() {
+        let switches: Vec<&str> = env!("VICTORY_SHADER_SWITCHES").split(',').collect();
+        assert!(switches.contains(&"VICTORY_BVH_NO_HIT"), "{switches:?}");
+        assert!(switches.contains(&"VICTORY_BVH_BUILDER"), "{switches:?}");
+        assert!(switches.contains(&"VICTORY_WAVE_WIDE"), "{switches:?}");
+        assert_ne!(
+            translation_fingerprint_with(Options { native16: false }),
+            translation_fingerprint_with(Options { native16: true }),
+        );
     }
     use super::container::SigElement;
     use super::shader::Shader;
@@ -1389,6 +1469,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            native16: false,
         })
         .unwrap();
         let mut dxil = l.dxil;

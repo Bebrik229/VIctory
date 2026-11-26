@@ -32,7 +32,9 @@ fn fnv(state: &mut [u64; 2], bytes: &[u8]) {
 }
 
 fn main() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_owned());
+    let src = Path::new(&manifest).join("src");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     let mut list = Vec::new();
@@ -41,6 +43,7 @@ fn main() {
     let mut state = [0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64];
     let mut switches = std::collections::BTreeSet::new();
     for p in &list {
+        println!("cargo:rerun-if-changed={}", p.display());
         let rel = p.strip_prefix(&src).unwrap_or(p).to_string_lossy().replace('\\', "/");
         let text = std::fs::read(p).unwrap_or_default();
         fnv(&mut state, rel.as_bytes());

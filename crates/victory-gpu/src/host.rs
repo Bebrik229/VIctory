@@ -213,7 +213,11 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        if !reaper_on() {
+            drop(object);
+            return;
+        }
+        reap(vec![Retired(Box::new(object))]);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -244,7 +248,107 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    reap(done.into_iter().map(|(_, object)| object).collect());
+}
+
+/// Whether host objects that are let go are dropped by a thread of their
+/// own (`VICTORY_REAPER=1`; `alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log). Off by default.
+fn reaper_on() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let asked = match std::env::var("VICTORY_REAPER").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        if asked == 0
+            || std::thread::Builder::new()
+                .name("victory-reaper".into())
+                .spawn(reaper)
+                .is_err()
+        {
+            return 0;
+        }
+        tracing::info!(
+            "host objects that are let go are dropped by a thread of their own (VICTORY_REAPER=1; alt: in turn)"
+        );
+        asked
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "host objects let go are dropped by their own thread from now (VICTORY_REAPER=alt): {}",
+                    if on {
+                        "ON"
+                    } else {
+                        "off, by the thread that lets them go as usual"
+                    }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// What waits for [`reaper`].
+static REAP: (Mutex<Vec<Retired>>, std::sync::Condvar) =
+    (Mutex::new(Vec::new()), std::sync::Condvar::new());
+
+/// Objects [`reaper`] dropped since the start, and the microseconds that took.
+static REAPED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Drops `objects`: here, or with [`reaper_on`] on the thread of that name.
+fn reap(objects: Vec<Retired>) {
+    if objects.is_empty() {
+        return;
+    }
+    if !reaper_on() {
+        drop(objects);
+        return;
+    }
+    REAP.0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(objects);
+    REAP.1.notify_one();
+}
+
+/// The thread of [`reaper_on`]: drops what [`reap`] hands it, with no lock
+/// of ours held, and says every 4,096 objects how long the drops took.
+fn reaper() {
+    loop {
+        let objects = {
+            let mut waiting = REAP.0.lock().unwrap_or_else(|e| e.into_inner());
+            while waiting.is_empty() {
+                waiting = REAP.1.wait(waiting).unwrap_or_else(|e| e.into_inner());
+            }
+            std::mem::take(&mut *waiting)
+        };
+        let began = std::time::Instant::now();
+        let count = objects.len() as u64;
+        drop(objects);
+        let us = began.elapsed().as_micros() as u64;
+        let before = REAPED[0].fetch_add(count, Ordering::Relaxed);
+        let spent = REAPED[1].fetch_add(us, Ordering::Relaxed) + us;
+        if (before + count) / 4096 != before / 4096 {
+            tracing::info!(
+                "host objects dropped by their own thread (VICTORY_REAPER): {} so far in {:.1} ms of that thread ({:.0} us each); the last batch {count} in {:.1} ms",
+                before + count,
+                spent as f64 / 1e3,
+                spent as f64 / (before + count) as f64,
+                us as f64 / 1e3
+            );
+        }
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -551,6 +655,22 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         Some(report) => report(&text),
         None => std::process::abort(),
     }
+}
+
+/// Whether translated shaders do the console's f16 arithmetic in native
+/// `half` (`victory_shader::emit::Options::native16`): the host GPU runs
+/// native 16-bit operations and rounds a 16-bit `FMad` once (a dispatch).
+/// `VICTORY_F16_IN_F32=1` keeps it in f32 on any host. Asked once.
+pub(crate) fn native16() -> bool {
+    static NATIVE: OnceLock<bool> = OnceLock::new();
+    *NATIVE.get_or_init(|| {
+        let native = std::env::var_os("VICTORY_F16_IN_F32").is_none_or(|v| v != "1")
+            && host().is_some_and(|h| {
+                victory_shader::emit::host::Host::from_device(h.device.clone()).native16()
+            });
+        tracing::info!(native, "host native 16-bit float operations");
+        native
+    })
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -876,6 +996,90 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    #[test]
+    fn fill_scratch_reuses_same_range_and_invalidates_on_title_writes_and_reset() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let mut title = [0x11u8; 256];
+        let updated = [0x22u8; 64];
+        let src = title.as_ptr();
+        let fill_count = |l: &HostList| {
+            l.deferred()
+                .copies
+                .iter()
+                .map(|s| s.fills().len())
+                .sum::<usize>()
+        };
+
+        let g1 = list.fill_scratch(src, 64).unwrap();
+        assert_eq!(g1 % 256, 0, "CBV scratch must be 256-byte aligned");
+        assert_eq!(list.scratch.lock().unwrap().used, 256);
+        assert_eq!(fill_count(&list), 1);
+
+        // Repeating the same (src, len) reuses the cached GPU address without
+        // growing scratch or appending another Step::Fill.
+        for _ in 0..4 {
+            assert_eq!(list.fill_scratch(src, 64), Some(g1));
+        }
+        assert_eq!(list.scratch.lock().unwrap().used, 256);
+        assert_eq!(fill_count(&list), 1);
+
+        // A different length at the same source address allocates separately.
+        let g2 = list.fill_scratch(src, 128).unwrap();
+        assert_ne!(g2, g1);
+        assert_eq!(g2 % 256, 0);
+        assert_eq!(list.scratch.lock().unwrap().used, 512);
+        assert_eq!(fill_count(&list), 2);
+        assert_eq!(list.fill_scratch(src, 128), Some(g2));
+        assert_eq!(fill_count(&list), 2);
+
+        // A different source offset (unaligned) allocates separately and hits on repeat.
+        // SAFETY: offset 16 stays within the 256-byte `title` buffer.
+        let src_16 = unsafe { src.add(16) };
+        let g3 = list.fill_scratch(src_16, 64).unwrap();
+        assert_ne!(g3, g1);
+        assert_ne!(g3, g2);
+        assert_eq!(g3 % 256, 0);
+        assert_eq!(fill_count(&list), 3);
+        assert_eq!(list.fill_scratch(src_16, 64), Some(g3));
+        assert_eq!(fill_count(&list), 3);
+
+        // Host-only work does not write title memory and keeps the cache warm.
+        list.defer_host(|| {});
+        assert_eq!(list.fill_scratch(src, 64), Some(g1));
+        assert_eq!(fill_count(&list), 3);
+
+        // `defer_copy` writes title memory and must invalidate cached fills.
+        list.defer_copy(title.as_mut_ptr(), updated.as_ptr(), updated.len());
+        let src = title.as_ptr();
+        let g4 = list.fill_scratch(src, 64).unwrap();
+        assert_ne!(g4, g1);
+        assert_eq!(g4 % 256, 0);
+        assert_eq!(fill_count(&list), 4);
+        assert_eq!(list.fill_scratch(src, 64), Some(g4));
+        assert_eq!(fill_count(&list), 4);
+
+        // `defer` (`Step::Run`) may write title memory and must also invalidate.
+        list.defer(|| {});
+        let g5 = list.fill_scratch(src, 64).unwrap();
+        assert_ne!(g5, g4);
+        assert_eq!(g5 % 256, 0);
+        assert_eq!(fill_count(&list), 5);
+        assert_eq!(list.fill_scratch(src, 64), Some(g5));
+        assert_eq!(fill_count(&list), 5);
+
+        // Execute and reset: `Deferred` and `Scratch` both clear, so the next
+        // fill starts fresh from chunk 0 with a new Step::Fill.
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.deferred().filled.is_empty());
+        let g6 = list.fill_scratch(src, 64).unwrap();
+        assert_eq!(g6, g1, "reuses chunk 0 after reset");
+        assert_eq!(fill_count(&list), 1);
+        list.close();
     }
 }
 
@@ -2462,6 +2666,15 @@ struct Deferred {
 }
 
 impl Deferred {
+    /// A step that may write title memory invalidates cached refreshes,
+    /// GPU-write declarations, and scratch fills recorded earlier in the
+    /// same list.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -7183,9 +7396,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
-        deferred.gpu_written.clear();
-        deferred.filled.clear();
+        deferred.title_written();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7204,13 +7415,25 @@ impl HostList {
     /// until a title copy intervenes.
     pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
         let key = (src as usize, len as usize);
-        let known = self.deferred().filled.get(&key).copied();
-        if known.is_some() {
-            return known;
+        if let Some(&gpu) = self.deferred().filled.get(&key) {
+            return Some(gpu);
         }
-        let (gpu, to) = self.scratch(len)?;
-        self.defer_fill(to, src, len as usize);
-        self.deferred().filled.insert(key, gpu);
+        // Allocate outside the `deferred` lock: `scratch` takes `deferred` if
+        // an oversized request spills into `deferred.uploads`.
+        let (gpu, dst) = self.scratch(len)?;
+        let mut deferred = self.deferred();
+        if let Some(&existing) = deferred.filled.get(&key) {
+            return Some(existing);
+        }
+        deferred.append_fill(
+            Fill {
+                dst: dst as usize,
+                src: src as usize,
+                len: len as usize,
+            },
+            fill_workers(),
+        );
+        deferred.filled.insert(key, gpu);
         Some(gpu)
     }
 
@@ -7242,7 +7465,7 @@ impl HostList {
     ) {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.gpu_written.insert(key) {
+        if deferred.gpu_written.insert(key) || !declare_once() {
             deferred
                 .copies
                 .push(Step::GpuWrite(shadow.clone(), address, len));
@@ -7490,9 +7713,7 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
-        deferred.refreshed.clear();
-        deferred.gpu_written.clear();
-        deferred.filled.clear();
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -7528,9 +7749,13 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            let copied = match step {
+            match step {
                 &Step::Copy(dst, src, len) => {
+                    // Only copies and fills report their time in release builds.
+                    #[cfg(not(feature = "diagnostics"))]
+                    let started = std::time::Instant::now();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -7540,9 +7765,13 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
-                    len
+                    PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PREPARING[1].fetch_add(len as u64, Ordering::Relaxed);
                 }
                 Step::Fill(_) | Step::Fills(_) => {
+                    // Only copies and fills report their time in release builds.
+                    #[cfg(not(feature = "diagnostics"))]
+                    let started = std::time::Instant::now();
                     let fills = step.fills();
                     let bytes = run_fills(fills, fill_workers());
                     #[cfg(feature = "diagnostics")]
@@ -7550,7 +7779,8 @@ impl HostList {
                         add(C::Copies, fills.len() as u64);
                         add(C::CopyBytes, bytes as u64);
                     }
-                    bytes
+                    PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PREPARING[1].fetch_add(bytes as u64, Ordering::Relaxed);
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -7559,7 +7789,6 @@ impl HostList {
                         add(C::RefreshBytes, *len as u64);
                     }
                     batch.add(shadow, *address, *len);
-                    continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
@@ -7578,7 +7807,6 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
-                    continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data: this copy's
@@ -7595,7 +7823,6 @@ impl HostList {
                         add(C::GpuWrites, 1);
                         add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                     }
-                    continue;
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
@@ -7605,13 +7832,16 @@ impl HostList {
                             staging.refresh();
                         }
                     }
-                    continue;
                 }
-            };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
+}
+
+/// See [`HostList::defer_gpu_write`].
+fn declare_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DECLARE_ONCE").is_none_or(|v| v != "0"))
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
