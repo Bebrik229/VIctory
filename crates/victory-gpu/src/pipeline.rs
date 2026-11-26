@@ -71,6 +71,9 @@ pub(crate) struct Shader {
     /// Its result gets constant indirect diffuse light ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// It draws the sky as the title reflects it ([`crate::ambient::SKY`]).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -154,6 +157,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         resolves_light: bytes
             .windows(crate::ambient::PROGRAM.len())
             .any(|w| w == crate::ambient::PROGRAM),
+        #[cfg(windows)]
+        draws_sky: bytes
+            .windows(crate::ambient::SKY.len())
+            .any(|w| w == crate::ambient::SKY),
         #[cfg(windows)]
         translated: OnceLock::new(),
     });
@@ -481,6 +488,24 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`: if a bound view has another format than the title's
+/// pipeline declares for its slot (`host::formats_differ`), the host
+/// pipeline of the same shaders and state made for the bound formats
+/// (`make::for_formats`). A draw whose views are as declared pays one
+/// comparison of the nine words.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
 }
 
 /// Host pipelines queued and not made yet.
@@ -811,8 +836,17 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    // The whole state is read: integer targets do not blend on the host
+    // (`GraphicsState::apply_integer_blend_bypass`).
     #[cfg(windows)]
-    graphics.apply_integer_blend_bypass();
+    if graphics.apply_integer_blend_bypass() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                "a pipeline of the title's blends into a render target of integers: blending is off for that target on the host (said once)"
+            );
+        });
+    }
     hand_out(
         shaders,
         #[cfg(windows)]
@@ -1003,6 +1037,15 @@ mod tests {
             b"DXBC ... CS_ScreenProbes_TemporalResolve_0001 ...",
         );
         assert!(resolve.resolves_light);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn draws_sky_detects_sky_paraboloid_shader_name() {
+        let plain = shader("pixel", b"DXBC plain shader container");
+        assert!(!plain.draws_sky);
+        let sky = shader("pixel", b"DXBC ... ps_sky_paraboloid_reflection ...");
+        assert!(sky.draws_sky);
     }
 
     /// The stream layout the title builds (title+0x86f090): root

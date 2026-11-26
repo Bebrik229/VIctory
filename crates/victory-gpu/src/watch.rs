@@ -674,6 +674,77 @@ pub(crate) fn clean(page: usize) -> bool {
     guards().clean.contains(&page)
 }
 
+/// `VICTORY_ABSENT_ONCE`: 0 off, 1 on, 2 in turn ([`absent_once`]).
+fn absent_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_ABSENT_ONCE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether a block of view memory that Windows said is uncommitted is not
+/// asked about again for [`absent_keep_ms`] (`VICTORY_ABSENT_ONCE=1`; off
+/// by default).
+///
+/// `VICTORY_ABSENT_ONCE=alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log with the counts of the phase before.
+fn absent_once() -> bool {
+    match absent_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                let [asked, kept] = absent_looks();
+                tracing::info!(
+                    "blocks of view memory found uncommitted are asked of Windows again only after {} ms from now (VICTORY_ABSENT_ONCE=alt): {}; since the change before: {asked} questions to Windows about such blocks, {kept} blocks answered from their note",
+                    absent_keep_ms(),
+                    if on { "ON" } else { "off, at every asking as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// How long a block found uncommitted is not asked about again
+/// ([`absent_once`]): `VICTORY_ABSENT_MS`, 100 by default (about a frame),
+/// 1 to 1000.
+fn absent_keep_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| match std::env::var("VICTORY_ABSENT_MS").as_deref().map(str::trim) {
+        // Until the runtime tells of the block ([`title_memory_remapped`],
+        // [`title_memory_committed`]): no question to Windows at all for a
+        // block noted uncommitted. Run 279 with 100 ms: 600,000 to 690,000
+        // questions in twenty seconds without the notes, and still 357,000
+        // to 604,000 with them, because a frame is as long as a note lives.
+        Ok("told") => u64::MAX,
+        Ok(v) => v.parse::<u64>().map_or(100, |n| n.clamp(1, 1000)),
+        Err(_) => 100,
+    })
+}
+
+/// Since they were last taken ([`absent_looks`]): questions to Windows
+/// about blocks noted absent, and such blocks answered from their note
+/// ([`absent_once`]). Counted with the switch off too.
+static ABSENT_LOOKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`ABSENT_LOOKS`], taken.
+fn absent_looks() -> [u64; 2] {
+    [0, 1].map(|i| ABSENT_LOOKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Milliseconds since the guards' first asking: the clock of
+/// [`absent_once`]'s notes.
+fn guard_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`] (or `ask_once`).
@@ -1189,6 +1260,9 @@ struct Guards {
     /// Uncommitted `MEM_FREE` or non-`MEM_MAPPED` placeholder blocks that remain
     /// uncommitted until `title_memory_remapped`.
     absent_static: BlockSet,
+    /// When `absent` blocks were last found uncommitted (milliseconds of
+    /// [`guard_ms`]), for `VICTORY_ABSENT_ONCE`.
+    verified: BTreeMap<usize, u64>,
     /// Blocks whose physical page was guarded together with its other views
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
@@ -1245,6 +1319,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BlockSet::new(),
     absent: BlockSet::new(),
     absent_static: BlockSet::new(),
+    verified: BTreeMap::new(),
     aliased: BTreeSet::new(),
     pins: Vec::new(),
     guard_epoch: 0,
@@ -1270,6 +1345,18 @@ fn guard_inner(start: usize, end: usize, bump_epoch: bool) -> Option<(Vec<usize>
     install();
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
+    let keep = if absent_once() { absent_keep_ms() } else { 0 };
+    let now = if keep != 0 { guard_ms() } else { 0 };
+    if bump_epoch && absent_mode() == 1 {
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if (CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).is_multiple_of(65_536) {
+            let [asked, kept] = absent_looks();
+            tracing::info!(
+                "blocks of view memory found uncommitted are asked of Windows again only after {} ms (VICTORY_ABSENT_ONCE=1): in the last 65536 askings of the guards {asked} questions to Windows about such blocks, {kept} blocks answered from their note",
+                absent_keep_ms()
+            );
+        }
+    }
     let mut g = guards();
     let known = !ask && known_view_in(&g, start);
     if !known {
@@ -1308,12 +1395,22 @@ fn guard_inner(start: usize, end: usize, bump_epoch: bool) -> Option<(Vec<usize>
         for &block in missing.iter() {
             let mut open = true;
             if g.absent.contains(&block) {
-                if block >= uncommitted_until {
-                    uncommitted_until = uncommitted_info(block).0;
-                }
-                open = block >= uncommitted_until;
-                if open {
-                    g.absent.remove(&block);
+                let noted = keep != 0 && g.verified.get(&block).is_some_and(|&at| now < at.saturating_add(keep));
+                if noted {
+                    ABSENT_LOOKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    open = false;
+                } else {
+                    if block >= uncommitted_until {
+                        ABSENT_LOOKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        uncommitted_until = uncommitted_info(block).0;
+                    }
+                    open = block >= uncommitted_until;
+                    if open {
+                        g.absent.remove(&block);
+                        g.verified.remove(&block);
+                    } else if keep != 0 {
+                        g.verified.insert(block, now);
+                    }
                 }
             }
             if !open {
@@ -2027,6 +2124,44 @@ fn acquire_reading_now(range: std::ops::Range<usize>) -> Option<FastReadGuard> {
     title_memory_reading_now_range(range).map(FastReadGuard::Scoped)
 }
 
+/// The runtime committed title memory `[at, at + len)` for the title
+/// (`XMemVirtualAlloc` with a commit): what [`absent_once`] noted about its
+/// blocks is forgotten, so the next asking puts the question to Windows
+/// again, as every asking did before the notes. With `VICTORY_ABSENT_MS=told`
+/// this and [`title_memory_remapped`] are the only ways a block noted
+/// uncommitted is asked about again.
+pub fn title_memory_committed(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let evicted = {
+        let mut g = guards();
+        let mut changed = false;
+        if absent_mode() != 0 && !g.verified.is_empty() {
+            let noted: Vec<usize> = g.verified.range(first..last).map(|(&block, _)| block).collect();
+            for block in noted {
+                g.verified.remove(&block);
+                changed = true;
+            }
+        }
+        if !g.absent_static.chunks.is_empty() {
+            let static_blocks: Vec<usize> = g.absent_static.range(first..last).collect();
+            for block in static_blocks {
+                g.absent_static.remove(&block);
+                changed = true;
+            }
+        }
+        if changed {
+            GUARD_REV.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        changed
+    };
+    if evicted {
+        evict_ahead_guarded(at / PAGE, at.saturating_add(len).div_ceil(PAGE), &[]);
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
@@ -2050,6 +2185,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         let absent_static: Vec<usize> = g.absent_static.range(range.clone()).collect();
         for block in absent_static {
             g.absent_static.remove(&block);
+        }
+        let verified: Vec<usize> = g.verified.range(range.clone()).map(|(&block, _)| block).collect();
+        for block in verified {
+            g.verified.remove(&block);
         }
         let blocks: Vec<usize> = g.protected.range(range.clone()).collect();
         for block in blocks {
