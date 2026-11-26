@@ -1,14 +1,15 @@
 //! Textures shaders write that the title's own code then reads on the CPU.
 //! On the console the CPU and the GPU share memory, so what a compute pass
 //! stores into a texture is in title memory for the CPU to read. Here it stays
-//! in the texture's host copy. The title's ocean is one: its water/wave passes
-//! write compressed min/max planes and composite height/displacement textures
-//! that its CPU buoyancy code samples, which is what boats float on; without
-//! copy-back it read memory nothing had written and boats sank.
+//! in the texture's host copy. The title's ocean is one: its wave passes write
+//! a 256x256 height map (R32_FLOAT) and a displacement map (R32G32_FLOAT), and
+//! its CPU code samples both, which is what boats float on; it read memory
+//! nothing had written (run rw1, `VICTORY_READ_WATCH=1`: about 30 places in
+//! the title read those two kinds), and boats sank.
 //!
 //! For textures of the kinds in `VICTORY_TEXTURE_BACK` (comma-separated
-//! `<width>x<height>f<format>`; `0` for none; by default the kinds the read
-//! watch found the title reading), a list in which shaders write one copies it
+//! `<width>x<height>f<format>`; `1` for the four water formats found by
+//! the upstream trace), a list in which shaders write one copies it
 //! into a read-back buffer of ours when it closes, and once the list has run
 //! the texels are tiled into the texture's title memory in the console's
 //! layout, as the console's GPU would have left them.
@@ -19,7 +20,8 @@
 //! before, as it would before the console's GPU has run.
 
 use std::cell::RefCell;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -67,7 +69,11 @@ fn kinds() -> &'static [(u64, u32, u32)] {
     static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
     KINDS.get_or_init(|| {
         const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
-        let list = std::env::var("VICTORY_TEXTURE_BACK").unwrap_or_else(|_| DEFAULT.to_owned());
+        let list = match std::env::var("VICTORY_TEXTURE_BACK").as_deref() {
+            Ok("1") => DEFAULT.to_owned(),
+            Ok(spec) => spec.to_owned(),
+            Err(_) => String::new(),
+        };
         let kinds: Vec<(u64, u32, u32)> = list
             .split(',')
             .filter_map(|k| {
@@ -93,8 +99,90 @@ pub(crate) fn wanted(resource: This) -> bool {
         && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
 }
 
-/// A texture's copy into a read-back buffer, recorded into a list, and where
-/// its texels go once the list has run.
+/// An outstanding write to a specific allocation. Mapping and resource
+/// changes invalidate only the writes that could touch the replaced memory.
+struct Ticket {
+    owner: usize,
+    at: usize,
+    end: usize,
+    valid: AtomicBool,
+}
+
+static TICKETS: Mutex<Vec<Weak<Ticket>>> = Mutex::new(Vec::new());
+static TRACKING: AtomicBool = AtomicBool::new(false);
+
+fn track(owner: usize, at: usize, end: usize) -> Arc<Ticket> {
+    let ticket = Arc::new(Ticket {
+        owner,
+        at,
+        end,
+        valid: AtomicBool::new(true),
+    });
+    let mut tickets = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    tickets.retain(|weak| weak.strong_count() != 0);
+    tickets.push(Arc::downgrade(&ticket));
+    TRACKING.store(true, Ordering::Relaxed);
+    ticket
+}
+
+fn invalidate(matches: impl Fn(&Ticket) -> bool) {
+    if !TRACKING.load(Ordering::Relaxed) {
+        return;
+    }
+    TICKETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|weak| {
+            let Some(ticket) = weak.upgrade() else {
+                return false;
+            };
+            if matches(&ticket) {
+                ticket.valid.store(false, Ordering::Release);
+            }
+            true
+        });
+}
+
+pub(crate) fn released(owner: usize) {
+    invalidate(|ticket| ticket.owner == owner);
+}
+
+pub(crate) fn replaced(at: usize) {
+    invalidate(|ticket| ticket.at == at);
+}
+
+pub(crate) fn remapped(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    invalidate(|ticket| at < ticket.end && ticket.at < end);
+}
+
+pub(crate) struct Target {
+    pub(crate) copy: Arc<crate::resource::HostTexture>,
+    layout: victory_formats::texture::Layout,
+    ticket: Arc<Ticket>,
+}
+
+impl Target {
+    pub(crate) fn new(resource: This) -> Option<Self> {
+        // Keep the host copy independently of the title's resource lifetime.
+        let copy = crate::resource::host_copy(resource)?;
+        let _mapping = crate::watch::title_memory_reading();
+        let (layout, at, size) = crate::resource::title_texture(resource)?;
+        let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
+        let ticket = track(resource as usize, at, end);
+        Some(Self {
+            copy,
+            layout,
+            ticket,
+        })
+    }
+
+    pub(crate) fn owner(&self) -> usize {
+        self.ticket.owner
+    }
+}
+
+/// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
     buffer: Option<ID3D12Resource>,
     capacity: u64,
@@ -102,9 +190,7 @@ pub(crate) struct Back {
     rows: Vec<u32>,
     mips: u32,
     layout: victory_formats::texture::Layout,
-    /// The texture's title memory and its layout's bytes.
-    at: usize,
-    size: usize,
+    ticket: Arc<Ticket>,
 }
 
 impl Drop for Back {
@@ -115,16 +201,20 @@ impl Drop for Back {
     }
 }
 
-/// Records into `list` the copy of `texture` (title resource `resource`'s
-/// host copy, in the copy-source state) into a read-back buffer.
-pub(crate) fn record(
-    list: &ID3D12GraphicsCommandList,
-    resource: This,
-    texture: &ID3D12Resource,
-) -> Option<Back> {
+impl Back {
+    pub(crate) fn range(&self) -> (usize, usize) {
+        (self.ticket.at, self.ticket.end)
+    }
+}
+
+/// Records a host copy from a texture already in COPY_SOURCE.
+pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option<Back> {
+    if !target.ticket.valid.load(Ordering::Acquire) {
+        return None;
+    }
     let host = crate::host::host()?;
-    let (layout, at, size) = crate::resource::title_texture(resource)?;
-    // SAFETY: a live texture.
+    let texture = &target.copy.texture;
+    // SAFETY: a live texture kept through the command list's state tracking.
     let desc = unsafe { texture.GetDesc() };
     let mips = u32::from(desc.MipLevels.max(1));
     let subresources = mips * u32::from(desc.DepthOrArraySize.max(1));
@@ -145,6 +235,15 @@ pub(crate) fn record(
             Some(&mut total),
         )
     };
+    // The last footprint's advertised extent can omit row-end padding.
+    // The tiler reads a pitched slice, so the mapped buffer must include it.
+    for (footprint, &rows) in footprints.iter().zip(&rows) {
+        let format = footprint.Footprint;
+        let pitched = u64::from(format.RowPitch)
+            .checked_mul(u64::from(rows))?
+            .checked_mul(u64::from(format.Depth))?;
+        total = total.max(footprint.Offset.checked_add(pitched)?);
+    }
     let (capacity, buffer) = acquire_buffer(host, total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -166,32 +265,41 @@ pub(crate) fn record(
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(Back {
         buffer: Some(buffer),
         capacity,
         footprints,
         rows,
         mips,
-        layout,
-        at,
-        size,
+        layout: target.layout,
+        ticket: target.ticket,
     })
 }
 
-/// Textures copied back since the start.
-pub(crate) static COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Once the list that recorded `back` has run: its texels, tiled into the
-/// title's layout, into the texture's title memory.
+/// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
+    static COPIED: AtomicU64 = AtomicU64::new(0);
+    static STALE: AtomicU64 = AtomicU64::new(0);
     let Some(buffer) = back.buffer.as_ref() else {
         return;
     };
+    let _mapping = crate::watch::title_memory_reading();
+    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    if !back.ticket.valid.load(Ordering::Acquire) {
+        let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+        if skipped.is_power_of_two() {
+            tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
+        }
+        return;
+    }
+    let (at, end) = back.range();
+    let size = end - at;
     TILED.with_borrow_mut(|tiled| {
-        tiled.resize(back.size, 0);
-        // Bytes of title memory the subresources do not cover stay as they are.
-        crate::host::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
+        tiled.resize(size, 0);
+        // Keep title bytes the subresources do not cover.
+        if !crate::host::read_into(at as *const u8, tiled) {
+            return;
+        }
         let mut data = std::ptr::null_mut();
         // SAFETY: our read-back buffer, written by the list that has run.
         unsafe {
@@ -223,8 +331,12 @@ pub(crate) fn land(back: &Back) {
                 return;
             }
         }
-        crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
-        crate::watch::wrote(back.at, back.size);
+        crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+        crate::watch::wrote(at, size);
+        let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+        if copied == 1 || copied.is_multiple_of(128) {
+            tracing::info!(copied, bytes = size, "texture readback landed");
+        }
     });
 }
 
@@ -238,5 +350,23 @@ mod tests {
         assert_eq!(pick_pool_index(&[1024, 16384], 32768), None);
         assert_eq!(pick_pool_index(&[512 * 1024], 65536), None);
         assert_eq!(pick_pool_index(&[65536], 16384), Some(0));
+    }
+
+    #[test]
+    fn only_readbacks_for_changed_allocations_are_invalidated() {
+        let first = track(91, 0x1000, 0x2000);
+        let next = track(92, 0x2000, 0x3000);
+        let far = track(93, 0x4000, 0x5000);
+
+        remapped(0x0f00, 0x200);
+        assert!(!first.valid.load(Ordering::Acquire));
+        assert!(next.valid.load(Ordering::Acquire));
+        replaced(0x2000);
+        assert!(!next.valid.load(Ordering::Acquire));
+        assert!(far.valid.load(Ordering::Acquire));
+
+        released(93);
+        assert!(!far.valid.load(Ordering::Acquire));
+        assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
     }
 }

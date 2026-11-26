@@ -1317,8 +1317,10 @@ fn guard_inner(start: usize, end: usize, bump_epoch: bool) -> Option<(Vec<usize>
                 }
             }
             if !open {
-                if let Some((from, to)) = run.take() {
-                    protect(&mut g, from, to);
+                if let Some((from, to)) = run.take()
+                    && protect(&mut g, from, to)
+                {
+                    any_pinned = true;
                 }
                 continue;
             }
@@ -1340,12 +1342,16 @@ fn guard_inner(start: usize, end: usize, bump_epoch: bool) -> Option<(Vec<usize>
                 if is_hot {
                     HOT_GUARD_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                if let Some((from, to)) = run.take() {
-                    protect(&mut g, from, to);
+                if let Some((from, to)) = run.take()
+                    && protect(&mut g, from, to)
+                {
+                    any_pinned = true;
                 }
             } else if g.protected.contains(&block) {
-                if let Some((from, to)) = run.take() {
-                    protect(&mut g, from, to);
+                if let Some((from, to)) = run.take()
+                    && protect(&mut g, from, to)
+                {
+                    any_pinned = true;
                 }
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
@@ -1354,14 +1360,18 @@ fn guard_inner(start: usize, end: usize, bump_epoch: bool) -> Option<(Vec<usize>
                     Some((_, to)) if *to == block => *to = block + 1,
                     Some(_) => {
                         let (from, to) = run.replace((block, block + 1)).unwrap();
-                        protect(&mut g, from, to);
+                        if protect(&mut g, from, to) {
+                            any_pinned = true;
+                        }
                     }
                     None => run = Some((block, block + 1)),
                 }
             }
         }
-        if let Some((from, to)) = run.take() {
-            protect(&mut g, from, to);
+        if let Some((from, to)) = run.take()
+            && protect(&mut g, from, to)
+        {
+            any_pinned = true;
         }
         Some((written, any_pinned))
     })
@@ -1417,12 +1427,17 @@ fn is_view(start: usize, end: usize) -> bool {
 /// at every other view of them are made read-only too: a write through
 /// one of those is this memory written, and only a fault can say so.
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
-fn protect(g: &mut Guards, from: usize, to: usize) {
+///
+/// Returns `true` if any block in `[from, to)` has a mapped alias that could
+/// not be guarded; those blocks are opened and left dirty so writes through
+/// the unguarded alias are never missed.
+fn protect(g: &mut Guards, from: usize, to: usize) -> bool {
     protect_here(g, from, to);
     if !view_guard() {
-        return;
+        return false;
     }
     let mut last_blk = usize::MAX;
+    let mut unguarded = Vec::new();
     crate::inplace::for_each_alias_in_range(
         from.saturating_mul(BLOCK),
         to.saturating_mul(BLOCK),
@@ -1437,9 +1452,18 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             }
             let alias = alias / BLOCK;
             g.aliased.insert(alias);
-            protect_alias(g, alias);
+            if !protect_alias(g, alias) && unguarded.last().copied() != Some(block) {
+                unguarded.push(block);
+            }
         },
     );
+    if unguarded.is_empty() {
+        return false;
+    }
+    for block in unguarded {
+        open_here(g, block * BLOCK, (block + 1) * BLOCK);
+    }
+    true
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -1466,15 +1490,28 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// reports a block that is read-only and not clean as written, then notes it
 /// clean). A block that is clean stays so: had the pages been written since
 /// its copies took them, `open` would have opened it.
-fn protect_alias(g: &mut Guards, block: usize) {
+///
+/// Returns `false` when `block` is mapped/writable and could not be guarded.
+fn protect_alias(g: &mut Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(&block) || g.pinned(block) {
-        return;
+    if g.pinned(block)
+        || (hot_guard_on()
+            && g.hot_pins
+                .get(&block)
+                .is_some_and(|&until| until > g.guard_epoch))
+    {
+        return false;
+    }
+    if g.protected.contains(&block) {
+        return true;
     }
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
         g.protected.insert(block);
+        true
+    } else {
+        g.absent_static.contains(&block) || uncommitted_info(block).0 > block
     }
 }
 
@@ -1994,6 +2031,7 @@ fn acquire_reading_now(range: std::ops::Range<usize>) -> Option<FastReadGuard> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -2878,7 +2916,7 @@ mod tests {
     /// A pagefile section mapped twice: two views of the same physical
     /// pages, the second left for the test; the section handle, the two
     /// addresses.
-    fn two_views(bytes: usize) -> (usize, usize, usize) {
+    pub(super) fn two_views(bytes: usize) -> (usize, usize, usize) {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
@@ -2907,7 +2945,7 @@ mod tests {
 
     /// The section of [`two_views`] is closed and its views unmapped; the
     /// guard is told they are gone first.
-    fn drop_views(section: usize, views: &[usize], bytes: usize) {
+    pub(super) fn drop_views(section: usize, views: &[usize], bytes: usize) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {
@@ -2974,6 +3012,7 @@ mod tests {
         // write pin expires or is released.
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         guards().unpin(guarded / BLOCK + 1, guarded / BLOCK + 2);
+        guards().unpin(other / BLOCK + 1, other / BLOCK + 2);
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         // Half a page and the next: both blocks, not just the first's.
@@ -3881,6 +3920,38 @@ mod mapping_tests {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ });
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
+    }
+
+    #[test]
+    fn unguardable_alias_leaves_block_dirty_and_not_ahead_guarded() {
+        use super::tests::{drop_views, two_views};
+        use super::{BLOCK, PAGE, guard, guard_inner, guards, writable, writing};
+        const SIZE: usize = BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let p_one = one / PAGE;
+        // Pin `two` (keeping `one` unpinned) so `two` cannot be protected as an alias.
+        writing(two, BLOCK);
+        guards().unpin(one / BLOCK, one / BLOCK + 1);
+        assert!(writable(two));
+
+        let (dirty, any_pinned) = guard_inner(one, one + SIZE, true).expect("view");
+        assert_eq!(dirty, vec![p_one]);
+        assert!(any_pinned, "unguardable alias must mark range non-cacheable");
+        assert!(writable(two), "pinned alias stays writable");
+        assert!(
+            !guards().clean.contains(&(one / BLOCK)),
+            "block with unguardable alias must not be marked clean"
+        );
+        // Subsequent check still reports `one` dirty while `two` remains pinned.
+        assert_eq!(guard(one, one + SIZE), Some(vec![p_one]));
+
+        // Unpin `two`; next check guards both and following check is clean.
+        guards().unpin(two / BLOCK, two / BLOCK + 1);
+        assert_eq!(guard(one, one + SIZE), Some(vec![p_one]));
+        assert!(!writable(two));
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+
+        drop_views(section, &[one, two], SIZE);
     }
 }
 

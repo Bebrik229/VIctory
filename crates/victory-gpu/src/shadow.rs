@@ -258,6 +258,55 @@ fn card_limits() -> (u64, u64) {
     })
 }
 
+/// Title buffers' host copies made since the start, by where they went
+/// and by size: in the card's memory; in the PC's memory of 64 KiB (the
+/// least a copy is), up to 256 KiB, up to 1 MiB, larger; each as (copies,
+/// bytes). Said with the memory lines ([`placed_line`]).
+static PLACED: [[AtomicU64; 2]; 5] = [const { [const { AtomicU64::new(0) }; 2] }; 5];
+
+fn placed_count(size: u64, on_card: bool) {
+    let class = match (on_card, size) {
+        (true, _) => 0,
+        (false, ..=0x1_0000) => 1,
+        (false, ..=0x4_0000) => 2,
+        (false, ..=0x10_0000) => 3,
+        _ => 4,
+    };
+    PLACED[class][0].fetch_add(1, Ordering::Relaxed);
+    PLACED[class][1].fetch_add(size, Ordering::Relaxed);
+}
+
+/// Where title buffers' host copies went, since the start (a line with
+/// the frame-rate line, when a copy was made since the last one).
+pub(crate) fn placed_line() {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let v: Vec<(u64, u64)> = PLACED
+        .iter()
+        .map(|c| (c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed)))
+        .collect();
+    let made: u64 = v.iter().map(|c| c.0).sum();
+    if SAID.swap(made, Ordering::Relaxed) == made {
+        return;
+    }
+    let mb = |b: u64| b as f64 / (1 << 20) as f64;
+    tracing::info!(
+        "title buffers' host copies made so far, by where shaders read them: {} in the card's memory {:.0} MB; \
+         in the PC's memory (read over the bus): {} of 64 KiB {:.0} MB, {} up to 256 KiB {:.0} MB, {} up to 1 MiB {:.0} MB, \
+         {} larger {:.0} MB (the least size for the card: {} KiB; VICTORY_CARD_BUFFERS_MIN_KB)",
+        v[0].0,
+        mb(v[0].1),
+        v[1].0,
+        mb(v[1].1),
+        v[2].0,
+        mb(v[2].1),
+        v[3].0,
+        mb(v[3].1),
+        v[4].0,
+        mb(v[4].1),
+        card_limits().0 >> 10,
+    );
+}
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -2058,6 +2107,47 @@ pub(crate) fn merge_fail_stats() -> [u64; 4] {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    if changed_runs_wide_on() {
+        changed_runs_wide(now, was)
+    } else {
+        changed_runs_bytes(now, was)
+    }
+}
+
+/// Which form [`changed_runs`] takes: the wide one unless
+/// `VICTORY_CHANGED_RUNS=0` (the walk byte by byte, as before);
+/// `VICTORY_CHANGED_RUNS=alt`: twenty seconds wide, twenty byte by byte, in
+/// turn, each change said in the log, so that one run measures both in the
+/// same scene. Both forms give the same runs for the same bytes (the test
+/// `changed_runs_wide_matches_byte_by_byte`).
+fn changed_runs_wide_on() -> bool {
+    /// 0 byte by byte, 1 wide, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_CHANGED_RUNS").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: AtomicU8 = AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "changed runs are found 64 bytes at a time from now (VICTORY_CHANGED_RUNS=alt): {}",
+                    if on { "ON" } else { "off, byte by byte as before" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// [`changed_runs`] as it was: equal bytes eight at a time, differing bytes
+/// one by one.
+fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2081,9 +2171,88 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// [`changed_runs`] 64 bytes at a time: one mask of the bytes that differ
+/// (four 16-byte compares), and the runs read off the masks. Every byte is
+/// read once.
+#[cfg(target_arch = "x86_64")]
+fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    let n = now.len().min(was.len());
+    let (now, was) = (&now[..n], &was[..n]);
+    let mut runs = Vec::with_capacity(64);
+    // The first byte of a run not yet ended.
+    let mut open: Option<usize> = None;
+    let mut base = 0;
+    while base + 64 <= n {
+        // Bit `k`: byte `base + k` differs.
+        let mut differ = 0u64;
+        for part in 0..4 {
+            let at = base + 16 * part;
+            // SAFETY: `at + 16 <= base + 64 <= n`, the length of both
+            // slices; the loads are unaligned ones. SSE2 is part of x86-64.
+            let equal = unsafe {
+                let a = _mm_loadu_si128(now.as_ptr().add(at).cast::<__m128i>());
+                let b = _mm_loadu_si128(was.as_ptr().add(at).cast::<__m128i>());
+                _mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) as u32 & 0xffff
+            };
+            differ |= u64::from(!equal & 0xffff) << (16 * part);
+        }
+        if differ == 0 {
+            if let Some(first) = open.take() {
+                runs.push((first, base - first));
+            }
+        } else if differ != u64::MAX || open.is_none() {
+            let mut at = 0u32;
+            while at < 64 {
+                match open {
+                    None => {
+                        // The next byte that differs, if any.
+                        let skip = (differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        open = Some(base + at as usize);
+                    }
+                    Some(first) => {
+                        // The next byte that is equal, if any.
+                        let skip = (!differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        runs.push((first, base + at as usize - first));
+                        open = None;
+                    }
+                }
+            }
+        }
+        base += 64;
+    }
+    for i in base..n {
+        match (open, now[i] != was[i]) {
+            (None, true) => open = Some(i),
+            (Some(first), false) => {
+                runs.push((first, i - first));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(first) = open {
+        runs.push((first, n - first));
+    }
+    runs
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    changed_runs_bytes(now, was)
+}
+
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_runs};
+    use super::{PIECE, back_piece, changed_runs, changed_runs_bytes, changed_runs_wide};
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
@@ -2195,6 +2364,66 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn changed_runs_wide_matches_byte_by_byte() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || -> u64 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng >> 32
+        };
+        let by_bytes = |now: &[u8], was: &[u8]| -> Vec<(usize, usize)> {
+            let n = now.len().min(was.len());
+            let mut out = Vec::new();
+            let mut open = None;
+            for i in 0..n {
+                match (open, now[i] != was[i]) {
+                    (None, true) => open = Some(i),
+                    (Some(first), false) => {
+                        out.push((first, i - first));
+                        open = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(first) = open {
+                out.push((first, n - first));
+            }
+            out
+        };
+        for case in 0..300 {
+            let n = match case % 4 {
+                0 => (next() % 30) as usize,
+                1 => 56 + (next() % 20) as usize,
+                2 => 120 + (next() % 20) as usize,
+                _ => (next() % 700) as usize,
+            } + if case % 97 == 0 { 4096 + (next() % 300) as usize } else { 0 };
+            let was: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+            let mut now = was.clone();
+            let rarity = 1 + (next() % 50) as usize;
+            for i in 0..n {
+                if (next() as usize).is_multiple_of(rarity) {
+                    now[i] ^= (next() as u8).max(1);
+                }
+            }
+            assert_eq!(changed_runs_wide(&now, &was), by_bytes(&now, &was), "case {case}, {n} bytes");
+            assert_eq!(changed_runs_bytes(&now, &was), by_bytes(&now, &was), "case {case}, {n} bytes (byte by byte)");
+        }
+        for n in [63usize, 64, 65, 127, 128, 129, 191, 192, 193, 256] {
+            for (from, to) in [(0, n), (0, 64.min(n)), (63.min(n), 65.min(n)), (64.min(n), n), (1, n - 1), (n - 1, n), (0, 1)] {
+                let was = vec![7u8; n];
+                let mut now = was.clone();
+                for b in &mut now[from..to] {
+                    *b = 9;
+                }
+                assert_eq!(changed_runs_wide(&now, &was), by_bytes(&now, &was), "{n} bytes, {from}..{to}");
+                let now: Vec<u8> = (0..n).map(|i| if i % 2 == 0 && (from..to).contains(&i) { 9 } else { 7 }).collect();
+                assert_eq!(changed_runs_wide(&now, &was), by_bytes(&now, &was), "{n} bytes, every other of {from}..{to}");
+            }
+        }
+        assert_eq!(changed_runs_wide(&[1, 2, 3, 4, 5, 6, 7, 8, 9], &[1, 2, 0]), vec![(2, 1)]);
+        assert_eq!(changed_runs_bytes(&[1, 2, 3, 4, 5, 6, 7, 8, 9], &[1, 2, 0]), vec![(2, 1)]);
     }
 }
 
@@ -3634,6 +3863,18 @@ impl Shadow {
         Some((&card.staging, before, card.size))
     }
 
+    /// The bytes of the copy the card's hashes cover: with
+    /// `VICTORY_CARD_HASH_LEN=1` the title buffer's own, rounded up to the
+    /// hash's 16-byte step; else the copy's whole buffer, as before.
+    pub(crate) fn card_hashed(&self) -> Option<u64> {
+        static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let size = self.card.as_ref()?.size;
+        if *WHOLE.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_LEN").is_none_or(|v| v != "1")) {
+            return Some(size);
+        }
+        Some(self.len.next_multiple_of(16).min(size))
+    }
+
     /// Shader writes are declared for a copy in the card's memory: makes
     /// its "before" twin with `make` (bytes to buffer) if it has none.
     /// Whether one was made now: the caller fills it, whole, from the
@@ -4008,6 +4249,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             }
             None => (buffer, None),
         };
+        placed_count(size, card.is_some());
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {

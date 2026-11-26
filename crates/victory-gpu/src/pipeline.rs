@@ -64,11 +64,41 @@ pub(crate) struct Shader {
     #[cfg_attr(not(windows), allow(dead_code))]
     full_hash: [u8; 32],
     container: Vec<u8>,
+    /// Left out: serves screen-probe rays that do not run unless `VICTORY_RAYS=1`
+    /// ([`idle_without_rays`]).
+    #[cfg(windows)]
+    idle_without_rays: bool,
     /// Its result gets constant indirect diffuse light ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+}
+
+/// Whether `VICTORY_RAYS=1` enables ray-tracing shaders and their screen-probe
+/// activation pass.
+#[cfg(windows)]
+fn rays_enabled() -> bool {
+    static RAYS: OnceLock<bool> = OnceLock::new();
+    *RAYS.get_or_init(|| std::env::var_os("VICTORY_RAYS").is_some_and(|v| v == "1"))
+}
+
+/// Whether a container's program only makes sense with the title's rays,
+/// which do not run (`VICTORY_RAYS=1` has them run, and it with them): the
+/// program that tells the screen probes which rays to trace.
+/// shortcut: left out. The AMD driver never ended its pipeline until the
+/// clean-up passes shortened it; once it ran, with no rays behind it, the
+/// whole picture lost light, shadows and reflections (run opt31b against
+/// sans39, 2026-11-25).
+#[cfg(windows)]
+fn is_idle_without_rays(container: &[u8], rays: bool) -> bool {
+    const NAME: &[u8] = b"CS_ScreenProbes_ActivateRays";
+    !rays && container.windows(NAME.len()).any(|w| w == NAME)
+}
+
+#[cfg(windows)]
+fn idle_without_rays(container: &[u8]) -> bool {
+    is_idle_without_rays(container, rays_enabled())
 }
 
 impl std::fmt::Debug for Shader {
@@ -118,6 +148,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         hash: full.to_hex()[..16].to_owned(),
         full_hash: key,
         container: bytes.to_vec(),
+        #[cfg(windows)]
+        idle_without_rays: idle_without_rays(bytes),
         #[cfg(windows)]
         resolves_light: bytes
             .windows(crate::ambient::PROGRAM.len())
@@ -494,12 +526,11 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         }
         parsed
     });
-    if hashes.is_empty() {
-        return None;
-    }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| {
+            shader.idle_without_rays || (!hashes.is_empty() && hashes.contains(&shader.hash))
+        })
         .map(|shader| shader.hash.as_str())
 }
 
@@ -1065,6 +1096,17 @@ mod tests {
             assert!(Arc::ptr_eq(&results[0], r));
         }
         assert_eq!(results[0].hash, blake3::hash(c).to_hex()[..16]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn idle_without_rays_skips_screen_probe_activate_rays_when_rays_off() {
+        let activate = b"DXBC ... CS_ScreenProbes_ActivateRays_0001 ...";
+        let plain = b"DXBC plain shader container";
+        assert!(is_idle_without_rays(activate, false));
+        assert!(!is_idle_without_rays(activate, true));
+        assert!(!is_idle_without_rays(plain, false));
+        assert!(!is_idle_without_rays(plain, true));
     }
 
     #[cfg(windows)]

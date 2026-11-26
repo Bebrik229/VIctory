@@ -73,6 +73,7 @@ fn compute_pipeline(used: &[UsedResource]) -> HostPipeline {
         full_hash: [0; 32],
         container: Vec::new(),
         resolves_light: false,
+        idle_without_rays: false,
         translated: Some(Translated {
             host: HostShader {
                 stage: HwStage::Cs,
