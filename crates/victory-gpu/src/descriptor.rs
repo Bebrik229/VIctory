@@ -417,23 +417,27 @@ pub(crate) fn sync_heaps() {
             end as usize
         };
         let mut parts: Vec<(u32, u32)> = Vec::new();
-        for (range_from, range_end) in written.take(start as usize, looked_end) {
-            let mut page = range_from & !(crate::watch::PAGE - 1);
-            while page < range_end {
-                let from = page.max(range_from);
-                let to = (page + crate::watch::PAGE).min(range_end);
-                let slots = whole_slots(from, to, start as usize, step, mirrored_count);
-                if !slots.is_empty() {
-                    if host.page_all_tabled(slots.start, slots.end, frame) {
-                        let count = u64::from(slots.end - slots.start);
-                        pages += 1;
-                        looked += count;
-                        tabled += count;
-                    } else {
-                        parts.push((slots.start, slots.end));
+        for (span_from, span_to) in
+            host.untabled_watch_spans(start as usize, looked_end, step, mirrored_count, frame)
+        {
+            for (range_from, range_end) in written.take(span_from, span_to) {
+                let mut page = range_from & !(crate::watch::PAGE - 1);
+                while page < range_end {
+                    let from = page.max(range_from);
+                    let to = (page + crate::watch::PAGE).min(range_end);
+                    let slots = whole_slots(from, to, start as usize, step, mirrored_count);
+                    if !slots.is_empty() {
+                        if host.page_all_tabled(slots.start, slots.end, frame) {
+                            let count = u64::from(slots.end - slots.start);
+                            pages += 1;
+                            looked += count;
+                            tabled += count;
+                        } else {
+                            parts.push((slots.start, slots.end));
+                        }
                     }
+                    page += crate::watch::PAGE;
                 }
-                page += crate::watch::PAGE;
             }
         }
         if parts.is_empty() {
@@ -472,6 +476,104 @@ pub(crate) fn sync_heaps() {
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
+}
+
+/// Whether a submission's pass over the title's view heaps ([`sync_heaps`])
+/// and the making of the slots that waited for a texture's host copy
+/// ([`make_waiting`]) run on a thread of their own while the submitting
+/// thread prepares the submission (`VICTORY_SYNC_BESIDE=1`; off by default:
+/// both on the submitting thread before preparing, as before). `alt`:
+/// twenty seconds with, twenty without, in turn, each change said in the
+/// log; decided once per submission.
+#[cfg(windows)]
+pub(crate) fn sync_beside() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SYNC_BESIDE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the pass over the title's view heap runs beside the preparing from now (VICTORY_SYNC_BESIDE=alt): {}",
+                    if on { "ON" } else { "off, on the submitting thread before it as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// [`sync_beside`]'s hand-over: 0 nothing asked, 1 asked, 2 running.
+#[cfg(windows)]
+static BESIDE: (std::sync::Mutex<u8>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// Since the line last took them: passes run beside, microseconds the
+/// submitting thread waited for one at [`sync_end`], passes it found done.
+#[cfg(windows)]
+static BESIDE_COUNTS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Hands the pass and [`make_waiting`] to their thread (started once); the
+/// submitting thread goes on preparing. Without the thread both run here.
+#[cfg(windows)]
+pub(crate) fn sync_begin() {
+    static THREAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let started = *THREAD.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("victory-heap-sync".into())
+            .spawn(|| loop {
+                {
+                    let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+                    while *state != 1 {
+                        state = BESIDE.1.wait(state).unwrap_or_else(|e| e.into_inner());
+                    }
+                    *state = 2;
+                }
+                sync_heaps();
+                make_waiting();
+                *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+                BESIDE.1.notify_all();
+            })
+            .is_ok()
+    });
+    if !started {
+        sync_heaps();
+        make_waiting();
+        return;
+    }
+    let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *state != 0 {
+        state = BESIDE.1.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    *state = 1;
+    BESIDE_COUNTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    BESIDE.1.notify_all();
+}
+
+/// Waits until the pass handed over by [`sync_begin`] is done (at once if
+/// none is out).
+#[cfg(windows)]
+pub(crate) fn sync_end() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let waiting = std::time::Instant::now();
+    let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+    if *state == 0 {
+        BESIDE_COUNTS[2].fetch_add(1, Relaxed);
+        return;
+    }
+    while *state != 0 {
+        state = BESIDE.1.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    BESIDE_COUNTS[1].fetch_add(waiting.elapsed().as_micros() as u64, Relaxed);
 }
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
@@ -537,6 +639,16 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
+    let [beside, waited_us, found_done] =
+        [0, 1, 2].map(|i| BESIDE_COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    if beside > 0 {
+        tracing::info!(
+            "the pass over the title's view heap beside the preparing (VICTORY_SYNC_BESIDE), per frame: {:.1} passes, the submitting thread waited {:.2} ms for them, {:.1} found done",
+            beside as f64 / frames,
+            waited_us as f64 / 1e3 / frames,
+            found_done as f64 / frames
+        );
+    }
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.

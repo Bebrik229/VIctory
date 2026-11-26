@@ -2468,9 +2468,7 @@ impl HostHeap {
             };
         }
         drop(shards);
-        for old in retired {
-            crate::host::retire(old);
-        }
+        crate::host::retire_resources(retired);
         self.keep_run(first, kept);
         Some((made, views))
     }
@@ -2512,9 +2510,7 @@ impl HostHeap {
             }
         }
         drop(dropped);
-        for old in retired {
-            crate::host::retire(old);
-        }
+        crate::host::retire_resources(retired);
     }
 
     /// Lets go of descriptors viewing any host texture in `textures` (when
@@ -2550,9 +2546,7 @@ impl HostHeap {
                 }
             }
         }
-        for old in retired {
-            crate::host::retire(old);
-        }
+        crate::host::retire_resources(retired);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -2600,7 +2594,7 @@ impl HostHeap {
                 if lean {
                     drop(old);
                 } else {
-                    crate::host::retire(old);
+                    crate::host::retire_resource(old);
                 }
             }
             return;
@@ -2619,7 +2613,7 @@ impl HostHeap {
                 if lean {
                     drop(old);
                 } else {
-                    crate::host::retire(old);
+                    crate::host::retire_resource(old);
                 }
             }
         }
@@ -2788,6 +2782,79 @@ impl HostHeap {
         }
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         u64::from(now.wrapping_sub(min_stamp)) <= TABLED_FRAMES
+    }
+
+    /// Builds contiguous `[range_from, range_end)` byte spans inside
+    /// `[start, looked_end)` skipping leading/trailing `page_all_tabled` pages
+    /// and internal all-tabled gaps of at least `MIN_TABLED_GAP_PAGES` (16)
+    /// pages so `GetWriteWatch` does not scan/reset massive all-tabled tails.
+    pub(crate) fn untabled_watch_spans(
+        &self,
+        start: usize,
+        looked_end: usize,
+        step: u64,
+        mirrored_count: u32,
+        frame: u64,
+    ) -> Vec<(usize, usize)> {
+        const MIN_TABLED_GAP_PAGES: usize = 16;
+        if looked_end <= start {
+            return Vec::new();
+        }
+        if sync_tables()
+            || !tabled_out()
+            || self.page_tabled_min.is_empty()
+            || step != 32
+            || !start.is_multiple_of(crate::watch::PAGE)
+        {
+            return vec![(start, looked_end)];
+        }
+        let page_size = crate::watch::PAGE;
+        let total_pages = (looked_end - start).div_ceil(page_size);
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut p = 0usize;
+        while p < total_pages {
+            let page_from = start + p * page_size;
+            let page_to = (page_from + page_size).min(looked_end);
+            let s_first = (p * PAGE_TABLED_SLOTS as usize) as u32;
+            let s_last = (((page_to - start) / step as usize) as u32).min(mirrored_count);
+            if s_first < s_last && self.page_all_tabled(s_first, s_last, frame) {
+                p += 1;
+                continue;
+            }
+            let span_start = page_from;
+            let mut span_end = page_to;
+            p += 1;
+            while p < total_pages {
+                let pf = start + p * page_size;
+                let pt = (pf + page_size).min(looked_end);
+                let sf = (p * PAGE_TABLED_SLOTS as usize) as u32;
+                let sl = (((pt - start) / step as usize) as u32).min(mirrored_count);
+                if sf < sl && self.page_all_tabled(sf, sl, frame) {
+                    let mut gap = 1usize;
+                    while gap < MIN_TABLED_GAP_PAGES && p + gap < total_pages {
+                        let gf = start + (p + gap) * page_size;
+                        let gt = (gf + page_size).min(looked_end);
+                        let gsf = ((p + gap) * PAGE_TABLED_SLOTS as usize) as u32;
+                        let gsl = (((gt - start) / step as usize) as u32).min(mirrored_count);
+                        if !(gsf < gsl && self.page_all_tabled(gsf, gsl, frame)) {
+                            break;
+                        }
+                        gap += 1;
+                    }
+                    if gap >= MIN_TABLED_GAP_PAGES || p + gap == total_pages {
+                        p += gap;
+                        break;
+                    }
+                    span_end = (start + (p + gap) * page_size).min(looked_end);
+                    p += gap;
+                } else {
+                    span_end = pt;
+                    p += 1;
+                }
+            }
+            spans.push((span_start, span_end));
+        }
+        spans
     }
 
     /// Scans complete title slots `first..last` (each `step` bytes, starting at
@@ -5523,6 +5590,67 @@ mod tests {
         assert!(heap.page_all_tabled(0, PAGE_TABLED_SLOTS, frame));
         assert!(heap.page_all_tabled(0, PAGE_TABLED_SLOTS, frame + TABLED_FRAMES));
         assert!(!heap.page_all_tabled(0, PAGE_TABLED_SLOTS, frame + TABLED_FRAMES + 1));
+    }
+
+    #[test]
+    fn untabled_watch_spans_trims_tails_and_large_gaps_only() {
+        const PAGES: usize = 30;
+        let slots = (PAGES as u32) * PAGE_TABLED_SLOTS;
+        let Some(heap) = HostHeap::new(false, slots) else {
+            return; // no host GPU
+        };
+        let frame = 2_000u64;
+        let start = crate::watch::PAGE * 64;
+        let looked_end = start + PAGES * crate::watch::PAGE;
+
+        // 1) All untabled -> single full span.
+        assert_eq!(
+            heap.untabled_watch_spans(start, looked_end, TITLE_SLOT_BYTES, slots, frame),
+            vec![(start, looked_end)]
+        );
+
+        // 2) Mark pages 0..2, 4..22 (18-page gap), and 25..30 (trailing tail) all-tabled.
+        // Page 2..4 (len 2), small gap at page 6? Let's leave page 3 and pages 22..25 untabled,
+        // plus test a small 3-page gap by having page 26 untabled instead of 25..30 trailing:
+        // Wait: mark pages 0..2 (leading), 3..6? No, mark 0..2 (leading), 3..5?
+        // Pages:
+        // 0..2   tabled (leading trimmed)
+        // 2      untabled
+        // 3..6   tabled (3-page gap < 16 -> bridged)
+        // 6      untabled
+        // 7..24  tabled (17-page gap >= 16 -> split)
+        // 24..26 untabled
+        // 26..30 tabled (trailing trimmed)
+        let mut page_bytes = vec![0u8; crate::watch::PAGE];
+        for p in (0..2usize).chain(3..6).chain(7..24).chain(26..30) {
+            let s0 = (p as u32) * PAGE_TABLED_SLOTS;
+            let s1 = s0 + PAGE_TABLED_SLOTS;
+            for s in s0..s1 {
+                heap.tabled_in(s, true, frame);
+            }
+            assert_eq!(
+                heap.sync_copied_page(s0, s1, 0, TITLE_SLOT_BYTES, frame, &mut page_bytes),
+                (true, u64::from(PAGE_TABLED_SLOTS), 0, u64::from(PAGE_TABLED_SLOTS))
+            );
+        }
+        assert_eq!(
+            heap.untabled_watch_spans(start, looked_end, TITLE_SLOT_BYTES, slots, frame),
+            vec![
+                (start + 2 * crate::watch::PAGE, start + 7 * crate::watch::PAGE),
+                (start + 24 * crate::watch::PAGE, start + 26 * crate::watch::PAGE),
+            ]
+        );
+
+        // 3) All pages tabled -> empty spans (zero GetWriteWatch calls).
+        for p in [2usize, 6, 24, 25] {
+            let s0 = (p as u32) * PAGE_TABLED_SLOTS;
+            let s1 = s0 + PAGE_TABLED_SLOTS;
+            for s in s0..s1 {
+                heap.tabled_in(s, true, frame);
+            }
+            heap.sync_copied_page(s0, s1, 0, TITLE_SLOT_BYTES, frame, &mut page_bytes);
+        }
+        assert!(heap.untabled_watch_spans(start, looked_end, TITLE_SLOT_BYTES, slots, frame).is_empty());
     }
 
     #[test]

@@ -107,7 +107,10 @@ static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A retired object, dropped on whatever thread finishes the submission.
-struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
+enum Retired {
+    Resource(#[allow(dead_code)] ID3D12Resource),
+    Any(#[allow(dead_code)] Box<dyn std::any::Any>),
+}
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
 // reference-counted wrappers holding them, dropped once.
 unsafe impl Send for Retired {}
@@ -245,14 +248,57 @@ pub(crate) fn retire<T: 'static>(object: T) {
             drop(object);
             return;
         }
-        reap(vec![Retired(Box::new(object))]);
+        reap_one(Retired::Any(Box::new(object)));
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+        .push((started, Retired::Any(Box::new(object))));
+}
+
+/// Retires a single `ID3D12Resource` without heap-boxing it.
+pub(crate) fn retire_resource(object: ID3D12Resource) {
+    let started = STARTED.load(Ordering::Acquire);
+    if started <= FINISHED.load(Ordering::Acquire) {
+        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+        if !reaper_on() {
+            drop(object);
+            return;
+        }
+        reap_one(Retired::Resource(object));
+        return;
+    }
+    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((started, Retired::Resource(object)));
+}
+
+/// Retires a batch of `ID3D12Resource` handles under a single `RETIRED` lock
+/// without per-item heap boxing.
+pub(crate) fn retire_resources(objects: Vec<ID3D12Resource>) {
+    if objects.is_empty() {
+        return;
+    }
+    let count = objects.len() as u64;
+    let started = STARTED.load(Ordering::Acquire);
+    if started <= FINISHED.load(Ordering::Acquire) {
+        RETIREMENTS[0].fetch_add(count, Ordering::Relaxed);
+        if !reaper_on() {
+            drop(objects);
+            return;
+        }
+        reap(objects.into_iter().map(Retired::Resource).collect());
+        return;
+    }
+    RETIREMENTS[1].fetch_add(count, Ordering::Relaxed);
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(objects.into_iter().map(|o| (started, Retired::Resource(o))));
 }
 
 /// Whether descriptor slots written again with the object they already
@@ -416,6 +462,19 @@ static REAP: (Mutex<Vec<Retired>>, std::sync::Condvar) =
 /// Objects [`reaper`] dropped since the start, and the microseconds that took.
 static REAPED: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Drops one pre-wrapped `object` on [`reaper`] without allocating a single-element Vec.
+fn reap_one(object: Retired) {
+    if !reaper_on() {
+        drop(object);
+        return;
+    }
+    REAP.0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(object);
+    REAP.1.notify_one();
+}
 
 /// Drops `objects`: here, or with [`reaper_on`] on the thread of that name.
 fn reap(objects: Vec<Retired>) {
@@ -3174,9 +3233,37 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    if settle_room() { most * 2 } else { most }
+}
+
+/// Whether flights get twice the room before `late_most` settles them and
+/// eight times the changed runs before `stale_under_flights` falls back to
+/// settling (`VICTORY_SETTLE_ROOM=1|alt`).
+fn settle_room() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SETTLE_ROOM").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "flights get more room (lists in the air x2, changed runs merged x8) before they are settled from now (VICTORY_SETTLE_ROOM=alt): {}",
+                    if on { "ON" } else { "off, the caps as set" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3565,6 +3652,9 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize)> {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(65536)
     });
+    if settle_room() {
+        runs_left = (runs_left * 8).min(1 << 16);
+    }
     for (shadow, mut ranges) in per_shadow {
         let raw = std::mem::take(&mut ranges);
         join_ranges(&mut ranges, raw);
@@ -5946,8 +6036,12 @@ fn sync_batched() -> bool {
             }
         }
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        {
+        // command lists that index those slots are submitted. With
+        // `VICTORY_SYNC_BESIDE` on a thread of its own while this one
+        // prepares, from after the sweep to before the lists go to the card
+        // (`crate::descriptor::sync_beside`).
+        let beside = crate::descriptor::sync_beside();
+        if !beside {
             let t0 = std::time::Instant::now();
             crate::descriptor::sync_heaps();
             SUBMIT_PARTS[0].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -5970,8 +6064,10 @@ fn sync_batched() -> bool {
         }
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        {
+        // lists that may read them run (with the pass, beside, after it).
+        if beside {
+            crate::descriptor::sync_begin();
+        } else {
             let t0 = std::time::Instant::now();
             crate::descriptor::make_waiting();
             SUBMIT_PARTS[0].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -6091,6 +6187,13 @@ fn sync_batched() -> bool {
             batch.flush();
             crate::watch::ask_once_end();
             SUBMIT_PARTS[4].fetch_add(t4.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        // The pass over the view heap, if it ran beside: done before any
+        // list of this submission goes to the card.
+        if beside {
+            let t0 = std::time::Instant::now();
+            crate::descriptor::sync_end();
+            SUBMIT_PARTS[0].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -10141,8 +10244,8 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         }
         {
             let mut retired = super::RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-            retired.push((10, super::Retired(Box::new(Flag(dropped.clone())))));
-            retired.push((u64::MAX, super::Retired(Box::new(Flag(dropped.clone())))));
+            retired.push((10, super::Retired::Any(Box::new(Flag(dropped.clone())))));
+            retired.push((u64::MAX, super::Retired::Any(Box::new(Flag(dropped.clone())))));
         }
         super::bury_with(10, true);
         assert_eq!(dropped.load(super::Ordering::Relaxed), 1);

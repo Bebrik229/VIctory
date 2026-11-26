@@ -1846,9 +1846,9 @@ fn hot_guard_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HOT_GUARD").is_none_or(|v| v != "0"))
 }
 
-const HOT_FAULT_WINDOW: u64 = 32;
+const HOT_FAULT_WINDOW: u64 = 128;
 const HOT_FAULT_THRESHOLD: u16 = 2;
-const HOT_PIN_EPOCHS: u64 = 512;
+const HOT_PIN_EPOCHS: u64 = 4096;
 
 static HOT_GUARD_STATS: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -2975,7 +2975,7 @@ fn install() {
                     entry.1 = 0;
                     g.hot_pins.insert(block, epoch.saturating_add(HOT_PIN_EPOCHS));
                 }
-                if g.fault_counts.len() > 4096 {
+                if g.fault_counts.len() > 16384 {
                     g.fault_counts
                         .retain(|_, &mut (e, _)| epoch.saturating_sub(e) <= HOT_FAULT_WINDOW * 2);
                     g.hot_pins.retain(|_, &mut until| until > epoch);
