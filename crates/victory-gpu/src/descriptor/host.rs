@@ -173,6 +173,10 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// Per `PAGE_TABLED_SLOTS`-aligned 64 KiB view-heap page: oldest non-zero
+    /// `tabled` stamp seen across an all-tabled page scan (`0` if unverified or
+    /// containing any untabled slot). Enables O(1) page-level skips in `sync_heaps`.
+    page_tabled_min: Vec<std::sync::atomic::AtomicU32>,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -836,6 +840,8 @@ pub(crate) fn remapped(at: usize, len: usize) {
 /// Frames for which a slot a draw read through a table counts as a table's
 /// slot ([`HostHeap::tabled`]).
 const TABLED_FRAMES: u64 = 240;
+/// Number of 32-byte view descriptors per 64 KiB write-watch page.
+const PAGE_TABLED_SLOTS: u32 = (crate::watch::PAGE / 32) as u32;
 
 /// Frames a write of a table's slot waits in the queue for the draw that
 /// reads it, before the slot is taken for one shaders pick by index.
@@ -1455,6 +1461,13 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { titled })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            page_tabled_min: (0..if sampler {
+                0
+            } else {
+                titled.div_ceil(PAGE_TABLED_SLOTS)
+            })
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect(),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -2747,6 +2760,36 @@ impl HostHeap {
         }
     }
 
+    /// O(1) check whether a `PAGE_TABLED_SLOTS`-aligned page `first..last`
+    /// was previously proven 100% tabled and its oldest stamp is still within
+    /// `TABLED_FRAMES` of `frame`.
+    pub(crate) fn page_all_tabled(&self, first: u32, last: u32, frame: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if sync_tables() || !tabled_out() || self.page_tabled_min.is_empty() {
+            return false;
+        }
+        let mirrored_limit = self.mirrored_count();
+        let first = first.min(mirrored_limit);
+        let last = last.min(mirrored_limit);
+        if first >= last || !first.is_multiple_of(PAGE_TABLED_SLOTS) {
+            return false;
+        }
+        let page_idx = (first / PAGE_TABLED_SLOTS) as usize;
+        let expected_end = ((page_idx as u32 + 1) * PAGE_TABLED_SLOTS).min(mirrored_limit);
+        if last != expected_end {
+            return false;
+        }
+        let Some(slot) = self.page_tabled_min.get(page_idx) else {
+            return false;
+        };
+        let min_stamp = slot.load(Relaxed);
+        if min_stamp == 0 {
+            return false;
+        }
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        u64::from(now.wrapping_sub(min_stamp)) <= TABLED_FRAMES
+    }
+
     /// Scans complete title slots `first..last` (each `step` bytes, starting at
     /// `start`) on one changed heap page and mirrors only untabled slots whose
     /// 12-byte `[tag, i, generation]` record key changed since last seen.
@@ -2773,6 +2816,9 @@ impl HostHeap {
             return (false, 0, 0, 0);
         }
         let total = u64::from(last - first);
+        if self.page_all_tabled(first, last, frame) {
+            return (true, total, 0, total);
+        }
         let skip_tabled = !sync_tables() && tabled_out() && !self.tabled.is_empty();
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         let is_tabled_raw = |raw: u32| -> bool {
@@ -2783,10 +2829,37 @@ impl HostHeap {
         let (scan_first, scan_last, mut tabled) = if skip_tabled {
             let tabled_end = (last as usize).min(self.tabled.len());
             let mut f = first as usize;
-            while f < tabled_end && is_tabled_raw(self.tabled[f].load(Relaxed)) {
+            let mut max_age = 0u32;
+            let mut oldest_stamp = 0u32;
+            while f < tabled_end {
+                let stamp = self.tabled[f].load(Relaxed) & !TABLED_READ;
+                if stamp == 0 {
+                    break;
+                }
+                let age = now.wrapping_sub(stamp);
+                if u64::from(age) > TABLED_FRAMES {
+                    break;
+                }
+                if oldest_stamp == 0 || age >= max_age {
+                    max_age = age;
+                    oldest_stamp = stamp;
+                }
                 f += 1;
             }
             if f == last as usize {
+                if oldest_stamp != 0
+                    && first.is_multiple_of(PAGE_TABLED_SLOTS)
+                    && !self.page_tabled_min.is_empty()
+                {
+                    let page_idx = (first / PAGE_TABLED_SLOTS) as usize;
+                    let expected_end =
+                        ((page_idx as u32 + 1) * PAGE_TABLED_SLOTS).min(mirrored_limit);
+                    if last == expected_end
+                        && let Some(cell) = self.page_tabled_min.get(page_idx)
+                    {
+                        cell.store(oldest_stamp, Relaxed);
+                    }
+                }
                 return (true, total, 0, total);
             }
             let mut l = last as usize;
@@ -5430,6 +5503,26 @@ mod tests {
         );
         assert_eq!(mixed.copied_begin()[4].load(std::sync::atomic::Ordering::Relaxed), 0);
         assert!(!mixed.made(4));
+    }
+
+    #[test]
+    fn page_all_tabled_caches_and_expires_full_tabled_page() {
+        let Some(heap) = HostHeap::new(false, PAGE_TABLED_SLOTS * 2) else {
+            return; // no host GPU
+        };
+        let frame = 1_000u64;
+        assert!(!heap.page_all_tabled(0, PAGE_TABLED_SLOTS, frame));
+        for slot in 0..PAGE_TABLED_SLOTS {
+            heap.tabled_in(slot, true, frame);
+        }
+        let mut page_bytes = vec![0u8; crate::watch::PAGE];
+        assert_eq!(
+            heap.sync_copied_page(0, PAGE_TABLED_SLOTS, 0, TITLE_SLOT_BYTES, frame, &mut page_bytes),
+            (true, u64::from(PAGE_TABLED_SLOTS), 0, u64::from(PAGE_TABLED_SLOTS))
+        );
+        assert!(heap.page_all_tabled(0, PAGE_TABLED_SLOTS, frame));
+        assert!(heap.page_all_tabled(0, PAGE_TABLED_SLOTS, frame + TABLED_FRAMES));
+        assert!(!heap.page_all_tabled(0, PAGE_TABLED_SLOTS, frame + TABLED_FRAMES + 1));
     }
 
     #[test]

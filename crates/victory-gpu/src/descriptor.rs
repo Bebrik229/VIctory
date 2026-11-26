@@ -424,7 +424,14 @@ pub(crate) fn sync_heaps() {
                 let to = (page + crate::watch::PAGE).min(range_end);
                 let slots = whole_slots(from, to, start as usize, step, mirrored_count);
                 if !slots.is_empty() {
-                    parts.push((slots.start, slots.end));
+                    if host.page_all_tabled(slots.start, slots.end, frame) {
+                        let count = u64::from(slots.end - slots.start);
+                        pages += 1;
+                        looked += count;
+                        tabled += count;
+                    } else {
+                        parts.push((slots.start, slots.end));
+                    }
                 }
                 page += crate::watch::PAGE;
             }

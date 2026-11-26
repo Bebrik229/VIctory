@@ -434,7 +434,7 @@ fn reap(objects: Vec<Retired>) {
 }
 
 /// The thread of [`reaper_on`]: drops what [`reap`] hands it, with no lock
-/// of ours held, and says every 4,096 objects how long the drops took.
+/// of ours held, and says every 262,144 objects how long the drops took.
 fn reaper() {
     loop {
         let objects = {
@@ -450,7 +450,7 @@ fn reaper() {
         let us = began.elapsed().as_micros() as u64;
         let before = REAPED[0].fetch_add(count, Ordering::Relaxed);
         let spent = REAPED[1].fetch_add(us, Ordering::Relaxed) + us;
-        if (before + count) / 4096 != before / 4096 {
+        if (before + count) / 262_144 != before / 262_144 {
             tracing::info!(
                 "host objects dropped by their own thread (VICTORY_REAPER): {} so far in {:.1} ms of that thread ({:.0} us each); the last batch {count} in {:.1} ms",
                 before + count,
@@ -5997,7 +5997,7 @@ fn sync_batched() -> bool {
         let ask_ranges: Vec<(usize, usize)> = {
             let t1 = std::time::Instant::now();
             let ranges = if crate::watch::once() {
-                let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+                let mut spans: FastMap<usize, (usize, usize)> = FastMap::default();
                 for list in runs {
                     for step in &list.deferred().copies {
                         match step {
@@ -8306,7 +8306,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     let whole = (!title_dst
         && if crate::plaincopy::on() {
-            crate::plaincopy::copy(dst, src, len)
+            if len < crate::plaincopy::least() {
+                crate::plaincopy::copy_short(dst, src, len)
+            } else {
+                crate::plaincopy::copy(dst, src, len)
+            }
         } else {
             crate::watch::try_copy_fast(dst, src, len)
         })

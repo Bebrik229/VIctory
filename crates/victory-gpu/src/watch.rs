@@ -43,7 +43,8 @@ const KERNEL_PAGE: usize = 4096;
 pub(crate) struct Tracked {
     start: usize,
     end: usize,
-    seen: Mutex<BTreeMap<usize, u64>>,
+    base_page: usize,
+    seen: Mutex<Vec<u64>>,
 }
 
 /// Tracks a runtime GPU-memory range, including physical-page views when
@@ -53,10 +54,13 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     if len == 0 || writes(start, end, views).is_none() {
         return None;
     }
+    let base_page = start / PAGE;
+    let pages = end.div_ceil(PAGE).saturating_sub(base_page);
     Some(Tracked {
         start,
         end,
-        seen: Mutex::default(),
+        base_page,
+        seen: Mutex::new(vec![0; pages]),
     })
 }
 
@@ -592,9 +596,14 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     // The light refresh: a few of the holes known by their bits are asked
-    // of Windows again, a submission at a time ([`look_at_holes`]).
+    // of Windows again, once per frame ([`look_at_holes`]).
     if light_kept() {
-        look_at_holes(HOLES_A_LOOK);
+        static LAST_HOLE_FRAME: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(u64::MAX);
+        let frame = crate::frame::current();
+        if LAST_HOLE_FRAME.swap(frame, std::sync::atomic::Ordering::Relaxed) != frame {
+            look_at_holes(HOLES_A_LOOK);
+        }
     }
     let _ask = watch_ask();
     let need_clear = {
@@ -931,6 +940,13 @@ fn publish(_noted: &Journal, written: &[usize], start: usize, end: usize, holes:
 }
 
 fn publish_ranges(_noted: &Journal, written: &[usize], ranges: &[(usize, usize)], holes: bool) {
+    let need_holes = holes
+        && ranges
+            .iter()
+            .any(|&(first, last)| first < last && !PUBLISHED.all(first, last));
+    if written.is_empty() && !need_holes {
+        return;
+    }
     let mut g = guards();
     let g = &mut *g;
     for &page in written {
@@ -941,11 +957,11 @@ fn publish_ranges(_noted: &Journal, written: &[usize], ranges: &[(usize, usize)]
             PUBLISHED.set(block);
         }
     }
-    if !holes {
+    if !need_holes {
         return;
     }
     for &(first, last) in ranges {
-        if first >= last {
+        if first >= last || PUBLISHED.all(first, last) {
             continue;
         }
         // The notes of the range not looked at yet. Both sets are read in
@@ -1545,7 +1561,8 @@ impl Tracked {
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for (page, write) in pages {
-            if seen.get(&page).is_some_and(|&last| last >= write) {
+            let idx = page.saturating_sub(self.base_page);
+            if seen.get(idx).is_some_and(|&last| last >= write) {
                 continue;
             }
             let (start, end) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
@@ -1555,8 +1572,9 @@ impl Tracked {
             // Keep partial pages dirty: the caller has not taken the rest.
             if (page * PAGE).max(self.start) >= from
                 && ((page + 1) * PAGE).min(self.end) <= to
+                && let Some(slot) = seen.get_mut(idx)
             {
-                seen.insert(page, write);
+                *slot = write;
             }
             match ranges.last_mut() {
                 Some((_, last)) if *last == start => *last = end,
@@ -4834,6 +4852,35 @@ mod tests {
         super::ask_once_end();
         assert!(!super::ask_once_active());
         unsafe { VirtualFree(mem, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn tracked_take_reports_writes_once_and_re_reports_new_writes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let bytes = PAGE * 3;
+        let mem = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                bytes,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!mem.is_null());
+        let addr = mem as usize;
+        let tracked = super::track(addr, bytes, false).expect("tracked allocation");
+        // Initial allocation has all pages dirty or written once.
+        let _ = tracked.take(addr, addr + bytes);
+        // Without new writes, take returns empty.
+        assert!(tracked.take(addr, addr + bytes).is_empty());
+        // Write only page 1 (middle page) and verify only `[addr + PAGE, addr + 2 * PAGE)` is returned once.
+        unsafe { std::ptr::write_volatile(mem.add(PAGE + 8), 0x42) };
+        assert_eq!(tracked.take(addr, addr + bytes), vec![(addr + PAGE, addr + 2 * PAGE)]);
+        assert!(tracked.take(addr, addr + bytes).is_empty());
+        unsafe { VirtualFree(mem.cast(), 0, MEM_RELEASE) };
     }
 }
 
