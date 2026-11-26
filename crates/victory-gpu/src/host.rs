@@ -8168,8 +8168,11 @@ fn copy_fill(dst: *mut u8, src: *const u8, len: usize) {
         && len < crate::plaincopy::least()
         && !timing_only
         && fills_plain()
-        && (crate::plaincopy::copy_short(dst, src, len)
-            || crate::watch::try_copy_fast(dst, src, len))
+        && (if crate::plaincopy::on() {
+            crate::plaincopy::copy_short(dst, src, len)
+        } else {
+            crate::watch::try_copy_fast(dst, src, len)
+        })
     {
         return;
     }
@@ -8219,7 +8222,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = (!title_dst
-        && (crate::plaincopy::copy(dst, src, len) || crate::watch::try_copy_fast(dst, src, len)))
+        && if crate::plaincopy::on() {
+            crate::plaincopy::copy(dst, src, len)
+        } else {
+            crate::watch::try_copy_fast(dst, src, len)
+        })
         || read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
@@ -8270,7 +8277,11 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !crate::watch::try_copy_fast(to, at, n) && !read(at, to, n) {
+        } else if !(if crate::plaincopy::on() {
+            crate::plaincopy::copy(to, at, n)
+        } else {
+            crate::watch::try_copy_fast(to, at, n)
+        }) && !read(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
         }
@@ -8300,9 +8311,11 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len())
-        || crate::watch::try_copy_fast(dst.as_mut_ptr(), src, dst.len())
-        || read(src, dst.as_mut_ptr(), dst.len())
+    (if crate::plaincopy::on() {
+        crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len())
+    } else {
+        crate::watch::try_copy_fast(dst.as_mut_ptr(), src, dst.len())
+    }) || read(src, dst.as_mut_ptr(), dst.len())
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not

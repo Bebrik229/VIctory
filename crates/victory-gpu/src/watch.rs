@@ -292,6 +292,13 @@ fn alias_pages_of_range(first: usize, last: usize) -> Vec<usize> {
 /// already-known physical-page views in a single `GUARDS` lock acquisition
 /// followed by one `inplace` views lookup for any unguarded view ranges.
 fn partition_pieces(ranges: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    partition_pieces_with(ranges, light())
+}
+
+fn partition_pieces_with(
+    ranges: &[(usize, usize)],
+    light_on: bool,
+) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
     let mut ww = Vec::new();
     let mut views = Vec::new();
     if force_view_ask() {
@@ -302,18 +309,26 @@ fn partition_pieces(ranges: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usi
         }
         return (ww, views);
     }
+    let mut unchecked = Vec::new();
     let mut unknown = Vec::new();
-    let light_on = light();
-    {
+    for &(start, end) in ranges {
+        if start < end {
+            let piece = (start / PAGE, end.div_ceil(PAGE));
+            if light_on && PUBLISHED.all(start / BLOCK, (start / BLOCK) + 1) {
+                views.push(piece);
+            } else {
+                unchecked.push((start, piece));
+            }
+        }
+    }
+    if !unchecked.is_empty() {
         let g = guards();
-        for &(start, end) in ranges {
-            if start < end {
-                let piece = (start / PAGE, end.div_ceil(PAGE));
-                if (light_on && PUBLISHED.all(piece.0, piece.0 + 1)) || known_view_in(&g, piece.0 * PAGE) {
-                    views.push(piece);
-                } else {
-                    unknown.push(piece);
-                }
+        for (start, piece) in unchecked {
+            if known_view_in(&g, piece.0 * PAGE) {
+                views.push(piece);
+            } else {
+                let _ = start;
+                unknown.push(piece);
             }
         }
     }
@@ -375,10 +390,28 @@ fn guard_view_pieces(
     ahead_guarded: &mut Vec<(usize, usize)>,
     dirty: &mut Vec<usize>,
 ) -> u64 {
+    guard_view_pieces_with(view_pieces, ahead_guarded, dirty, light())
+}
+
+fn guard_view_pieces_with(
+    view_pieces: &mut Vec<(usize, usize)>,
+    ahead_guarded: &mut Vec<(usize, usize)>,
+    dirty: &mut Vec<usize>,
+    light_on: bool,
+) -> u64 {
     coalesce_ranges(view_pieces);
     let rev_before = GUARD_REV.load(std::sync::atomic::Ordering::SeqCst);
     let mut bump = true;
     for &(first, last) in view_pieces.iter() {
+        // `PAGE == BLOCK` (64 KiB), so each coalesced page interval aligns with block bits.
+        if light_on && PUBLISHED.all(first, last) {
+            LIGHT_ASKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ahead_guarded.push((first, last));
+            continue;
+        }
+        if light_on {
+            LIGHT_ASKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WatchKnownView, 1);
         #[cfg(feature = "diagnostics")]
@@ -4702,6 +4735,63 @@ mod tests {
         BITS.set(1 << 40);
         BITS.clear(1 << 40);
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+
+    #[test]
+    fn ask_once_skips_guards_lock_and_guard_inner_when_published() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        let (section, base) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let base = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize;
+            assert_ne!(base, 0);
+            (section, base)
+        };
+        let block = base / BLOCK;
+        let first_page = base / PAGE;
+        let last_page = first_page + 1;
+        assert!(guard(base, base + BLOCK).is_some());
+
+        let j = journal_write();
+        super::publish_ranges(&j, &[first_page], &[(block, block + 1)], false);
+        drop(j);
+        assert!(super::PUBLISHED.all(block, block + 1));
+
+        // 1) `partition_pieces_with(..., true)` routes published blocks into `views` lock-free.
+        let (ww, views) = super::partition_pieces_with(&[(base, base + BLOCK)], true);
+        assert!(ww.is_empty());
+        assert_eq!(views, vec![(first_page, last_page)]);
+
+        // 2) `guard_view_pieces_with(..., true)` skips `guard_inner` when `PUBLISHED` is set,
+        //    preserving `ahead_guarded` and incrementing `LIGHT_ASKS[0]`.
+        let before = super::LIGHT_ASKS[0].load(std::sync::atomic::Ordering::Relaxed);
+        let mut view_pieces = vec![(first_page, last_page)];
+        let mut ahead_guarded = Vec::new();
+        let mut dirty = Vec::new();
+        let _ = super::guard_view_pieces_with(&mut view_pieces, &mut ahead_guarded, &mut dirty, true);
+        let after = super::LIGHT_ASKS[0].load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(ahead_guarded, vec![(first_page, last_page)]);
+        assert!(dirty.is_empty());
+        assert_eq!(after - before, 1);
+
+        super::PUBLISHED.clear(block);
+        title_memory_remapped(base, BLOCK);
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ });
+            CloseHandle(section);
+        }
     }
 }
 
